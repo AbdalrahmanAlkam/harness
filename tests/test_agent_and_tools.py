@@ -73,7 +73,7 @@ def test_turbo_skips_semantic_question_but_keeps_destructive_gate(tmp_path: Path
     agent = DeveloperAgent(llm_client=LLMClient(force_mock=True), workspace_root=str(tmp_path),
                            classifier_backend=Backend(), clarification_callback=lambda *args: "Abort operation")
     original = agent.ambiguity_classifier.evaluate
-    def evaluate(task, skills, semantic_decision=False):
+    def evaluate(task, skills, semantic_decision=False, ask_on_ambiguity_phrase=False):
         seen.append(semantic_decision)
         return AmbiguityAssessment(False, 2.0, 0.0, "medium", "Uncertain")
     agent.ambiguity_classifier.evaluate = evaluate
@@ -87,6 +87,19 @@ def test_turbo_skips_semantic_question_but_keeps_destructive_gate(tmp_path: Path
     events = list(agent.run_stream("rm -rf important files", max_steps=1))
     assert any(event.event_type == "clarification_needed" for event in events)
     assert not any(event.event_type == "agent_stage" for event in events)
+
+
+def test_strict_tool_approvals_are_never_reused_from_clarification_memory(tmp_path: Path):
+    answers = []
+    agent = DeveloperAgent(llm_client=LLMClient(force_mock=True), workspace_root=str(tmp_path),
+                           clarification_callback=lambda *args: answers.append(args) or "Proceed with this command",
+                           preferences_dir=tmp_path / "prefs")
+    question = "Approve this action under strict safety? run_bash"
+    agent.clarification_memory.remember(question, "Proceed with this command", "Destructive tool command detected")
+    answer = agent._handle_clarification(question, ["Proceed", "Abort"],
+                                         "Destructive tool command detected", remember=False)
+    assert answer == "Proceed with this command"
+    assert len(answers) == 1
 
 
 def test_local_task_endpoint_does_not_receive_environment_api_key(monkeypatch):
@@ -105,7 +118,7 @@ def test_openrouter_reasoning_request_uses_effort_without_temperature():
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None),
                                                       finish_reason="stop")], usage=None, model=kwargs["model"])
 
-    client = LLMClient(force_mock=True)
+    client = LLMClient(api_key="test-key")
     client._openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     response = client.complete([{"role": "user", "content": "Solve a proof"}],
                                model=MODEL_TIERS["reasoning"], reasoning_effort="high")
@@ -124,7 +137,7 @@ def test_reasoning_budget_uses_supported_openrouter_parameters():
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None),
                                                       finish_reason="stop")], usage=None, model=kwargs["model"])
 
-    client = LLMClient(force_mock=True)
+    client = LLMClient(api_key="test-key")
     client._openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     messages = [{"role": "user", "content": "Analyze the proof"}]
     client.complete(messages, model="anthropic/claude-3.7-sonnet", reasoning_effort="high",

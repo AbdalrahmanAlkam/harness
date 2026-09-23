@@ -181,7 +181,7 @@ def test_provider_reports_actual_cached_tokens_and_stable_prefix():
                                      finish_reason="stop")], model=kwargs["model"],
             usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20,
                                   prompt_tokens_details=SimpleNamespace(cached_tokens=60)))
-    client = LLMClient(force_mock=True)
+    client = LLMClient(api_key="test-key")
     client._openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     prefix = {"role": "system", "content": "Stable project instructions"}
     for text in ("first", "second"):

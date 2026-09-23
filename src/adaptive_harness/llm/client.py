@@ -38,6 +38,7 @@ class LLMClient:
                                    os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"))
         self.default_model = default_model or MODEL_TIERS["standard"]
         self.force_mock = force_mock
+        self._temporary_offline = False
         self.mock_client = MockLLMClient(default_model=self.default_model)
 
         self._openai_client: Optional[OpenAI] = None
@@ -55,7 +56,7 @@ class LLMClient:
 
     @property
     def is_mock(self) -> bool:
-        return self._openai_client is None
+        return self.force_mock or self._openai_client is None or self._temporary_offline
 
     def get_model_for_tier(self, tier: str) -> str:
         """Maps an abstract tier (fast, standard, reasoning) to a concrete model ID."""
@@ -75,8 +76,11 @@ class LLMClient:
         selected_model = model or (self.get_model_for_tier(tier) if tier else self.default_model)
 
         # Use mock client if offline or no key configured
-        if self.is_mock:
+        if self.force_mock or self._openai_client is None:
             return self.mock_client.complete(messages=messages, tools=tools, model=selected_model)
+        # A prior failure only changed the visible status to offline. Keep the
+        # credential/client and retry it once on the next task automatically.
+        self._temporary_offline = False
 
         kwargs: Dict[str, Any] = {
             "model": selected_model,
@@ -201,9 +205,18 @@ class LLMClient:
             # Never fabricate successful work after a failed live request. The
             # current task stops; subsequent requests can use the offline engine.
             detail = str(e).replace(self.api_key, "[redacted]") if self.api_key else str(e)
-            self._openai_client = None
+            self._temporary_offline = True
+            status = getattr(e, "status_code", None)
+            if status in {401, 403}:
+                hint = "The saved API key was rejected; it remains saved. Check its permissions/account, and replace it only if it was revoked."
+            elif status == 429:
+                hint = "The provider rate-limited this request or has no available quota; your saved key is unchanged."
+            elif status in {400, 422}:
+                hint = "The provider rejected this request; your saved key is unchanged."
+            else:
+                hint = "The request failed; your saved key is unchanged and will be retried on the next task."
             return LLMResponse(
-                content=f"API call failed: {type(e).__name__}: {detail}. Switched to Offline Mock Engine; reconnect with /key or retry from the CLI.",
+                content=f"API call failed: {type(e).__name__}: {detail}. {hint} This task stopped without claiming success.",
                 tool_calls=[],
                 model=selected_model,
                 finish_reason="error",

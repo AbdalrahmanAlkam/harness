@@ -50,6 +50,7 @@ class AmbiguityClassifier:
         task_text: str,
         skill_result: SkillClassificationResult,
         semantic_decision: bool = False,
+        ask_on_ambiguity_phrase: bool = False,
     ) -> AmbiguityAssessment:
         """Evaluates whether the agent must pause and ask a clarifying question."""
         text_lower = task_text.lower().strip()
@@ -102,6 +103,12 @@ class AmbiguityClassifier:
             reason = "The request has no identifiable task target."
             suggested_q = "What should I work on? Please name the file, feature, or problem."
             suggested_opts = []
+        elif ask_on_ambiguity_phrase and any(marker in text_lower for marker in
+                ("either", "not sure", "which approach", "choose one", "or should i")):
+            should_ask = True
+            risk_level = "medium"
+            reason = "The cautious profile pauses on an unresolved choice in the request."
+            suggested_q = "Which outcome or option should I prioritize?"
         elif skill_result.primary_skill == "ask_clarification" or has_ambiguity_phrase:
             reason = "User requested a design judgment; agent should evaluate the options and proceed."
         elif semantic_decision and (entropy > self.entropy_threshold or margin < self.margin_threshold):

@@ -524,8 +524,9 @@ class ClarificationModal(ModalScreen[str]):
         color: $warning;
         padding-top: 1;
     }
-    #modal-scroll { height: 1fr; width: 100%; overflow-y: auto; }
-    #modal-question { width: 100%; height: auto; color: $text; text-style: bold; margin-bottom: 1; }
+    #modal-info { height: 5; min-height: 3; width: 100%; overflow-y: auto; border: round $primary; padding: 0 1; }
+    #modal-scroll { height: 1fr; min-height: 3; width: 100%; overflow-y: auto; }
+    #modal-question { width: 100%; height: auto; max-height: 3; overflow-y: auto; color: $text; text-style: bold; margin-bottom: 1; }
     #modal-context {
         width: 100%;
         height: auto;
@@ -533,13 +534,12 @@ class ClarificationModal(ModalScreen[str]):
         background: $warning 20%;
         padding: 1;
         margin-bottom: 1;
+        max-height: 2;
+        overflow-y: auto;
     }
-    #options-container {
-        height: auto;
-        margin-bottom: 1;
-    }
+    #options-container { height: auto; }
     .option-row { height: auto; min-height: 3; width: 100%; margin-bottom: 1; background: $panel; }
-    .opt-btn { width: 12; min-width: 12; margin-right: 1; }
+    .opt-btn { width: 6; min-width: 6; margin-right: 1; }
     .option-text { width: 1fr; min-width: 0; height: auto; padding: 0 1; color: $text; }
     .option-text:hover { background: $primary 20%; }
     .opt-btn:focus { border: heavy $accent; }
@@ -570,17 +570,17 @@ class ClarificationModal(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         with Vertical(id="modal-container"):
             yield Label("⚡ Agent Requires Clarification", id="modal-title")
+            with VerticalScroll(id="modal-info"):
+                yield Static(Text(self.question), id="modal-question")
+                yield Static(Text(self.context_msg), id="modal-context")
             with VerticalScroll(id="modal-scroll"):
-                yield Label(Text(self.question), id="modal-question")
-                yield Label(Text(self.context_msg), id="modal-context")
-
                 with Vertical(id="options-container"):
                     for i, opt in enumerate(self.options):
                         with Horizontal(classes="option-row"):
-                            yield Button(f"{i+1}. Choose", id=f"opt-{i}", classes="opt-btn", variant="primary" if i == 0 else "default")
+                            yield Button(f"{i+1}.", id=f"opt-{i}", classes="opt-btn", variant="primary" if i == 0 else "default")
                             yield OptionDescription(opt, i)
 
-            yield Static("↓ options  1-9 choose  Tab type  Esc cancel", id="modal-help")
+            yield Static("Scroll question/reason · 1-9 choose · ↑↓ options · Tab type · Esc cancel", id="modal-help")
             yield Input(placeholder="Type custom answer and press Enter...", id="write-in-input")
 
             with Horizontal(id="modal-buttons"):
@@ -604,6 +604,9 @@ class ClarificationModal(ModalScreen[str]):
             self.dismiss(self.options[event.widget.index])
 
     def on_mount(self) -> None:
+        # Keep question and reason at the top while the first choice receives focus.
+        self.query_one("#modal-info", VerticalScroll).scroll_home(animate=False)
+        self.query_one("#modal-scroll", VerticalScroll).scroll_home(animate=False)
         if self.options:
             self.query_one("#opt-0", Button).focus(scroll_visible=False)
         else:

@@ -110,7 +110,7 @@ def tui(
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
     mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Thinking level: none, low, medium, deep, auto"),
-    safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo or cautious (default turbo)"),
+    safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Local or OpenRouter classifier endpoint"),
@@ -131,8 +131,8 @@ def tui(
 
     if tier and tier not in MODEL_TIERS:
         raise typer.BadParameter("Choose fast, standard, or reasoning", param_hint="--tier")
-    if safety is not None and safety not in {"turbo", "cautious"}:
-        raise typer.BadParameter("Choose turbo or cautious", param_hint="--safety")
+    if safety is not None and safety not in {"turbo", "balanced", "cautious", "strict"}:
+        raise typer.BadParameter("Choose turbo, balanced, cautious, or strict", param_hint="--safety")
     try:
         parse_domain_mode(mode)
         parse_thinking_level(thinking)
@@ -180,7 +180,7 @@ def dev(
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
     mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Thinking level: none, low, medium, deep, auto"),
-    safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo or cautious (default turbo)"),
+    safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Classifier endpoint"),
@@ -203,8 +203,8 @@ def dev(
 
     if tier and tier not in MODEL_TIERS:
         raise typer.BadParameter("Choose fast, standard, or reasoning", param_hint="--tier")
-    if safety is not None and safety not in {"turbo", "cautious"}:
-        raise typer.BadParameter("Choose turbo or cautious", param_hint="--safety")
+    if safety is not None and safety not in {"turbo", "balanced", "cautious", "strict"}:
+        raise typer.BadParameter("Choose turbo, balanced, cautious, or strict", param_hint="--safety")
     try:
         selected_mode = parse_domain_mode(mode)
         selected_thinking = parse_thinking_level(thinking)

@@ -140,8 +140,8 @@ class AdaptiveHarnessApp(App):
         initial_thinking = parse_thinking_level(thinking)
         self._cli_mode_override = initial_mode
         self._cli_thinking_override = initial_thinking
-        if safety is not None and safety not in {"turbo", "cautious"}:
-            raise ValueError("Safety profile must be turbo or cautious")
+        if safety is not None and safety not in {"turbo", "balanced", "cautious", "strict"}:
+            raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
         self._cli_safety_override = safety
         self._default_safety = "turbo"
         self._model_catalog: list[CatalogModel] = []
@@ -333,7 +333,7 @@ class AdaptiveHarnessApp(App):
             self._session_restore_warning = f"Saved mode or thinking level is invalid ({exc}); using auto."
         self.agent.safety_profile = (self._cli_safety_override if preserve_cli_overrides and self._cli_safety_override
                                      else settings.get("safety", self._default_safety))
-        if self.agent.safety_profile not in {"turbo", "cautious"}:
+        if self.agent.safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
             self.agent.safety_profile = "turbo"
         for field, setting in (("prompt_tokens", "prompt_tokens"),
                                ("completion_tokens", "completion_tokens"),
@@ -486,8 +486,8 @@ class AdaptiveHarnessApp(App):
         self._refresh_status()
 
     def _set_safety(self, profile: str) -> None:
-        if profile not in {"turbo", "cautious"}:
-            self.query_one("#chat-log", RichLog).write(Text("Choose turbo or cautious.", style="yellow"))
+        if profile not in {"turbo", "balanced", "cautious", "strict"}:
+            self.query_one("#chat-log", RichLog).write(Text("Choose turbo, balanced, cautious, or strict.", style="yellow"))
             return
         self.agent.safety_profile = profile
         self._save_session()
@@ -640,9 +640,9 @@ class AdaptiveHarnessApp(App):
         log.write("  /tier <fast|standard|reasoning> - Force model tier")
         log.write("  /copy                   - Copy selected chat text or latest agent reply")
         log.write("  Ctrl+Shift+C            - Copy selected chat text or latest agent reply")
+        log.write("  /safety <turbo|balanced|cautious|strict> - Set tool confirmation level")
         log.write("  /mode <coding|research|science|security|auto> - Set operational mode")
         log.write("  /thinking <none|low|medium|deep|auto> - Set reasoning budget")
-        log.write("  /safety <turbo|cautious> - Control ordinary ambiguity prompts (default: turbo)")
         log.write("  /classifier <semif|sklearn|backend> [model/path] - Switch decision engine")
         log.write("  /workspace [path]      - Show or change working directory")
         log.write("  /sessions              - Browse saved sessions (F5); /sessions list prints IDs")
@@ -831,8 +831,10 @@ class AdaptiveHarnessApp(App):
         elif cmd == "/safety":
             if not arg:
                 self.push_screen(QuickSelectModal("Choose interaction profile", [
-                    ("turbo", "Turbo · proceed through uncertainty; stop for destructive actions"),
-                    ("cautious", "Cautious · ask on high semantic uncertainty"),
+                    ("turbo", "Turbo · few interruptions; still block high-risk actions"),
+                    ("balanced", "Balanced · resolve unclear targets and block destructive actions"),
+                    ("cautious", "Cautious · ask when SemIf finds genuinely ambiguous intent"),
+                    ("strict", "Strict · approve each shell, edit, write, test, and web tool call"),
                 ], current=self.agent.safety_profile),
                     callback=lambda selected: self._set_safety(selected) if selected else None)
             else:

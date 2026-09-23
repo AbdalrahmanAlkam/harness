@@ -38,10 +38,17 @@ def test_pytest_node_id_is_supported(tmp_path):
     assert result.success and result.metadata["passed"] == 1
 
 
-def test_live_failure_is_redacted_and_switches_offline():
-    client = LLMClient(api_key="private-test-key", force_mock=True)
+def test_live_failure_keeps_saved_key_and_retries_live_next_call(tmp_path):
+    config = ConfigManager(tmp_path / "config")
+    config.save_key("private-test-key")
+    client = LLMClient(api_key="private-test-key")
+    calls = []
     def fail(**kwargs):
-        raise ConnectionError("failed with private-test-key")
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise ConnectionError("failed with private-test-key")
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="recovered", tool_calls=None),
+            finish_reason="stop")], usage=None, model=kwargs["model"])
     client._openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fail)))
     response = client.complete([{"role": "user", "content": "hello"}])
     assert response.finish_reason == "error"
@@ -49,6 +56,12 @@ def test_live_failure_is_redacted_and_switches_offline():
     assert response.usage == {"prompt_tokens": 0, "completion_tokens": 0}
     assert client.is_mock
     assert not response.tool_calls
+    assert client.api_key == "private-test-key"
+    assert config.load()["api_key"] == "private-test-key"
+    recovered = client.complete([{"role": "user", "content": "retry"}])
+    assert recovered.content == "recovered"
+    assert len(calls) == 2
+    assert client.api_key == "private-test-key" and not client.is_mock
 
 
 def test_reasoning_parameter_rejection_retries_same_model_without_thinking():

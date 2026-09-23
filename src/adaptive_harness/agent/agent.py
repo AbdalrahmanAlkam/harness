@@ -83,8 +83,8 @@ class DeveloperAgent:
         safety_profile: str = "turbo",
         preferences_dir: str | Path | None = None,
     ):
-        if safety_profile not in {"turbo", "cautious"}:
-            raise ValueError("Safety profile must be turbo or cautious")
+        if safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
+            raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
         self.safety_profile = safety_profile
         self.clarification_memory = ClarificationMemory(preferences_dir)
         self.llm_client = llm_client or LLMClient()
@@ -142,16 +142,18 @@ class DeveloperAgent:
             if hasattr(tool, "workspace_root"):
                 tool.workspace_root = target
 
-    def _handle_clarification(self, question: str, options: Optional[List[str]], context: Optional[str]) -> str:
-        remembered = self.clarification_memory.lookup(question, context)
+    def _handle_clarification(self, question: str, options: Optional[List[str]], context: Optional[str],
+                              remember: bool = True) -> str:
+        remembered = self.clarification_memory.lookup(question, context) if remember else None
         if remembered:
             return remembered
         if self.clarification_callback is not None:
             answer = self.clarification_callback(question, options, context)
-            try:
-                self.clarification_memory.remember(question, answer, context)
-            except OSError:
-                pass
+            if remember:
+                try:
+                    self.clarification_memory.remember(question, answer, context)
+                except OSError:
+                    pass
             return answer
         # Headless execution cannot obtain authorization for a destructive action.
         if not options or (context and "destructive" in context.lower()):
@@ -224,8 +226,10 @@ class DeveloperAgent:
 
         # 2. Ambiguity & Clarification assessment ("questions in the middle of development")
         ambiguity_res = self.ambiguity_classifier.evaluate(user_input, skill_res,
-            semantic_decision=(self.safety_profile == "cautious" and classifier_name == "semif"
-                               and self.clarification_callback is not None))
+            semantic_decision=(self.safety_profile in {"balanced", "cautious", "strict"} and
+                               classifier_name == "semif" and self.clarification_callback is not None),
+            ask_on_ambiguity_phrase=(self.safety_profile in {"cautious", "strict"} and
+                                     self.clarification_callback is not None))
         yield AgentEvent(
             event_type="ambiguity_assessment",
             payload=ambiguity_res.to_dict(),
@@ -448,13 +452,19 @@ class DeveloperAgent:
             # Obtain authorization before adding tool calls to conversation history.
             for tc in llm_resp.tool_calls:
                 risky_command = self.tool_risk_classifier.evaluate(tc.name, tc.arguments)
+                if self.safety_profile == "strict" and tc.name in {
+                        "run_bash", "write_file", "edit_file", "run_pytest", "run_python_repl", "web_search"}:
+                    risky_command = risky_command or f"strict profile approval for {tc.name}"
                 if risky_command and not authorized_destructive:
-                    question = f"Allow this destructive command? {risky_command}"
+                    strict_gate = self.safety_profile == "strict"
+                    question = (f"Approve this action under the strict safety profile? {risky_command}"
+                                if strict_gate else f"Allow this destructive command? {risky_command}")
                     yield AgentEvent("clarification_needed", {"question": question,
                         "options": ["Proceed with this command", "Abort operation"],
-                        "reason": "Destructive tool command detected", "risk_level": "high"})
+                        "reason": "Strict safety profile requires approval before tool execution" if strict_gate else
+                                 "Destructive tool command detected", "risk_level": "high"})
                     answer = self._handle_clarification(question, ["Proceed with this command", "Abort operation"],
-                                                        "Destructive tool command detected")
+                        "Destructive tool command detected", remember=not strict_gate)
                     yield AgentEvent("clarification_answered", {"answer": answer})
                     if not answer.lower().startswith("proceed"):
                         yield AgentEvent("response", {"content": "Action cancelled by user.",
