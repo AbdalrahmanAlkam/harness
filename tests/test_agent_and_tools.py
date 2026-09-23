@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 
 from adaptive_harness.agent.agent import AgentEvent, DeveloperAgent
@@ -57,6 +59,26 @@ def test_local_task_endpoint_does_not_receive_environment_api_key(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "secret-cloud-key")
     client = LLMClient(base_url="http://localhost:8080/v1")
     assert client.api_key == "local"
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "http://127.0.0.1:8080/v1")
+    assert LLMClient().api_key == "local"
+
+
+def test_openrouter_reasoning_request_uses_effort_without_temperature():
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None),
+                                                      finish_reason="stop")], usage=None, model=kwargs["model"])
+
+    client = LLMClient(force_mock=True)
+    client._openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    response = client.complete([{"role": "user", "content": "Solve a proof"}],
+                               model=MODEL_TIERS["reasoning"], reasoning_effort="high")
+    assert response.content == "ok"
+    assert captured["model"] == MODEL_TIERS["reasoning"]
+    assert captured["extra_body"] == {"reasoning": {"effort": "high"}}
+    assert "temperature" not in captured
 
 
 def test_run_bash_tool(tmp_path: Path):
@@ -424,6 +446,7 @@ def test_session_store_roundtrip(tmp_path: Path):
     session.messages = [{"role": "user", "content": "hello"}]
     session.model = "local/model"
     session.skills = ["literature"]
+    session.settings = {"classifier_backend": "ollama", "classifier_model": "qwen2.5:1.5b"}
     store.save(session)
     assert store.load(session.id) == session
     assert store.list()[0].id == session.id
@@ -431,6 +454,22 @@ def test_session_store_roundtrip(tmp_path: Path):
     reopened = SessionStore(db)
     assert reopened.load(session.id) == session
     reopened.close()
+
+
+def test_session_store_migrates_existing_database(tmp_path: Path):
+    db = tmp_path / "old-sessions.db"
+    connection = sqlite3.connect(db)
+    connection.execute("""CREATE TABLE agent_sessions (
+        id TEXT PRIMARY KEY, title TEXT NOT NULL, workspace TEXT NOT NULL,
+        messages TEXT NOT NULL, model TEXT, skills TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+    connection.execute("INSERT INTO agent_sessions(id,title,workspace,messages,skills) VALUES (?,?,?,?,?)",
+                       ("legacy", "Old session", str(tmp_path), "[]", "[]"))
+    connection.commit()
+    connection.close()
+    store = SessionStore(db)
+    assert store.load("legacy").settings == {}
+    store.close()
 
 
 @pytest.mark.anyio
@@ -552,3 +591,67 @@ def test_selected_classifier_drives_all_three_heads(tmp_path: Path):
     assert len(backend.calls) == 3
     assert next(e.payload for e in events if e.event_type == "domain_mode")["mode"] == "research"
     assert next(e.payload for e in events if e.event_type == "skill_classification")["backend"] == "counting"
+
+
+def test_classifier_json_validation_and_local_endpoint():
+    parsed = _parse_response('```json\n{"label":"coding","confidence":0.7}\n```',
+                             ["coding", "research"], time.perf_counter())
+    assert parsed.label == "coding"
+    with pytest.raises(ValueError):
+        _parse_response('{"label":"coding","confidence":"NaN"}',
+                        ["coding", "research"], time.perf_counter())
+    assert create_backend("local-slm", "tiny", "http://localhost:8080").endpoint == \
+        "http://localhost:8080/v1/chat/completions"
+
+
+def test_invalid_search_and_risky_split_flags(tmp_path: Path):
+    assert not SearchFilesTool(tmp_path).execute(pattern="[").success
+    risk = ToolRiskClassifier()
+    assert risk.evaluate("run_bash", {"command": "rm -r -f build"})
+    assert risk.evaluate("run_bash", {"command": "git clean -df"})
+    assert risk.evaluate("run_bash", {"command": "git reset --hard"})
+    assert risk.evaluate("run_bash", {"command": "echo okay"}) is None
+
+
+def test_agent_denies_unavailable_domain_tool_and_retains_failure(tmp_path: Path):
+    class AuditBackend(BaseClassifierBackend):
+        name = "audit-backend"
+        model = "test"
+
+        def classify(self, text, labels):
+            label = "audit" if "audit" in labels else "low" if "low" in labels else labels[0]
+            return Classification(label, {item: float(item == label) for item in labels}, 0.1)
+
+    class WriteClient:
+        default_model = "test"
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(model="test", tool_calls=[ToolCall(id="write", name="write_file",
+                    arguments={"path": "should-not-exist.txt", "content": "bad"})])
+            return LLMResponse(content="Could not write in audit mode", model="test")
+
+    agent = DeveloperAgent(llm_client=WriteClient(), classifier_backend=AuditBackend(), workspace_root=str(tmp_path))
+    events = list(agent.run_stream("audit this workspace", max_steps=2))
+    assert not (tmp_path / "should-not-exist.txt").exists()
+    result = next(e.payload for e in events if e.event_type == "tool_result")
+    assert not result["success"]
+    assert "unavailable" in agent.messages[-2]["content"]
+    assert next(e.payload for e in events if e.event_type == "response")["success"] is False
+
+
+@pytest.mark.anyio
+async def test_classifier_api_key_and_narrow_layout(tmp_path: Path):
+    app = AdaptiveHarnessApp(db_path=tmp_path / "layout.db", classifier_backend="openrouter")
+    async with app.run_test(size=(70, 22)) as pilot:
+        app._handle_slash_command("/key secret-test-key")
+        assert app.agent.classifier_backend.api_key == "secret-test-key"
+        assert app.query_one("#chat-log").region.width <= 70
+        assert app.query_one("#chat-log").virtual_size.width <= 70
+        app._handle_slash_command("/classifier sklearn")
+        app._handle_slash_command("/session save")
+        assert app.session_store.load(app.session.id).settings["classifier_backend"] == "sklearn"

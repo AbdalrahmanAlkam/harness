@@ -1,4 +1,4 @@
-"""Selectable classification engines. Remote engines return calibrated-shaped distributions."""
+"""Selectable local and remote classification engines."""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -45,7 +45,14 @@ class Classification:
 
 
 def _normalize(scores: Mapping[str, float], labels: list[str]) -> dict[str, float]:
-    values = {key: max(0.0, float(scores.get(key, 0))) for key in labels}
+    if not labels:
+        raise ValueError("Classifier labels cannot be empty")
+    values = {}
+    for key in labels:
+        value = float(scores.get(key, 0))
+        if not math.isfinite(value):
+            raise ValueError(f"Invalid probability for {key}")
+        values[key] = max(0.0, value)
     total = sum(values.values())
     if total <= 0:
         raise ValueError("Classifier returned no valid probabilities")
@@ -127,7 +134,7 @@ class LocalHTTPBackend(BaseClassifierBackend):
 class OpenRouterBackend(BaseClassifierBackend):
     name = "openrouter"
 
-    def __init__(self, model: str = "google/gemini-2.0-flash-lite-preview", api_key: str | None = None,
+    def __init__(self, model: str = "google/gemini-2.5-flash-lite", api_key: str | None = None,
                  endpoint: str = "https://openrouter.ai/api/v1/chat/completions"):
         self.model, self.api_key, self.endpoint = model, api_key or os.getenv("OPENROUTER_API_KEY"), endpoint
 
@@ -144,15 +151,27 @@ class OpenRouterBackend(BaseClassifierBackend):
 
 
 def _parse_response(raw: str, labels: list[str], start: float) -> Classification:
-    payload = json.loads(raw)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        # Some local chat servers wrap otherwise valid JSON in markdown fences.
+        first = raw.find("{")
+        if first < 0:
+            raise
+        payload, _ = json.JSONDecoder().raw_decode(raw[first:])
+    if not isinstance(payload, dict):
+        raise ValueError("Classifier response must be a JSON object")
     label = payload["label"]
     if label not in labels:
         raise ValueError(f"Unknown classifier label: {label}")
     if isinstance(payload.get("probabilities"), dict):
         probs = _normalize(payload["probabilities"], labels)
     else:
-        confidence = min(1.0, max(1.0 / len(labels), float(payload.get("confidence", 0.75))))
-        probs = {key: (confidence if key == label else (1-confidence)/(len(labels)-1)) for key in labels}
+        confidence = float(payload.get("confidence", 0.75))
+        if not math.isfinite(confidence):
+            raise ValueError("Classifier confidence must be finite")
+        confidence = min(1.0, max(1.0 / len(labels), confidence))
+        probs = {key: (confidence if key == label else (1-confidence)/(len(labels)-1)) for key in labels} if len(labels) > 1 else {label: 1.0}
     return Classification(max(probs, key=probs.get), probs, (time.perf_counter()-start)*1000,
                           str(payload.get("reasoning", "")))
 
@@ -178,7 +197,17 @@ class OnnxBackend(BaseClassifierBackend):
         inputs = self.tokenizer(text, return_tensors="np", truncation=True, max_length=256)
         names = {item.name for item in self.session.get_inputs()}
         outputs = self.session.run(None, {k: v.astype("int64") for k, v in inputs.items() if k in names})[0]
-        embedding = outputs.mean(axis=1)[0] if outputs.ndim == 3 else outputs[0]
+        if outputs.ndim == 3:
+            mask = inputs.get("attention_mask")
+            if mask is None:
+                embedding = outputs.mean(axis=1)[0]
+            else:
+                weights = mask[..., None]
+                embedding = ((outputs * weights).sum(axis=1) / weights.sum(axis=1).clip(min=1))[0]
+        elif outputs.ndim == 2:
+            embedding = outputs[0]
+        else:
+            raise ValueError(f"Unsupported ONNX embedding output shape: {outputs.shape}")
         return embedding / (np.linalg.norm(embedding) + 1e-12)
 
     def classify(self, text: str, labels: list[str]) -> Classification:
@@ -191,16 +220,23 @@ class OnnxBackend(BaseClassifierBackend):
         return Classification(max(probs, key=probs.get), probs, (time.perf_counter()-start)*1000)
 
 
-def create_backend(name: str = "sklearn", model: str | None = None, endpoint: str | None = None) -> BaseClassifierBackend:
+def create_backend(name: str = "sklearn", model: str | None = None, endpoint: str | None = None,
+                   api_key: str | None = None) -> BaseClassifierBackend:
     name = name.lower().strip()
     if name == "sklearn":
         return SklearnBackend()
-    if name == "local-slm" and endpoint and endpoint.rstrip("/").endswith("chat/completions"):
-        return LocalHTTPBackend(model or "local-model", endpoint)
+    if name == "local-slm" and endpoint and not endpoint.rstrip("/").endswith("api/generate"):
+        local_endpoint = endpoint.rstrip("/")
+        if not local_endpoint.endswith("chat/completions"):
+            if not local_endpoint.endswith("/v1"):
+                local_endpoint += "/v1"
+            local_endpoint += "/chat/completions"
+        return LocalHTTPBackend(model or "local-model", local_endpoint)
     if name in ("ollama", "local-slm"):
         return OllamaBackend(model or "qwen2.5:1.5b", endpoint or "http://localhost:11434/api/generate")
     if name == "openrouter":
-        return OpenRouterBackend(model or "google/gemini-2.0-flash-lite-preview", endpoint=endpoint or "https://openrouter.ai/api/v1/chat/completions")
+        return OpenRouterBackend(model or "google/gemini-2.5-flash-lite", api_key=api_key,
+                                 endpoint=endpoint or "https://openrouter.ai/api/v1/chat/completions")
     if name == "onnx":
         if not model:
             raise ValueError("onnx backend requires a local model directory")

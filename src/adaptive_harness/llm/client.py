@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Union
 
 from openai import OpenAI
@@ -14,9 +15,9 @@ from adaptive_harness.llm.mock_client import LLMResponse, MockLLMClient, ToolCal
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 MODEL_TIERS = {
-    "fast": "google/gemini-2.0-flash-001",
+    "fast": "google/gemini-2.5-flash-lite",
     "standard": "openai/gpt-4o",
-    "reasoning": "anthropic/claude-3.7-sonnet",
+    "reasoning": "anthropic/claude-sonnet-4",
 }
 
 
@@ -31,7 +32,9 @@ class LLMClient:
         force_mock: bool = False,
     ):
         self.base_url = base_url or os.environ.get("OPENROUTER_BASE_URL") or DEFAULT_OPENROUTER_BASE_URL
-        self.api_key = api_key or ("local" if base_url and base_url != DEFAULT_OPENROUTER_BASE_URL else
+        endpoint_host = urlparse(self.base_url).hostname
+        local_endpoint = endpoint_host in {"localhost", "127.0.0.1", "::1"}
+        self.api_key = api_key or ("local" if local_endpoint else
                                    os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"))
         self.default_model = default_model or MODEL_TIERS["standard"]
         self.force_mock = force_mock
@@ -81,9 +84,10 @@ class LLMClient:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
         if reasoning_effort and self.base_url.rstrip("/").startswith("https://openrouter.ai") and any(
-            marker in selected_model.lower() for marker in ("claude-3.7", "deepseek-r1", "o3-mini", "reasoning")
+            marker in selected_model.lower() for marker in ("claude-sonnet-4", "gemini-2.5", "deepseek-r1", "o3-mini", "reasoning")
         ):
             kwargs["extra_body"] = {"reasoning": {"effort": reasoning_effort}}
+            kwargs.pop("temperature", None)
 
         try:
             assert self._openai_client is not None
@@ -96,6 +100,8 @@ class LLMClient:
                 for tc in msg.tool_calls:
                     try:
                         args = json.loads(tc.function.arguments)
+                        if not isinstance(args, dict):
+                            args = {"raw": args}
                     except Exception:
                         args = {"raw": tc.function.arguments}
                     tool_calls.append(

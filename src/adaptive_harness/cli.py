@@ -106,9 +106,9 @@ def run(
 def tui(
     api_key: Optional[str] = typer.Option(None, "--key", "-k", help="OpenRouter or OpenAI API key"),
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID (e.g. anthropic/claude-3.7-sonnet)"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID (e.g. anthropic/claude-sonnet-4)"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
-    classifier_backend: str = typer.Option("sklearn", "--classifier-backend", help="sklearn, ollama, onnx, openrouter"),
+    classifier_backend: str = typer.Option("sklearn", "--classifier-backend", help="sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Local or OpenRouter classifier endpoint"),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w", help="Working directory for agent tools"),
@@ -146,7 +146,7 @@ def dev(
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
-    classifier_backend: str = typer.Option("sklearn", "--classifier-backend", help="sklearn, ollama, onnx, openrouter"),
+    classifier_backend: str = typer.Option("sklearn", "--classifier-backend", help="sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Classifier endpoint"),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w", help="Working directory for agent tools"),
@@ -169,7 +169,7 @@ def dev(
     if not workspace.is_dir():
         raise typer.BadParameter(f"Workspace directory does not exist: {workspace}", param_hint="--workspace")
     try:
-        backend = create_backend(classifier_backend, classifier_model, classifier_endpoint)
+        backend = create_backend(classifier_backend, classifier_model, classifier_endpoint, api_key=api_key)
     except (ValueError, RuntimeError, OSError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--classifier-backend") from exc
     agent = DeveloperAgent(llm_client=client, repository=repo, workspace_root=str(workspace), explicit_model=selected_model,
@@ -196,6 +196,8 @@ def dev(
             console.print(f"  [magenta]Model Tier:[/magenta] [{p['tier'].upper()}] -> {p['model']}")
         elif et == "llm_error":
             console.print(f"[red]Model error: {escape(p['message'])}[/red]")
+        elif et == "storage_error":
+            console.print(f"[yellow]{escape(p['error'])}[/yellow]")
         elif et == "thought":
             console.print(f"\n[bold magenta]Agent Thought:[/bold magenta] {escape(p['content'])}")
         elif et == "tool_call":

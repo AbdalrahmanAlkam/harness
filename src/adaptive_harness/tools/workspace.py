@@ -73,7 +73,10 @@ class SearchFilesTool(Tool):
 
     def execute(self, pattern: str, file_extension: Optional[str] = None, **kwargs: Any) -> ToolResult:
         matches = []
-        regex = re.compile(pattern, re.IGNORECASE)
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            return ToolResult(success=False, output="", error=f"Invalid search pattern: {exc}")
 
         for root, dirs, files in os.walk(self.workspace_root):
             # Prune hidden or heavy directories

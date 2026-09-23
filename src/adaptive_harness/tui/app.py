@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import concurrent.futures
 from typing import Optional
 from rich.syntax import Syntax
 from rich.text import Text
@@ -101,6 +102,7 @@ class AdaptiveHarnessApp(App):
         self.session_store = SessionStore(self.db_path)
         self.session = self.session_store.load(session_id) if session_id else None
         if session_id and self.session is None:
+            self.session_store.close()
             raise ValueError(f"Session not found: {session_id}")
         if self.session is not None:
             self.workspace_root = self.session.workspace
@@ -110,6 +112,9 @@ class AdaptiveHarnessApp(App):
         self._busy = False
         self._show_telemetry = True
         self._last_tool_output = ""
+        self._clarification_future: concurrent.futures.Future[str] | None = None
+        self._session_restore_warning = ""
+        self._quit_when_finished = False
 
         # Developer Agent with interactive clarification hook
         self.agent = DeveloperAgent(
@@ -118,7 +123,8 @@ class AdaptiveHarnessApp(App):
             clarification_callback=self._request_interactive_clarification,
             workspace_root=self.workspace_root,
             explicit_model=default_model,
-            classifier_backend=create_backend(classifier_backend, classifier_model, classifier_endpoint),
+            classifier_backend=create_backend(classifier_backend, classifier_model, classifier_endpoint,
+                                               api_key=self.api_key),
         )
         if session_id:
             self._restore_session()
@@ -126,7 +132,7 @@ class AdaptiveHarnessApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="main-container"):
-            yield RichLog(id="chat-log", wrap=True, highlight=True, markup=True)
+            yield RichLog(id="chat-log", min_width=1, wrap=True, highlight=True, markup=True)
             yield ClassifierTelemetryWidget(id="telemetry")
 
         yield Static(id="status-line")
@@ -141,7 +147,7 @@ class AdaptiveHarnessApp(App):
 
     def on_mount(self) -> None:
         self.title = "Adaptive Agent Harness - Developer TUI"
-        self.sub_title = f"Model: {self.agent.llm_client.default_model} | Mode: {'LIVE (OpenRouter)' if not self.agent.llm_client.is_mock else 'OFFLINE MOCK'}"
+        self.sub_title = f"Model: {self.agent.llm_client.default_model} | {'LIVE' if not self.agent.llm_client.is_mock else 'OFFLINE MOCK'}"
 
         log = self.query_one("#chat-log", RichLog)
         log.write("[bold cyan]Welcome to Adaptive Agent Harness 2.0![/bold cyan]")
@@ -152,7 +158,9 @@ class AdaptiveHarnessApp(App):
             log.write("[yellow]Notice: No OPENROUTER_API_KEY detected. Running in offline simulated mode.[/yellow]")
             log.write("[dim]Type '/key <YOUR_KEY>' to connect your OpenRouter account at any time.[/dim]\n")
         else:
-            log.write(Text(f"Connected to OpenRouter using {self.agent.llm_client.default_model}\n", style="green"))
+            log.write(Text(f"Connected to {self.agent.llm_client.base_url} using {self.agent.llm_client.default_model}\n", style="green"))
+        if self._session_restore_warning:
+            log.write(Text(self._session_restore_warning, style="yellow"))
 
         self.query_one("#prompt-input", Input).focus()
         self._refresh_status()
@@ -186,16 +194,29 @@ class AdaptiveHarnessApp(App):
         self.session.messages = self.agent.messages
         self.session.model = self.agent.explicit_model
         self.session.skills = list(self.agent.active_skills)
+        self.session.settings = {"classifier_backend": self.agent.classifier_backend.name,
+                                 "classifier_model": self.agent.classifier_backend.model,
+                                 "classifier_endpoint": self.classifier_endpoint or ""}
         self.session_store.save(self.session)
 
     def _restore_session(self) -> None:
-        if self.session.messages:
-            self.agent.messages = self.session.messages
+        self._session_restore_warning = ""
+        self.agent.messages = self.session.messages or [{"role": "system", "content": self.agent.system_prompt}]
         self.agent.explicit_model = self.session.model
         if self.session.model:
             self.agent.llm_client.default_model = self.session.model
         self.agent.set_workspace(self.session.workspace)
+        settings = self.session.settings or {}
+        self.classifier_endpoint = settings.get("classifier_endpoint") or None
+        if settings.get("classifier_backend"):
+            try:
+                self.agent.classifier_backend = create_backend(settings["classifier_backend"],
+                    settings.get("classifier_model"), self.classifier_endpoint, api_key=self.api_key)
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.agent.classifier_backend = create_backend("sklearn")
+                self._session_restore_warning = f"Saved classifier could not load ({exc}); using sklearn."
         self.skill_catalog = SkillCatalog(self.session.workspace)
+        self.agent.active_skills.clear()
         for name in self.session.skills or []:
             try:
                 self.agent.active_skills[name] = self.skill_catalog.read(name)
@@ -203,7 +224,10 @@ class AdaptiveHarnessApp(App):
                 pass
 
     def on_unmount(self) -> None:
-        self._save_session()
+        if self._clarification_future and not self._clarification_future.done():
+            self._clarification_future.set_result("Action cancelled by user")
+        if not self._busy:
+            self._save_session()
         self.session_store.close()
 
     def _request_interactive_clarification(
@@ -213,15 +237,16 @@ class AdaptiveHarnessApp(App):
         context: Optional[str],
     ) -> str:
         """Called by agent when ambiguity or risk is detected in the middle of development."""
-        import concurrent.futures
-
         fut: concurrent.futures.Future[str] = concurrent.futures.Future()
+        self._clarification_future = fut
 
         def show_modal():
             self.query_one("#waiting-indicator", Static).add_class("visible")
             def on_dismiss(ans: Optional[str]):
                 self.query_one("#waiting-indicator", Static).remove_class("visible")
-                fut.set_result(ans or "Action cancelled by user")
+                if not fut.done():
+                    fut.set_result(ans or "Action cancelled by user")
+                self._clarification_future = None
 
             modal = ClarificationModal(question=question, options=options, context=context)
             self.push_screen(modal, callback=on_dismiss)
@@ -233,6 +258,15 @@ class AdaptiveHarnessApp(App):
     def action_clear_screen(self) -> None:
         log = self.query_one("#chat-log", RichLog)
         log.clear()
+
+    def action_quit(self) -> None:
+        if self._busy and not self._quit_when_finished:
+            self._quit_when_finished = True
+            self.query_one("#chat-log", RichLog).write(Text(
+                "Will quit when the current task ends. Press Ctrl+C again to exit now; Esc cancels a question.",
+                style="yellow"))
+            return
+        self.exit()
 
     def action_toggle_telemetry(self) -> None:
         self._show_telemetry = not self._show_telemetry
@@ -250,7 +284,7 @@ class AdaptiveHarnessApp(App):
         log.write("  /session new [title] | load <id> | save")
         log.write("  /skills                - List installed skills")
         log.write("  /skill <name|off>      - Toggle skill guidance")
-        log.write("  /output                - Show the last full tool result")
+        log.write("  /output                - Show the last tool result (up to 20k characters)")
         log.write("  F2                    - Show or hide telemetry")
         log.write("  /clear                 - Clear chat history")
         log.write("  /exit                  - Exit application")
@@ -261,15 +295,14 @@ class AdaptiveHarnessApp(App):
             return
 
         input_widget = self.query_one("#prompt-input", Input)
+        if self._busy and not text.startswith("/"):
+            self.query_one("#chat-log", RichLog).write(Text("Agent is still working. Wait for this task to finish.", style="yellow"))
+            return
         input_widget.value = ""
 
         # Handle slash commands
         if text.startswith("/"):
             self._handle_slash_command(text)
-            return
-
-        if self._busy:
-            self.query_one("#chat-log", RichLog).write(Text("Agent is still working. Wait for this task to finish.", style="yellow"))
             return
 
         log = self.query_one("#chat-log", RichLog)
@@ -287,8 +320,13 @@ class AdaptiveHarnessApp(App):
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
 
+        if self._busy and cmd in {"/key", "/model", "/tier", "/classifier",
+                                  "/workspace", "/session", "/skill"}:
+            log.write(Text("Wait for the current task before changing settings or exiting.", style="yellow"))
+            return
+
         if cmd in ("/exit", "/quit"):
-            self.exit()
+            self.action_quit()
         elif cmd == "/clear":
             self.action_clear_screen()
         elif cmd == "/help":
@@ -297,8 +335,11 @@ class AdaptiveHarnessApp(App):
             if not arg:
                 log.write("[red]Usage: /key <OPENROUTER_API_KEY>[/red]")
                 return
+            self.api_key = arg
             self.agent.llm_client = LLMClient(api_key=arg, base_url=self.base_url,
                                               default_model=self.agent.llm_client.default_model)
+            if self.agent.classifier_backend.name == "openrouter":
+                self.agent.classifier_backend.api_key = arg
             log.write("[green]✓ OpenRouter API key updated![/green]")
             self._refresh_status()
         elif cmd == "/model":
@@ -326,7 +367,8 @@ class AdaptiveHarnessApp(App):
                 log.write(Text(f"Classifier: {self.agent.classifier_backend.name} {self.agent.classifier_backend.model}"))
                 return
             try:
-                backend = create_backend(args[0], args[1] if len(args) > 1 else None, self.classifier_endpoint)
+                backend = create_backend(args[0], args[1] if len(args) > 1 else None, self.classifier_endpoint,
+                                         api_key=self.api_key)
             except (ValueError, RuntimeError, OSError) as exc:
                 log.write(Text(str(exc), style="red"))
                 return
@@ -374,12 +416,17 @@ class AdaptiveHarnessApp(App):
                 if saved is None:
                     log.write(Text(f"Session not found: {value.strip()}", style="red"))
                     return
+                if not Path(saved.workspace).is_dir():
+                    log.write(Text(f"Session workspace is unavailable: {saved.workspace}", style="red"))
+                    return
                 self._save_session()
                 self.session = saved
                 self.workspace_root = saved.workspace
                 self._restore_session()
                 log.clear()
                 log.write(Text(f"Loaded session {saved.id}: {saved.title} ({len(saved.messages)} messages)", style="green"))
+                if self._session_restore_warning:
+                    log.write(Text(self._session_restore_warning, style="yellow"))
             elif action == "save":
                 self._save_session()
                 log.write(Text(f"Saved session {self.session.id}", style="green"))
@@ -425,15 +472,26 @@ class AdaptiveHarnessApp(App):
             for event in self.agent.run_stream(task_text):
                 self.call_from_thread(self._render_event, event)
         except Exception as exc:
-            self.call_from_thread(self._render_error, f"Agent error: {type(exc).__name__}: {exc}")
+            if self.is_running:
+                try:
+                    self.call_from_thread(self._render_error, f"Agent error: {type(exc).__name__}: {exc}")
+                except RuntimeError:
+                    pass
         finally:
-            self.call_from_thread(self._finish_task)
+            try:
+                if self.is_running:
+                    self.call_from_thread(self._finish_task)
+            except RuntimeError:
+                pass
 
     def _finish_task(self) -> None:
         self._busy = False
         self._save_session()
         self._refresh_status()
-        self.query_one("#prompt-input", Input).focus()
+        if self._quit_when_finished:
+            self.exit()
+        else:
+            self.query_one("#prompt-input", Input).focus()
 
     def _render_error(self, message: str) -> None:
         self.query_one("#chat-log", RichLog).write(Text(message, style="bold red"))
@@ -472,6 +530,8 @@ class AdaptiveHarnessApp(App):
                 log.write(Text(f"Classifier {p['backend']} failed: {p['error']}; using sklearn", style="yellow"))
         elif et == "llm_error":
                 log.write(Text(p["message"], style="bold red"))
+        elif et == "storage_error":
+                log.write(Text(p["error"], style="yellow"))
         elif et == "thought":
                 log.write(Text(f"\nAgent ({p.get('model', 'thought')}):", style="bold magenta"))
                 log.write(Markdown(p["content"]))
@@ -480,7 +540,10 @@ class AdaptiveHarnessApp(App):
         elif et == "tool_result":
                 status_color = "green" if p["success"] else "red"
                 log.write(Text(f"Result ({p['time_ms']} ms) · {p['name']}", style=status_color))
-                output = p["output"] or p.get("error") or "(empty)"
+                output = p["output"] or ""
+                if p.get("error"):
+                    output = f"ERROR: {p['error']}\n{output}" if output else f"ERROR: {p['error']}"
+                output = output or "(empty)"
                 self._last_tool_output = output
                 if "Diff:\n" in output or output.startswith("@@"):
                     diff = output.split("Diff:\n", 1)[-1]

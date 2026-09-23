@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 from rich.panel import Panel
+from rich.console import Group
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
+from adaptive_harness.llm.client import MODEL_TIERS
 from textual.app import ComposeResult
 from textual import events
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
@@ -23,6 +26,7 @@ class ClassifierTelemetryWidget(Static):
         background: $surface;
         border-left: solid $primary;
         padding: 1;
+        overflow-y: auto;
     }
     """
 
@@ -33,7 +37,7 @@ class ClassifierTelemetryWidget(Static):
         self.margin: float = 0.0
         self.risk_level: str = "low"
         self.tier: str = "standard"
-        self.active_model: str = "openai/gpt-4o"
+        self.active_model: str = MODEL_TIERS["standard"]
         self.primary_skill: str = "none"
         self.selection: str = "auto"
         self.classifier_engine: str = "sklearn"
@@ -84,55 +88,36 @@ class ClassifierTelemetryWidget(Static):
         self.refresh()
 
     def render(self) -> Panel:
-        table = Table(box=None, show_header=False, expand=True, padding=(0, 0))
-        table.add_column("Key", style="bold cyan", width=12)
-        table.add_column("Value")
+        status = Text(overflow="fold")
+        status.append("MODEL  ", style="bold cyan")
+        status.append(f"{self.selection.upper()} · {self.tier.upper()}\n", style="bold magenta")
+        status.append(self.active_model + "\n", style="white")
+        status.append("CLASSIFIER  ", style="bold cyan")
+        status.append(self.classifier_engine.upper() + "\n", style="bold white")
+        status.append(self.classifier_model + "\n", style="white")
+        status.append(f"Latency  {self.classifier_latency_ms:.2f} ms\n", style="cyan")
+        status.append(f"Domain  {self.domain_mode.upper()}\n", style="bold magenta")
+        status.append(f"Thinking  {self.thinking_level.upper()} · {self.thinking_tokens:,} tokens\n", style="bold yellow")
+        status.append(f"Skill  {self.primary_skill}\n", style="white")
+        status.append(f"H(p)  {self.entropy:.3f} bits   Margin  {self.margin*100:.1f}%\n", style="cyan")
+        risk_style = "green" if self.risk_level == "low" else "yellow" if self.risk_level == "medium" else "bold red"
+        status.append(f"Risk  {self.risk_level.upper()}", style=risk_style)
 
-        # Model tier badge
-        tier_color = "green" if self.tier == "fast" else ("yellow" if self.tier == "standard" else "magenta")
-        table.add_row("Model", Text(f"{self.selection.upper()}: {self.tier.upper()}", style=f"bold {tier_color}"))
-        table.add_row("Active Model", Text(self.active_model, style="bold white"))
-        table.add_row("Engine", Text(f"{self.classifier_engine}: {self.classifier_model}", style="cyan"))
-        table.add_row("Latency", Text(f"{self.classifier_latency_ms:.2f} ms", style="white"))
-        table.add_row("Domain", Text(self.domain_mode.upper(), style="bold magenta"))
-        table.add_row("Thinking", Text(f"{self.thinking_level.upper()} · {self.thinking_tokens:,} tokens", style="bold yellow"))
-        table.add_row("Primary Skill", Text(self.primary_skill, style="bold white"))
-
-        # Entropy & Margin
-        ent_color = "green" if self.entropy < 1.0 else ("yellow" if self.entropy < 1.5 else "red")
-        table.add_row("Entropy H(p)", f"[{ent_color}]{self.entropy:.3f} bits[/{ent_color}]")
-        table.add_row("Margin", f"{self.margin*100:4.1f}%")
-
-        # Risk level
-        risk_color = "green" if self.risk_level == "low" else ("yellow" if self.risk_level == "medium" else "red bold")
-        table.add_row("Risk Level", f"[{risk_color}]{self.risk_level.upper()}[/{risk_color}]")
-
-        # Skill probability bars
         bars_table = Table(box=None, show_header=False, expand=True, padding=(0, 0))
-        bars_table.add_column("Skill", width=11)
-        bars_table.add_column("Bar", width=12)
+        bars_table.add_column("Skill", width=10)
+        bars_table.add_column("Bar", width=8)
         bars_table.add_column("Pct", justify="right", width=6)
 
         sorted_skills = sorted(self.probabilities.items(), key=lambda x: x[1], reverse=True)
         for skill, prob in sorted_skills:
-            bar_len = int(prob * 10)
-            bar_str = "█" * bar_len + "░" * (10 - bar_len)
-            c = "green" if prob >= 0.4 else ("yellow" if prob >= 0.15 else "dim")
+            bar_len = max(0, min(8, round(prob * 8)))
+            bar_str = "█" * bar_len + "░" * (8 - bar_len)
+            c = "green" if prob >= 0.4 else ("yellow" if prob >= 0.15 else "bright_black")
             clean_name = skill.replace("_", " ")[:10]
-            bars_table.add_row(clean_name, f"[{c}]{bar_str}[/{c}]", f"{prob*100:4.1f}%")
+            bars_table.add_row(Text(clean_name), Text(bar_str, style=c), Text(f"{prob*100:4.1f}%"))
 
-        full_table = Table(box=None, show_header=False, expand=True)
-        full_table.add_column("Section")
-        full_table.add_row(table)
-        full_table.add_row(Text("─" * 32, style="dim"))
-        full_table.add_row(Text("Intent Probabilities:", style="bold cyan"))
-        full_table.add_row(bars_table)
-
-        return Panel(
-            full_table,
-            title="[bold cyan]Telemetry Brain[/bold cyan]",
-            border_style="cyan",
-        )
+        return Panel(Group(status, Rule(style="cyan"), Text("SKILL PROBABILITIES", style="bold cyan"), bars_table),
+                     title="[bold cyan]ROUTING[/bold cyan]", border_style="cyan")
 
 
 class OptionDescription(Static):
@@ -154,19 +139,19 @@ class ClarificationModal(ModalScreen[str]):
     #modal-container {
         width: 90%;
         max-width: 88;
-        height: auto;
-        max-height: 90%;
-        overflow-y: auto;
+        height: 90%;
         background: $surface;
         border: round #fbbf24;
-        padding: 1 2;
+        padding: 0 2;
     }
     #modal-title {
+        height: 2;
         text-align: center;
         text-style: bold;
         color: #fbbf24;
-        margin-bottom: 1;
+        padding-top: 1;
     }
+    #modal-scroll { height: 1fr; width: 100%; overflow-y: auto; }
     #modal-question { width: 100%; height: auto; color: $text; text-style: bold; margin-bottom: 1; }
     #modal-context {
         width: 100%;
@@ -186,9 +171,14 @@ class ClarificationModal(ModalScreen[str]):
     .option-text:hover { background: $primary 20%; }
     .opt-btn:focus { border: heavy #22d3ee; }
     #write-in-input {
-        margin-top: 1;
-        margin-bottom: 1;
+        width: 100%;
+        height: 3;
+        background: $panel;
+        color: $text;
     }
+    #modal-help { height: 1; color: #22d3ee; }
+    #modal-buttons { height: 3; }
+    #modal-buttons Button { width: 1fr; }
     """
     BINDINGS = [("escape", "cancel", "Cancel"), ("up", "previous_option", "Previous"),
                 ("down", "next_option", "Next"), ("enter", "choose_focused", "Select")]
@@ -205,21 +195,22 @@ class ClarificationModal(ModalScreen[str]):
         self.context_msg = context or "Classifier detected ambiguity or risk requiring alignment."
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(id="modal-container"):
+        with Vertical(id="modal-container"):
             yield Label("⚡ Agent Requires Clarification", id="modal-title")
-            yield Label(Text(self.question), id="modal-question")
-            yield Label(Text(self.context_msg), id="modal-context")
+            with VerticalScroll(id="modal-scroll"):
+                yield Label(Text(self.question), id="modal-question")
+                yield Label(Text(self.context_msg), id="modal-context")
 
-            with Vertical(id="options-container"):
-                for i, opt in enumerate(self.options):
-                    with Horizontal(classes="option-row"):
-                        yield Button(f"{i+1}. Choose", id=f"opt-{i}", classes="opt-btn", variant="primary" if i == 0 else "default")
-                        yield OptionDescription(opt, i)
+                with Vertical(id="options-container"):
+                    for i, opt in enumerate(self.options):
+                        with Horizontal(classes="option-row"):
+                            yield Button(f"{i+1}. Choose", id=f"opt-{i}", classes="opt-btn", variant="primary" if i == 0 else "default")
+                            yield OptionDescription(opt, i)
 
-            yield Label("Custom instruction (Tab to focus):")
+            yield Static("↓ options  1-9 choose  Tab type  Esc cancel", id="modal-help")
             yield Input(placeholder="Type custom answer and press Enter...", id="write-in-input")
 
-            with Horizontal():
+            with Horizontal(id="modal-buttons"):
                 yield Button("Submit", id="submit-btn", variant="success")
                 yield Button("Cancel", id="cancel-btn", variant="error")
 

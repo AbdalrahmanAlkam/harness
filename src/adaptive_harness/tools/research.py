@@ -21,6 +21,10 @@ class WebSearchTool(Tool):
     def execute(self, query: str, count: int = 5, **kwargs) -> ToolResult:
         if not self.api_key:
             return ToolResult(success=False, output="", error="BRAVE_SEARCH_API_KEY is required for web search")
+        if not isinstance(count, int) or isinstance(count, bool):
+            return ToolResult(success=False, output="", error="Search count must be an integer")
+        if not isinstance(query, str) or not query.strip():
+            return ToolResult(success=False, output="", error="Search query cannot be empty")
         url = "https://api.search.brave.com/res/v1/web/search?" + urlencode({"q": query, "count": max(1, min(count, 10))})
         request = Request(url, headers={"Accept": "application/json", "X-Subscription-Token": self.api_key})
         try:

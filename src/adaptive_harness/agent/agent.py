@@ -32,10 +32,10 @@ from adaptive_harness.tools.research import WebSearchTool
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 
 
-DEFAULT_SYSTEM_PROMPT = """You are Adaptive Agent, an expert AI software engineer.
-You solve coding tasks by reading files, writing clean code, running tests, and executing bash commands.
-Before modifying critical code, you think carefully. You verify your work using tests.
-When asking clarifying questions, keep them targeted and actionable.
+DEFAULT_SYSTEM_PROMPT = """You are Adaptive Agent, an expert assistant for software engineering, research, science, and mathematics.
+Inspect relevant evidence, use tools when needed, and distinguish verified results from assumptions.
+For code changes, run appropriate checks and inspect failures before reporting success.
+Make routine decisions yourself; ask only when the task target is missing or an action is destructive.
 """
 
 
@@ -95,7 +95,7 @@ class DeveloperAgent:
         ]
         if WebSearchTool().api_key:
             default_tools.append(WebSearchTool())
-        tools_list = tools or default_tools
+        tools_list = tools if tools is not None else default_tools
         self.tools: Dict[str, Tool] = {t.name: t for t in tools_list}
         self.messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
 
@@ -116,7 +116,13 @@ class DeveloperAgent:
             return "Action cancelled by user"
         return options[0]
 
-    def run_stream(self, user_input: str, max_steps: int = 4) -> Generator[AgentEvent, None, None]:
+    def _request_messages(self) -> List[Dict[str, Any]]:
+        """Keep recent complete turns in model context while preserving the full saved session."""
+        user_positions = [i for i, message in enumerate(self.messages) if message.get("role") == "user"]
+        start = user_positions[-20] if len(user_positions) > 20 else 1
+        return [self.messages[0], *self.messages[start:]]
+
+    def run_stream(self, user_input: str, max_steps: Optional[int] = None) -> Generator[AgentEvent, None, None]:
         """Executes a task through the agentic lifecycle, yielding real-time events for the TUI."""
         start_time = time.perf_counter()
 
@@ -205,6 +211,10 @@ class DeveloperAgent:
         thinking_res = ThinkingAssessment(predicted_level, BUDGET_TOKENS[predicted_level],
                                           None if predicted_level == ThinkingLevel.NONE else
                                           "high" if predicted_level in (ThinkingLevel.DEEP, ThinkingLevel.EXTREME) else predicted_level.value)
+        if max_steps is None:
+            max_steps = {ThinkingLevel.NONE: 4, ThinkingLevel.LOW: 8, ThinkingLevel.MEDIUM: 12,
+                         ThinkingLevel.DEEP: 16, ThinkingLevel.EXTREME: 20}[thinking_res.level]
+        max_steps = max(1, min(max_steps, 24))
         yield AgentEvent("domain_mode", {"mode": domain_res.mode.value, "confidence": domain_res.confidence,
                                           "latency_ms": round(domain_prediction.latency_ms, 2)})
         yield AgentEvent("thinking_budget", {"level": thinking_res.level.value, "tokens": thinking_res.budget_tokens,
@@ -231,7 +241,7 @@ class DeveloperAgent:
                             + ("\n" + skill_guidance if skill_guidance else "")}
         domain_tool_names = {
             DomainMode.CODING: set(self.tools),
-            DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "ask_user"},
+            DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "run_bash", "calculate", "ask_user"},
             DomainMode.SCIENCE: {"read_file", "write_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "ask_user"},
             DomainMode.AUDIT: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user"},
         }[domain_res.mode]
@@ -247,7 +257,7 @@ class DeveloperAgent:
         while step < max_steps:
             step += 1
             llm_resp = self.llm_client.complete(
-                messages=self.messages,
+                messages=self._request_messages(),
                 tools=tool_schemas,
                 model=selected_model,
                 tier=complexity_res.tier,
@@ -301,7 +311,7 @@ class DeveloperAgent:
                     payload={"name": tc.name, "arguments": tc.arguments, "call_id": tc.id},
                 )
 
-                tool = self.tools.get(tc.name)
+                tool = self.tools.get(tc.name) if tc.name in domain_tool_names else None
                 t_start = time.perf_counter()
                 if tool:
                     try:
@@ -309,7 +319,7 @@ class DeveloperAgent:
                     except Exception as exc:
                         tool_res = ToolResult(success=False, output="", error=f"Tool error: {type(exc).__name__}: {exc}")
                 else:
-                    tool_res = ToolResult(success=False, output="", error=f"Unknown tool `{tc.name}`")
+                    tool_res = ToolResult(success=False, output="", error=f"Tool `{tc.name}` is unavailable in {domain_res.mode.value} mode")
                 if tool_res.success and tc.name in ("write_file", "edit_file") and str(tc.arguments.get("path", "")).endswith(".py"):
                     try:
                         source_path = (tool.workspace_root / tc.arguments["path"]).resolve()
@@ -317,13 +327,16 @@ class DeveloperAgent:
                     except (SyntaxError, OSError) as exc:
                         tool_res = ToolResult(success=False, output=tool_res.output, error=f"SyntaxError: Python AST validation failed: {exc}")
                 t_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+                shown_output = tool_res.output
+                if len(shown_output) > 20_000:
+                    shown_output = shown_output[:20_000] + "\n… output truncated at 20,000 characters; request a narrower read."
 
                 yield AgentEvent(
                     event_type="tool_result",
                     payload={
                         "name": tc.name,
                         "success": tool_res.success,
-                        "output": tool_res.output,
+                        "output": shown_output,
                         "error": tool_res.error,
                         "time_ms": round(t_elapsed_ms, 2),
                     },
@@ -366,7 +379,8 @@ class DeveloperAgent:
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "name": tc.name,
-                        "content": tool_res.output if tool_res.success else f"ERROR: {tool_res.error}",
+                        "content": shown_output if tool_res.success else
+                                   f"ERROR: {tool_res.error or 'Tool failed'}\n{shown_output}",
                     }
                 )
 
@@ -406,5 +420,5 @@ class DeveloperAgent:
             )
             try:
                 self.repository.record_trace(trace)
-            except Exception:
-                pass
+            except Exception as exc:
+                yield AgentEvent("storage_error", {"error": f"Could not save execution trace: {exc}"})

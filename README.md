@@ -6,9 +6,9 @@ Install the project into its virtual environment, then run `adaptive-harness dev
 
 Model selection is automatic by default. The complexity router selects fast, standard, or reasoning for each task. `--model MODEL_ID` or `--tier fast|standard|reasoning` fixes the model for every step. In the TUI, `/model MODEL_ID` and `/tier NAME` do the same; `/model auto` restores automatic routing. A forced model appears as `FORCED` in telemetry.
 
-Choose a working directory with `--workspace PATH` or `/workspace PATH`. Conversations save automatically to the configured SQLite database. Use `/sessions` to list them, `/session new [title]` to start fresh, `/session load ID` to resume, or `--session ID` at launch. Put optional `SKILL.md` files under `.harness/skills/NAME/` in the workspace or `~/.config/adaptive-harness/skills/NAME/`; `/skills` lists them and `/skill NAME` toggles one. `dev --skill NAME` enables a skill for a headless task.
+Choose a working directory with `--workspace PATH` or `/workspace PATH`. Conversations and classifier settings save automatically to the configured SQLite database. Use `/sessions` to list them, `/session new [title]` to start fresh, `/session load ID` to resume, or `--session ID` at launch. Put optional `SKILL.md` files under `.harness/skills/NAME/` in the workspace or `~/.config/adaptive-harness/skills/NAME/`; `/skills` lists them and `/skill NAME` toggles one. `dev --skill NAME` enables a skill for a headless task.
 
-The default classifier is local TF-IDF and logistic regression. Select another engine with `--classifier-backend sklearn|ollama|onnx|openrouter` and `--classifier-model MODEL`. The TUI equivalent is `/classifier BACKEND [MODEL]`. `--classifier-endpoint URL` sets a custom HTTP endpoint for Ollama or OpenRouter classification. If a classifier request fails, the agent reports the error and uses sklearn for that task.
+The default classifier is local TF-IDF and logistic regression. Select another engine with `--classifier-backend sklearn|ollama|local-slm|onnx|openrouter` and `--classifier-model MODEL`. The TUI equivalent is `/classifier BACKEND [MODEL]`. `--classifier-endpoint URL` sets a custom HTTP endpoint for Ollama or OpenRouter classification. If a classifier request fails, the agent reports the error and uses sklearn for that task.
 
 For a local SLM, start Ollama and pull a small model, such as `ollama pull qwen2.5:1.5b`, then run:
 
@@ -20,7 +20,7 @@ The Ollama backend calls the local `/api/generate` endpoint with JSON output. Fo
 
 Each task also receives a domain mode (coding, research, science, or audit) and a thinking level (none, low, medium, deep). The selected classifier backend predicts all three heads: skill, domain, and thinking. The domain changes agent guidance and tools offered to the model; audit is read oriented, research can save notes, and science has a restricted arithmetic checker. Set `BRAVE_SEARCH_API_KEY` to enable web search with source URLs in research mode. Python file writes receive automatic AST validation, with syntax errors fed into the verification and recovery loop. The thinking level sets a token estimate in telemetry and sends OpenRouter reasoning effort for supported reasoning models. These are routing signals, not guarantees of a specific token count. The telemetry panel shows the active classifier, its observed latency, domain, thinking level, entropy, margin, skill probabilities, and model selection.
 
-Clarification opens for detected destructive operations or a genuinely missing task target. Numeric keys 1–9 select options, arrows navigate, Enter confirms, Tab reaches the custom instruction field, and Escape cancels. Long text wraps in a scrollable card, and empty custom input cannot approve an action. Entropy and requests for the agent's design judgment do not pause the task. F2 toggles the telemetry panel on wide terminals; narrow terminals hide it automatically. `/output` shows the last full tool result.
+Clarification opens for detected destructive operations or a genuinely missing task target. Numeric keys 1–9 select options, arrows navigate, Enter confirms, Tab reaches the custom instruction field, and Escape cancels. Long text wraps in a scrollable card, and empty custom input cannot approve an action. Entropy and requests for the agent's design judgment do not pause the task. F2 toggles the telemetry panel on wide terminals; narrow terminals hide it automatically. `/output` shows the last tool result up to the 20,000-character output limit.
 
 > **An Autonomous AI Developer Agent Harness powered by OpenRouter LLMs and Pervasive ML Classifiers everywhere — featuring real-time intent routing, middle-of-development clarification dialogs, multi-tier complexity routing, active output verification, and an interactive Terminal User Interface (TUI).**
 
@@ -35,9 +35,9 @@ The **Adaptive Agent Harness 2.0** solves this by embedding **pervasive machine 
 1. **Skill & Intent Classifier (`SkillClassifier`)**: Rapidly routes developer tasks into specialized tool pipelines (`code_edit`, `run_command`, `search_explore`, `testing`, `ask_clarification`, `general_reasoning`) with full probability distributions.
 2. **Ambiguity & Risk Classifier (`AmbiguityClassifier`)**: Quantifies task uncertainty via Shannon entropy $H(p)$, confidence margin, and destructive risk filters. Destructive actions and explicit decision ambiguity trigger clarification; entropy alone remains telemetry.
 3. **Cognitive Complexity & Model Tier Router (`ComplexityRouter`)**: Dynamically routes requests across LLM model tiers:
-   - **Fast Tier** (e.g. `google/gemini-2.0-flash-001`): rapid queries, file reads, git status, typo fixes.
+   - **Fast Tier** (e.g. `google/gemini-2.5-flash-lite`): rapid queries, file reads, git status, typo fixes.
    - **Standard Tier** (e.g. `openai/gpt-4o`): core coding, refactoring, unit test authoring.
-   - **Reasoning Tier** (e.g. `anthropic/claude-3.7-sonnet`): complex architectures, concurrency/deadlocks, multi-file algorithms.
+   - **Reasoning Tier** (e.g. `anthropic/claude-sonnet-4`): complex architectures, concurrency/deadlocks, multi-file algorithms.
 4. **Tool Verification & Self-Healing Classifier (`VerificationClassifier`)**: Actively inspects tool outputs (bash stdout/stderr, pytest assertions, compiler syntax errors, missing paths) to classify failure modes (`SYNTAX_ERROR`, `TEST_FAILURE`, `FILE_ERROR`, `RUNTIME_ERROR`) and immediately trigger targeted recovery actions (`AUTO_RETRY_SYNTAX_FIX`, `AUTO_RETRY_TEST_FIX`, etc.).
 5. **Interactive Textual TUI (`AdaptiveHarnessApp`)**: A full terminal IDE featuring live classifier telemetry gauges, probability bar charts, streaming agent thought logs, and interactive clarification modals.
 6. **OpenRouter Protocol & Offline Fallback**: Direct integration with OpenRouter's API (`https://openrouter.ai/api/v1`) and OpenAI-compatible endpoints, paired with an intelligent **Mock LLM engine** for instant offline development without requiring a paid API key.
@@ -129,7 +129,7 @@ adaptive-harness tui --key sk-or-v1-xxxxxxxxxxxxxxxxx
   - Live streaming of agent thoughts, tool execution invocations with argument inspection, real-time tool results, and verification classifications.
 - **Built-in Slash Commands**:
   - `/key <OPENROUTER_API_KEY>`: Set or update OpenRouter API key on the fly.
-  - `/model <MODEL_ID>`: Switch active LLM (e.g. `anthropic/claude-3.7-sonnet`).
+  - `/model <MODEL_ID>`: Switch active LLM (e.g. `anthropic/claude-sonnet-4`).
   - `/tier <fast|standard|reasoning>`: Switch between optimized cost/capability tiers.
   - `/clear`: Clear terminal history log.
   - `/help`: Display available commands.
@@ -139,7 +139,7 @@ adaptive-harness tui --key sk-or-v1-xxxxxxxxxxxxxxxxx
 
 ## 4. Developer Tools Suite
 
-The agent is equipped with a sandboxed, robust developer toolbelt (`src/adaptive_harness/tools/`):
+The agent is equipped with a workspace-scoped developer toolbelt (`src/adaptive_harness/tools/`):
 
 - **`RunBashTool` (`run_bash`)**: Executes workspace commands with timeouts, output capture, virtualenv path resolution, and dangerous command safety filtering (blocks `rm -rf /`, fork bombs, etc.).
 - **`ReadFileTool` (`read_file`)**: Reads workspace files with line numbering and optional `start_line` / `end_line` slicing.
@@ -167,7 +167,7 @@ adaptive-harness dev "list files in workspace"
 adaptive-harness dev "run pytest on test_agent_and_tools.py"
 
 # Custom OpenRouter model
-adaptive-harness dev "refactor the storage layer" --key $OPENROUTER_API_KEY --model anthropic/claude-3.7-sonnet
+adaptive-harness dev "refactor the storage layer" --key $OPENROUTER_API_KEY --model anthropic/claude-sonnet-4
 ```
 
 ### 2. Algorithmic Routing & Recovery Benchmarks
@@ -220,7 +220,7 @@ export OPENROUTER_API_KEY="sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxx"
 
 ## 7. Verification & Automated Test Suite
 
-The project includes 49 comprehensive unit and integration tests covering algorithmic strategies, mathematical calibration, developer tools, pervasive classifiers, the agent event loop, and the Textual TUI:
+The project includes unit and integration tests covering algorithmic strategies, mathematical calibration, developer tools, pervasive classifiers, the agent event loop, and the Textual TUI:
 
 ```bash
 pytest tests/ -v
