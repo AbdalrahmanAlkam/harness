@@ -37,6 +37,9 @@ from adaptive_harness.agent.compaction import compact_tool_output, rank_search_r
 from adaptive_harness.data.preferences import ClarificationMemory
 from adaptive_harness.tools.research import WebSearchTool
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
+from adaptive_harness.agent.skills import SkillCatalog
+from adaptive_harness.skills.router import SkillRouter
+from adaptive_harness.skills.verifier import SkillVerifier
 
 
 DEFAULT_SYSTEM_PROMPT = """You are Adaptive Agent, an expert assistant for software engineering, research, science, and mathematics.
@@ -90,6 +93,9 @@ class DeveloperAgent:
         self.system_prompt = system_prompt
         self.workspace_root = Path(workspace_root or ".").resolve()
         self.active_skills: dict[str, str] = {}
+        self.skill_catalog = SkillCatalog(self.workspace_root)
+        self.skill_router = SkillRouter()
+        self.skill_verifier = SkillVerifier()
         self.explicit_model = explicit_model
         self.forced_mode = parse_domain_mode(forced_mode)
         self.forced_thinking = parse_thinking_level(forced_thinking)
@@ -131,6 +137,7 @@ class DeveloperAgent:
         if not target.is_dir():
             raise ValueError(f"Workspace directory does not exist: {target}")
         self.workspace_root = target
+        self.skill_catalog = SkillCatalog(target)
         for tool in self.tools.values():
             if hasattr(tool, "workspace_root"):
                 tool.workspace_root = target
@@ -335,9 +342,25 @@ class DeveloperAgent:
             },
         )
 
+        skill_selection = self.skill_router.route(original_input, self.skill_catalog.all(),
+            self.classifier_backend, tuple(self.active_skills))
+        selected_skills = skill_selection.skills
+        security_skill_active = any(skill.name == "security_audit_scanner"
+                                    for skill in selected_skills)
+        selected_tool_names = set().union(*(set(skill.tools) for skill in selected_skills)) if selected_skills else None
+        yield AgentEvent("specialized_skill", {
+            "skills": [{"name": skill.name, "title": skill.title, "category": skill.category,
+                        "icon": skill.icon} for skill in selected_skills],
+            "confidence": skill_selection.confidence, "selection": skill_selection.selection,
+            "backend": skill_selection.backend, "latency_ms": round(skill_selection.latency_ms, 2),
+            "tools": sorted(selected_tool_names or ()),
+        })
+
         # Add user message to history
         self.messages.append({"role": "user", "content": user_input})
-        skill_guidance = "\n".join(f"Selected skill {name}:\n{content}" for name, content in self.active_skills.items())
+        skill_guidance = "\n".join(
+            f"Active skill: {skill.title}. {skill.instructions} Completion checks: {', '.join(skill.invariants) or 'none'}."
+            for skill in selected_skills)
         self.messages[0] = {"role": "system", "content": self.system_prompt + "\nWorkspace: " + str(self.workspace_root)
                             + "\nOperating mode: " + domain_res.mode.value + ". " + DOMAIN_GUIDANCE[domain_res.mode]
                             + "\nUse read_file(symbol=...) for focused Python code. For mathematics and science, run deterministic calculations and verify proposed roots before claiming exactness."
@@ -351,6 +374,8 @@ class DeveloperAgent:
         }[domain_res.mode]
         if self.safety_profile == "turbo":
             domain_tool_names.discard("ask_user")
+        if selected_tool_names is not None:
+            domain_tool_names.intersection_update(selected_tool_names)
         tool_schemas = [t.to_openai_schema() for t in self.tools.values() if t.name in domain_tool_names]
 
         # Agent execution loop (LLM call -> tool execution -> verification -> repeat if needed)
@@ -358,6 +383,7 @@ class DeveloperAgent:
         final_answer = ""
         completed = False
         execution_attempts: List[ExecutionAttempt] = []
+        skill_observations: list[dict[str, Any]] = []
         cache_dependencies: dict[str, str] = {}
         cache_eligible = _cacheable_read_request(original_input)
         unresolved_failures: set[str] = set()
@@ -431,10 +457,10 @@ class DeveloperAgent:
 
                 tool = self.tools.get(tc.name) if tc.name in domain_tool_names else None
                 t_start = time.perf_counter()
-                if (tool and domain_res.mode == DomainMode.AUDIT and tc.name == "run_bash" and
+                if (tool and (domain_res.mode == DomainMode.AUDIT or security_skill_active) and tc.name == "run_bash" and
                         not audit_command_is_read_only(str(tc.arguments.get("command", "")))):
                     tool_res = ToolResult(success=False, output="",
-                        error="Security audit mode permits only read-only git status, diff, show, or log commands")
+                        error="Security review permits read-only git inspection and approved dependency scanners")
                 elif tool:
                     try:
                         tool_res = tool.execute(**tc.arguments)
@@ -529,6 +555,8 @@ class DeveloperAgent:
                         ),
                     )
                 )
+                skill_observations.append({"name": tc.name, "arguments": tc.arguments,
+                                           "success": tool_res.success})
 
                 # Append tool result to conversation history
                 self.messages.append(
@@ -541,6 +569,13 @@ class DeveloperAgent:
                     }
                 )
 
+        skill_checks = self.skill_verifier.verify(selected_skills, skill_observations)
+        for skill_check in skill_checks:
+            yield AgentEvent("skill_verification", {"skill": skill_check.skill,
+                "verified": skill_check.verified, "satisfied": skill_check.satisfied,
+                "missing": skill_check.missing})
+        if skill_checks and not all(check.verified for check in skill_checks):
+            completed = False
         total_wall_ms = (time.perf_counter() - start_time) * 1000.0
         if self.repository is not None and completed and cache_eligible and cache_dependencies and final_answer:
             try:

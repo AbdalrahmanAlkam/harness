@@ -120,6 +120,7 @@ def tui(
     semif_temperature: float = typer.Option(1.0, "--semif-temperature", min=0.01, help="SemIf probability temperature"),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w", help="Working directory for agent tools"),
     session: Optional[str] = typer.Option(None, "--session", help="Resume an existing TUI session ID"),
+    skill: Optional[list[str]] = typer.Option(None, "--skill", help="Force a built-in or custom skill (repeatable)"),
     db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Path to experience database"),
 ):
     """Launches the interactive Textual TUI development environment with pervasive classifiers."""
@@ -158,6 +159,14 @@ def tui(
         )
     except (ValueError, RuntimeError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+    if skill:
+        from adaptive_harness.agent.skills import SkillCatalog
+        catalog = SkillCatalog(tui_app.workspace_root)
+        for name in skill:
+            try:
+                tui_app.agent.active_skills[name] = catalog.read(name)
+            except (ValueError, OSError) as exc:
+                raise typer.BadParameter(str(exc), param_hint="--skill") from exc
     tui_app.run()
 
 
@@ -231,6 +240,10 @@ def dev(
         p = event.payload
         if et == "skill_classification":
             console.print(f"  [cyan]Skill Classifier ({p['backend']} · {p['latency_ms']:.1f} ms):[/cyan] {p['primary_skill']} ({p['confidence']*100:.1f}%)")
+        elif et == "specialized_skill" and p["skills"]:
+            console.print(f"  [cyan]Active skill:[/cyan] {escape(' → '.join(skill['title'] for skill in p['skills']))} ({p['confidence']:.0%}, {p['selection']})")
+        elif et == "skill_verification" and p["missing"]:
+            console.print(f"  [yellow]Skill checks pending ({escape(p['skill'])}): {escape(', '.join(p['missing']))}[/yellow]")
         elif et == "classifier_loading":
             console.print(f"  [cyan]Loading local SemIf model {p['model']} for its first decision…[/cyan]")
         elif et == "classifier_error":

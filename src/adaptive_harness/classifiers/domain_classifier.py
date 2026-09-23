@@ -53,6 +53,8 @@ def audit_command_is_read_only(command: str) -> bool:
         tokens = shlex.split(command)
     except ValueError:
         return False
+    if tokens == ["pip-audit"] or tokens == ["safety", "check"]:
+        return True
     if len(tokens) < 2 or tokens[0] != "git" or tokens[1] not in {"status", "diff", "show", "log"}:
         return False
     return not any(token.startswith(("--output", "--ext-diff", "--config", "--exec-path"))

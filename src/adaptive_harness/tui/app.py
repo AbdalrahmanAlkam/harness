@@ -627,7 +627,8 @@ class AdaptiveHarnessApp(App):
         log.write("  /sessions              - Browse saved sessions (F5); /sessions list prints IDs")
         log.write("  /session new [title] | load <id> | save")
         log.write("  /skills                - List installed skills")
-        log.write("  /skill <name|off>      - Toggle skill guidance")
+        log.write("  /skill list            - Browse 22 built-in and custom skills")
+        log.write("  /skill <name|off>      - Force a skill or restore automatic routing")
         log.write("  /output                - Show the last tool result (up to 20k characters)")
         log.write("  /new | /reset          - Start a new session or reset current one")
         log.write("  /theme [name]          - Preview and save terminal theme (F2)")
@@ -872,13 +873,11 @@ class AdaptiveHarnessApp(App):
             else:
                 log.write(Text("Use /session new [title], /session load <id>, or /session save", style="yellow"))
             self._refresh_status()
-        elif cmd == "/skills":
-            skills = self.skill_catalog.discover()
-            if not skills:
-                log.write(Text("No skills found in .harness/skills or ~/.config/adaptive-harness/skills", style="yellow"))
-            for name, path in skills.items():
+        elif cmd == "/skills" or (cmd == "/skill" and arg == "list"):
+            skills = self.skill_catalog.all()
+            for name, skill in skills.items():
                 marker = "●" if name in self.agent.active_skills else "○"
-                log.write(Text(f"{marker} {name}  {path}", style="cyan"))
+                log.write(Text(f"{marker} {skill.icon} {name} · {skill.category} — {skill.trigger}", style="cyan"))
         elif cmd == "/skill":
             if not arg:
                 log.write(Text("Use /skills to list and /skill <name> to toggle.", style="yellow"))
@@ -996,6 +995,17 @@ class AdaptiveHarnessApp(App):
                     classifier_engine=p["backend"], classifier_model=p["classifier_model"],
                     classifier_latency_ms=p["latency_ms"],
                 )
+        elif et == "specialized_skill":
+                telemetry.update_telemetry(specialized_skills=p["skills"],
+                    skill_confidence=p["confidence"], skill_tools=p["tools"])
+                if p["skills"]:
+                    names = " → ".join(item["title"] for item in p["skills"])
+                    log.write(Text(f"Skill: {names} ({p['selection']}, {p['confidence']:.0%})", style="cyan"))
+        elif et == "skill_verification":
+                if p["missing"]:
+                    log.write(Text(f"Skill checks pending ({p['skill']}): {', '.join(p['missing'])}", style="yellow"))
+                else:
+                    log.write(Text(f"Skill checks verified: {p['skill']}", style="green"))
         elif et == "ambiguity_assessment":
                 telemetry.update_telemetry(
                     entropy=p["entropy"],

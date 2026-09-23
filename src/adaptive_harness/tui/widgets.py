@@ -55,6 +55,9 @@ class ClassifierTelemetryWidget(Static):
         self.tier: str = "—"
         self.active_model: str = MODEL_TIERS["standard"]
         self.primary_skill: str = "none"
+        self.specialized_skills: list[dict[str, str]] = []
+        self.skill_confidence = 0.0
+        self.skill_tools: list[str] = []
         self.selection: str = "auto"
         self.classifier_engine: str = "sklearn"
         self.classifier_model: str = "TF-IDF + Logistic Regression"
@@ -78,6 +81,9 @@ class ClassifierTelemetryWidget(Static):
         self.risk_level = "idle"
         self.tier = "—"
         self.primary_skill = "none"
+        self.specialized_skills = []
+        self.skill_confidence = 0.0
+        self.skill_tools = []
         self.classifier_latency_ms = 0.0
         self.domain_mode = "—"
         self.domain_selection = "auto"
@@ -107,6 +113,9 @@ class ClassifierTelemetryWidget(Static):
         tier: Optional[str] = None,
         model: Optional[str] = None,
         primary_skill: Optional[str] = None,
+        specialized_skills: Optional[list[dict[str, str]]] = None,
+        skill_confidence: Optional[float] = None,
+        skill_tools: Optional[list[str]] = None,
         selection: Optional[str] = None,
         classifier_engine: Optional[str] = None,
         classifier_model: Optional[str] = None,
@@ -135,6 +144,12 @@ class ClassifierTelemetryWidget(Static):
             self.active_model = model
         if primary_skill is not None:
             self.primary_skill = primary_skill
+        if specialized_skills is not None:
+            self.specialized_skills = specialized_skills
+        if skill_confidence is not None:
+            self.skill_confidence = skill_confidence
+        if skill_tools is not None:
+            self.skill_tools = skill_tools
         for key, value in (("selection", selection), ("classifier_engine", classifier_engine),
                            ("classifier_model", classifier_model), ("classifier_latency_ms", classifier_latency_ms),
                            ("domain_mode", domain_mode), ("domain_selection", domain_selection),
@@ -173,6 +188,14 @@ class ClassifierTelemetryWidget(Static):
         status.append(f"[{self.thinking_level.upper()} ({budget_label} tokens)]", style="bold yellow")
         status.append(f" {self.thinking_selection.upper()}\n", style="dim")
         status.append(f"Skill  {self.primary_skill}\n")
+        if self.specialized_skills:
+            for skill in self.specialized_skills:
+                status.append("Active Skill: ", style="bold cyan")
+                status.append(f"{skill['icon']} {skill['title']}\n", style="bold green")
+                status.append(f"  {skill['category']} · {self.skill_confidence:.0%}\n", style="cyan")
+            status.append("Tools: " + ", ".join(self.skill_tools) + "\n", style="dim")
+        else:
+            status.append("Active Skill: automatic general\n", style="dim")
         status.append(f"H(p)  {self.entropy:.3f} bits   Margin  {self.margin*100:.1f}%\n", style="cyan")
         risk_style = "cyan" if self.risk_level == "idle" else "green" if self.risk_level == "low" else "yellow" if self.risk_level == "medium" else "bold red"
         status.append(f"Risk  {self.risk_level.upper()}", style=risk_style)
