@@ -49,22 +49,24 @@ class AmbiguityClassifier:
         self,
         task_text: str,
         skill_result: SkillClassificationResult,
+        semantic_decision: bool = False,
     ) -> AmbiguityAssessment:
         """Evaluates whether the agent must pause and ask a clarifying question."""
         text_lower = task_text.lower().strip()
 
         # 1. Compute Shannon Entropy H(p) = -sum p log2(p)
         probs = list(skill_result.probabilities.values())
-        entropy = 0.0
-        for p in probs:
-            if p > 0:
-                entropy -= p * math.log2(p)
+        entropy = skill_result.entropy if skill_result.entropy is not None else 0.0
+        if skill_result.entropy is None:
+            for p in probs:
+                if p > 0:
+                    entropy -= p * math.log2(p)
 
         # 2. Confidence Margin
         ranked = skill_result.ranked_skills
         p1 = ranked[0][1] if len(ranked) > 0 else 1.0
         p2 = ranked[1][1] if len(ranked) > 1 else 0.0
-        margin = p1 - p2
+        margin = skill_result.confidence_margin if skill_result.confidence_margin is not None else p1 - p2
 
         # 3. Detect high-risk actions
         high_risk_words = ["rm ", "delete all", "drop table", "git reset --hard", "wipe", "format disk"]
@@ -102,6 +104,12 @@ class AmbiguityClassifier:
             suggested_opts = []
         elif skill_result.primary_skill == "ask_clarification" or has_ambiguity_phrase:
             reason = "User requested a design judgment; agent should evaluate the options and proceed."
+        elif semantic_decision and (entropy > self.entropy_threshold or margin < self.margin_threshold):
+            should_ask = True
+            risk_level = "medium"
+            reason = f"SemIf found uncertain intent (H={entropy:.2f} bits, margin={margin:.2f})."
+            suggested_q = "Could you clarify the goal and the result you expect?"
+            suggested_opts = []
         elif entropy > self.entropy_threshold and margin < self.margin_threshold:
             # Uncertain routing is telemetry, not a reason to interrupt the developer.
             should_ask = False

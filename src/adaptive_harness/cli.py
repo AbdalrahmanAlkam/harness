@@ -108,9 +108,13 @@ def tui(
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID (e.g. anthropic/claude-sonnet-4)"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
-    classifier_backend: str = typer.Option("sklearn", "--classifier-backend", help="sklearn, ollama, local-slm, onnx, openrouter"),
+    classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Local or OpenRouter classifier endpoint"),
+    semif_model: Optional[str] = typer.Option(None, "--semif-model", help="Cached HuggingFace model ID or local checkpoint path"),
+    semif_device: str = typer.Option("auto", "--semif-device", help="SemIf device: auto, cpu, cuda, or mps"),
+    semif_4bit: bool = typer.Option(False, "--semif-4bit", help="Load SemIf in 4-bit on CUDA (requires bitsandbytes)"),
+    semif_temperature: float = typer.Option(1.0, "--semif-temperature", min=0.01, help="SemIf probability temperature"),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w", help="Working directory for agent tools"),
     session: Optional[str] = typer.Option(None, "--session", help="Resume an existing TUI session ID"),
     db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Path to experience database"),
@@ -127,9 +131,12 @@ def tui(
             api_key=api_key,
             base_url=base_url,
             default_model=(None if model and model.lower() == "auto" else model) or (MODEL_TIERS[tier] if tier in MODEL_TIERS else None),
-            classifier_backend=classifier_backend,
-            classifier_model=classifier_model,
+            classifier_backend="semif" if semif_model else classifier_backend,
+            classifier_model=semif_model or classifier_model,
             classifier_endpoint=classifier_endpoint,
+            semif_device=semif_device,
+            semif_4bit=semif_4bit,
+            semif_temperature=semif_temperature,
             workspace_root=str(workspace),
             session_id=session,
             db_path=db_path,
@@ -146,9 +153,13 @@ def dev(
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
-    classifier_backend: str = typer.Option("sklearn", "--classifier-backend", help="sklearn, ollama, local-slm, onnx, openrouter"),
+    classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Classifier endpoint"),
+    semif_model: Optional[str] = typer.Option(None, "--semif-model", help="Cached HuggingFace model ID or local checkpoint path"),
+    semif_device: str = typer.Option("auto", "--semif-device", help="SemIf device: auto, cpu, cuda, or mps"),
+    semif_4bit: bool = typer.Option(False, "--semif-4bit", help="Load SemIf in 4-bit on CUDA (requires bitsandbytes)"),
+    semif_temperature: float = typer.Option(1.0, "--semif-temperature", min=0.01, help="SemIf probability temperature"),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w", help="Working directory for agent tools"),
     skill: Optional[list[str]] = typer.Option(None, "--skill", help="Enable a named workspace or user skill"),
     db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Path to experience database"),
@@ -169,7 +180,9 @@ def dev(
     if not workspace.is_dir():
         raise typer.BadParameter(f"Workspace directory does not exist: {workspace}", param_hint="--workspace")
     try:
-        backend = create_backend(classifier_backend, classifier_model, classifier_endpoint, api_key=api_key)
+        backend = create_backend("semif" if semif_model else classifier_backend,
+            semif_model or classifier_model, classifier_endpoint, api_key=api_key, device=semif_device,
+            load_in_4bit=semif_4bit, temperature=semif_temperature)
     except (ValueError, RuntimeError, OSError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--classifier-backend") from exc
     agent = DeveloperAgent(llm_client=client, repository=repo, workspace_root=str(workspace), explicit_model=selected_model,
@@ -188,7 +201,11 @@ def dev(
         et = event.event_type
         p = event.payload
         if et == "skill_classification":
-            console.print(f"  [cyan]Skill Classifier:[/cyan] {p['primary_skill']} ({p['confidence']*100:.1f}%)")
+            console.print(f"  [cyan]Skill Classifier ({p['backend']} · {p['latency_ms']:.1f} ms):[/cyan] {p['primary_skill']} ({p['confidence']*100:.1f}%)")
+        elif et == "classifier_loading":
+            console.print(f"  [cyan]Loading local SemIf model {p['model']} for its first decision…[/cyan]")
+        elif et == "classifier_error":
+            console.print(f"  [yellow]Classifier {p['backend']} unavailable: {escape(p['error'])}; using sklearn[/yellow]")
         elif et == "ambiguity_assessment":
             color = "green" if p["risk_level"] == "low" else "yellow"
             console.print(f"  [{color}]Ambiguity & Risk:[/{color}] H={p['entropy']:.2f} bits | Risk={p['risk_level'].upper()} | Ask={p['should_ask_question']}")

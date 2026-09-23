@@ -23,9 +23,17 @@ class ComplexityRouter:
     def __init__(self, custom_tier_models: Optional[Dict[str, str]] = None):
         self.tier_models = custom_tier_models or MODEL_TIERS
 
-    def route(self, task_text: str) -> ComplexityRoutingResult:
+    def route(self, task_text: str, semantic_probabilities: Optional[Dict[str, float]] = None) -> ComplexityRoutingResult:
         low = task_text.lower().strip()
         word_count = len(re.findall(r"\b\w+\b", task_text))
+
+        if semantic_probabilities:
+            tier, confidence = max(semantic_probabilities.items(), key=lambda item: item[1])
+            if tier in self.tier_models:
+                reasons = {"fast": "Semantic decision selected the lightweight tier.",
+                           "standard": "Semantic decision selected the standard engineering tier.",
+                           "reasoning": "Semantic decision selected the deep reasoning tier."}
+                return ComplexityRoutingResult(tier, self.tier_models[tier], confidence, reasons[tier])
 
         # 1. Reasoning tier signals: multi-file, architecture, math/proof, subtle bug, algorithm design
         reasoning_cues = [

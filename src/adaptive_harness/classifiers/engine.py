@@ -4,9 +4,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import json
+import importlib.util
 import math
 import os
 import time
+from pathlib import Path
 from typing import Mapping
 from urllib.request import Request, urlopen
 
@@ -14,6 +16,8 @@ from adaptive_harness.classifiers.skill_classifier import SkillClassifier
 
 DOMAIN_LABELS = ["coding", "research", "science", "audit"]
 THINKING_LABELS = ["none", "low", "medium", "deep"]
+TIER_LABELS = ["fast", "standard", "reasoning"]
+VERIFICATION_LABELS = ["success", "syntax_error", "test_failure", "file_error", "runtime_error"]
 
 TRAINING = {
     "coding": ["fix the Python bug", "refactor the API", "implement a new feature", "write unit tests", "review the git diff", "compile this project"],
@@ -24,6 +28,31 @@ TRAINING = {
     "low": ["write a simple function", "fix a typo", "add a unit test", "explain this code", "format a file", "update a comment"],
     "medium": ["refactor multiple modules", "design a data pipeline", "solve an algorithm problem", "debug a cross module issue", "implement a parser", "integrate two systems"],
     "deep": ["prove a formal theorem", "debug a concurrency deadlock", "design a distributed architecture", "resolve subtle race conditions", "verify a cryptographic protocol", "analyze a complex numerical method"],
+    "fast": ["git status", "list files", "read one file", "check project version", "fix a typo", "quick status check"],
+    "standard": ["implement a feature", "write a unit test", "fix a typical bug", "refactor a module", "update an API", "add error handling"],
+    "reasoning": ["design distributed architecture", "debug concurrency deadlock", "analyze race condition", "prove mathematical theorem", "plan multi module redesign", "derive complex algorithm"],
+    "success": ["command completed with exit code zero", "file was written successfully", "all requested tests passed", "operation completed normally"],
+    "syntax_error": ["syntax error", "indentation error", "parser rejected code", "invalid Python syntax"],
+    "test_failure": ["pytest assertion failed", "unit test failed", "test suite reported failures", "expected value differs from actual"],
+    "file_error": ["file not found", "path does not exist", "missing directory", "no such file or directory"],
+    "runtime_error": ["process crashed", "nonzero exit code", "uncaught exception", "tool operation failed"],
+}
+
+SEMIF_DESCRIPTIONS = {
+    "code_edit": "Create, edit, modify, or surgically refactor source code files.",
+    "run_command": "Execute shell commands, git operations, or terminal processes.",
+    "search_explore": "Inspect directories, list files, or search across the codebase.",
+    "testing": "Execute pytest, run test suites, or verify test outcomes.",
+    "ask_clarification": "The request is inherently ambiguous, subjective, or incomplete.",
+    "general_reasoning": "Explain concepts, summarize architecture, or discuss design logic.",
+    "fast": "Lightweight query, simple file read, git status, or minor typo fix.",
+    "standard": "Standard engineering: coding new features, writing tests, refactoring.",
+    "reasoning": "Deep reasoning: complex architecture, concurrency, or mathematical proofs.",
+    "success": "Tool completed its intended action without error.",
+    "syntax_error": "Code contains a SyntaxError, IndentationError, or parse failure.",
+    "test_failure": "Unit test assertions failed or pytest reported test failures.",
+    "file_error": "File or directory path was not found or does not exist.",
+    "runtime_error": "Uncaught exception, crash, or non-zero exit status.",
 }
 
 
@@ -68,6 +97,38 @@ class BaseClassifierBackend(ABC):
         """Return one normalized probability distribution over labels."""
 
 
+class SemIfBackend(BaseClassifierBackend):
+    """Adapt a local SemIfEngine decision to the shared classifier contract."""
+    name = "semif"
+
+    def __init__(self, model: str | None = None, device: str = "auto", load_in_4bit: bool = False,
+                 temperature: float = 1.0):
+        from adaptive_harness.classifiers.semif_engine import SemIfEngine
+        self.engine = SemIfEngine(model or SemIfEngine.DEFAULT_MODEL, device, load_in_4bit, temperature)
+        self.model = self.engine.model_name_or_path
+
+    def classify(self, text: str, labels: list[str]) -> Classification:
+        decision = self.engine.decide(text, {label: SEMIF_DESCRIPTIONS.get(label, label.replace("_", " "))
+                                              for label in labels})
+        return Classification(decision.selected_option, decision.probabilities, decision.latency_ms)
+
+
+def semif_weights_cached(model: str | None = None) -> bool:
+    """Whether dependencies and a local checkpoint are available for auto selection."""
+    if importlib.util.find_spec("torch") is None or importlib.util.find_spec("transformers") is None:
+        return False
+    from adaptive_harness.classifiers.semif_engine import SemIfEngine
+    model = model or SemIfEngine.DEFAULT_MODEL
+    if Path(model).expanduser().exists():
+        return True
+    cache = Path(os.getenv("HF_HUB_CACHE", Path(os.getenv("HF_HOME", Path.home() / ".cache/huggingface")) / "hub"))
+    snapshots = cache / ("models--" + model.replace("/", "--")) / "snapshots"
+    try:
+        return snapshots.exists() and any(snapshots.iterdir())
+    except OSError:
+        return False
+
+
 class SklearnBackend(BaseClassifierBackend):
     name = "sklearn"
     model = "TF-IDF + Logistic Regression"
@@ -80,7 +141,7 @@ class SklearnBackend(BaseClassifierBackend):
         start = time.perf_counter()
         if set(labels).issubset(set(self.skill.pipeline.classes_)):
             probabilities = _normalize(self.skill.classify(text).probabilities, labels)
-        elif set(labels) in (set(DOMAIN_LABELS), set(THINKING_LABELS)):
+        elif set(labels) in (set(DOMAIN_LABELS), set(THINKING_LABELS), set(TIER_LABELS), set(VERIFICATION_LABELS)):
             key = tuple(sorted(labels))
             if key not in self._pipelines:
                 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -221,10 +282,15 @@ class OnnxBackend(BaseClassifierBackend):
 
 
 def create_backend(name: str = "sklearn", model: str | None = None, endpoint: str | None = None,
-                   api_key: str | None = None) -> BaseClassifierBackend:
+                   api_key: str | None = None, device: str = "auto", load_in_4bit: bool = False,
+                   temperature: float = 1.0) -> BaseClassifierBackend:
     name = name.lower().strip()
+    if name == "auto":
+        name = "semif" if semif_weights_cached(model) else "sklearn"
     if name == "sklearn":
         return SklearnBackend()
+    if name == "semif":
+        return SemIfBackend(model=model, device=device, load_in_4bit=load_in_4bit, temperature=temperature)
     if name == "local-slm" and endpoint and not endpoint.rstrip("/").endswith("api/generate"):
         local_endpoint = endpoint.rstrip("/")
         if not local_endpoint.endswith("chat/completions"):

@@ -26,6 +26,8 @@ class SkillClassificationResult:
     confidence: float
     probabilities: Dict[str, float]
     ranked_skills: List[Tuple[str, float]]
+    entropy: float | None = None
+    confidence_margin: float | None = None
 
 
 class SkillClassifier:

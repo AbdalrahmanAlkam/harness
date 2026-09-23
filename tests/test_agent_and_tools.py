@@ -31,7 +31,9 @@ from adaptive_harness.llm.mock_client import ToolCall
 from adaptive_harness.classifiers.risk_classifier import ToolRiskClassifier
 from adaptive_harness.tools.science import CalculateTool
 from adaptive_harness.tools.research import WebSearchTool
-from adaptive_harness.classifiers.engine import BaseClassifierBackend, Classification, create_backend, _parse_response
+from adaptive_harness.classifiers.engine import (BaseClassifierBackend, Classification, create_backend,
+    _parse_response, semif_weights_cached)
+from adaptive_harness.classifiers.semif_engine import SemIfEngine
 from adaptive_harness.classifiers.domain_classifier import DomainClassifier, DomainMode
 from adaptive_harness.classifiers.thinking_classifier import ThinkingClassifier, ThinkingLevel
 import time
@@ -372,6 +374,9 @@ async def test_tui_app_headless(tmp_path: Path):
 
         app._handle_slash_command("/classifier ollama qwen2.5:1.5b")
         assert app.agent.classifier_backend.name == "ollama"
+        app._handle_slash_command("/classifier semif Qwen/Qwen2.5-3B-Instruct")
+        assert app.agent.classifier_backend.name == "semif"
+        assert app.agent.classifier_backend.model == "Qwen/Qwen2.5-3B-Instruct"
         app._handle_slash_command("/classifier sklearn")
         assert app.agent.classifier_backend.name == "sklearn"
 
@@ -588,9 +593,103 @@ def test_selected_classifier_drives_all_three_heads(tmp_path: Path):
     agent = DeveloperAgent(llm_client=LLMClient(force_mock=True), classifier_backend=backend,
                            workspace_root=str(tmp_path))
     events = list(agent.run_stream("summarize the papers", max_steps=1))
-    assert len(backend.calls) == 3
+    assert len(backend.calls) >= 4
     assert next(e.payload for e in events if e.event_type == "domain_mode")["mode"] == "research"
     assert next(e.payload for e in events if e.event_type == "skill_classification")["backend"] == "counting"
+    assert "fast" in backend.calls[1] or "standard" in backend.calls[1]
+
+
+def test_semif_engine_one_forward_pass_and_temperature():
+    class Tensor:
+        def __init__(self, values):
+            self.values = values
+        def to(self, device):
+            return self
+        def float(self):
+            return self
+        def cpu(self):
+            return self
+        def __truediv__(self, divisor):
+            return Tensor([value / divisor for value in self.values])
+        def __getitem__(self, index):
+            return self.values[index]
+        def __iter__(self):
+            return iter(self.values)
+
+    class FakeTorch:
+        @staticmethod
+        def inference_mode():
+            from contextlib import nullcontext
+            return nullcontext()
+        @staticmethod
+        def softmax(tensor, dim=0):
+            import math
+            weights = [math.exp(value) for value in tensor.values]
+            return Tensor([value / sum(weights) for value in weights])
+
+    class Tokenizer:
+        truncation_side = "right"
+        def encode(self, text, add_special_tokens=False):
+            return [ord(text[-1])]
+        def __call__(self, prompt, **kwargs):
+            return {"input_ids": Tensor([1, 2])}
+
+    class Logits:
+        def __getitem__(self, key):
+            return Tensor([3.0, 1.0])
+
+    class Model:
+        calls = 0
+        def parameters(self):
+            return iter([SimpleNamespace(device="cpu")])
+        def __call__(self, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(logits=Logits())
+
+    engine = SemIfEngine("fixture", temperature=2.0)
+    engine._torch, engine._tokenizer, engine._model = FakeTorch(), Tokenizer(), Model()
+    result = engine.decide("update the API", {"edit": "modify source code", "test": "run tests"})
+    assert engine._model.calls == 1
+    assert result.selected_option == "edit"
+    assert result.probabilities["edit"] == pytest.approx(1 / (1 + 2.718281828 ** -1))
+    assert sum(result.probabilities.values()) == pytest.approx(1.0)
+    assert result.entropy > 0
+    assert result.margin == pytest.approx(result.probabilities["edit"] - result.probabilities["test"])
+    assert result.latency_ms >= 0
+
+
+def test_semif_lazy_fallback_and_auto_engine(monkeypatch, tmp_path: Path):
+    assert not semif_weights_cached("missing-local-checkpoint")
+    assert create_backend("auto", "missing-local-checkpoint").name == "sklearn"
+    backend = create_backend("semif", str(tmp_path))
+    assert backend.name == "semif"  # construction does not load weights
+    backend.engine._load = lambda: (_ for _ in ()).throw(RuntimeError("weights missing"))
+    class OfflineClient:
+        default_model = "mock"
+        def complete(self, **kwargs):
+            return LLMResponse(content="fallback answer", model="mock")
+    agent = DeveloperAgent(llm_client=OfflineClient(), classifier_backend=backend, workspace_root=str(tmp_path))
+    events = list(agent.run_stream("explain this design", max_steps=1))
+    assert any(event.event_type == "classifier_error" for event in events)
+    assert agent.classifier_backend.name == "sklearn"
+    assert next(event.payload for event in events if event.event_type == "skill_classification")["backend"] == "sklearn"
+
+
+def test_semif_heads_drive_ambiguity_tier_and_verification():
+    from adaptive_harness.classifiers.skill_classifier import SkillClassificationResult
+
+    skill = SkillClassificationResult("code_edit", 0.3,
+        {"code_edit": 0.3, "run_command": 0.25, "search_explore": 0.2, "testing": 0.1,
+         "ask_clarification": 0.1, "general_reasoning": 0.05},
+        [("code_edit", 0.3), ("run_command", 0.25), ("search_explore", 0.2), ("testing", 0.1),
+         ("ask_clarification", 0.1), ("general_reasoning", 0.05)])
+    ambiguity = AmbiguityClassifier().evaluate("work on the project", skill, semantic_decision=True)
+    assert ambiguity.should_ask_question
+    routed = ComplexityRouter().route("simple typo", {"fast": 0.05, "standard": 0.1, "reasoning": 0.85})
+    assert routed.tier == "reasoning"
+    semantic_verification = VerificationClassifier().evaluate(
+        "run_bash", ToolResult(success=False, output="Unexpected result"), semantic_status="test_failure")
+    assert semantic_verification.status == "TEST_FAILURE"
 
 
 def test_classifier_json_validation_and_local_endpoint():

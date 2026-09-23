@@ -20,7 +20,8 @@ class VerificationAssessment:
 class VerificationClassifier:
     """Classifies tool execution results to drive autonomous agent self-healing and recovery."""
 
-    def evaluate(self, tool_name: str, tool_result: ToolResult) -> VerificationAssessment:
+    def evaluate(self, tool_name: str, tool_result: ToolResult,
+                 semantic_status: Optional[str] = None) -> VerificationAssessment:
         if tool_result.success:
             return VerificationAssessment(
                 status="SUCCESS",
@@ -58,6 +59,16 @@ class VerificationClassifier:
                 recommended_action="VERIFY_PATH_OR_SEARCH",
                 diagnostic_summary="File or directory path does not exist. Use search_files or list_directory first.",
             )
+
+        semantic_assessments = {
+            "syntax_error": ("SYNTAX_ERROR", "AUTO_RETRY_SYNTAX_FIX", "Semantic verifier detected a syntax or parse failure."),
+            "test_failure": ("TEST_FAILURE", "AUTO_RETRY_TEST_FIX", "Semantic verifier detected failed test assertions."),
+            "file_error": ("FILE_ERROR", "VERIFY_PATH_OR_SEARCH", "Semantic verifier detected a missing path."),
+            "runtime_error": ("RUNTIME_ERROR", "AUTO_RETRY", "Semantic verifier detected a runtime failure."),
+        }
+        if semantic_status in semantic_assessments:
+            status, action, diagnostic = semantic_assessments[semantic_status]
+            return VerificationAssessment(status, True, action, diagnostic)
 
         # General runtime exception
         return VerificationAssessment(

@@ -74,9 +74,12 @@ class AdaptiveHarnessApp(App):
         default_model: Optional[str] = None,
         db_path: Path | str = "output/experience.db",
         workspace_root: Optional[str] = None,
-        classifier_backend: str = "sklearn",
+        classifier_backend: str = "auto",
         classifier_model: Optional[str] = None,
         classifier_endpoint: Optional[str] = None,
+        semif_device: str = "auto",
+        semif_4bit: bool = False,
+        semif_temperature: float = 1.0,
         session_id: Optional[str] = None,
         **kwargs,
     ):
@@ -91,6 +94,9 @@ class AdaptiveHarnessApp(App):
         if not Path(self.workspace_root).is_dir():
             raise ValueError(f"Workspace directory does not exist: {self.workspace_root}")
         self.classifier_endpoint = classifier_endpoint
+        self.semif_device = semif_device
+        self.semif_4bit = semif_4bit
+        self.semif_temperature = semif_temperature
 
         # LLM Client & Repo
         self.llm_client = LLMClient(
@@ -124,7 +130,8 @@ class AdaptiveHarnessApp(App):
             workspace_root=self.workspace_root,
             explicit_model=default_model,
             classifier_backend=create_backend(classifier_backend, classifier_model, classifier_endpoint,
-                                               api_key=self.api_key),
+                api_key=self.api_key, device=semif_device, load_in_4bit=semif_4bit,
+                temperature=semif_temperature),
         )
         if session_id:
             self._restore_session()
@@ -150,6 +157,9 @@ class AdaptiveHarnessApp(App):
         self.sub_title = f"Model: {self.agent.llm_client.default_model} | {'LIVE' if not self.agent.llm_client.is_mock else 'OFFLINE MOCK'}"
 
         log = self.query_one("#chat-log", RichLog)
+        self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+            classifier_engine=self.agent.classifier_backend.name,
+            classifier_model=self.agent.classifier_backend.model)
         log.write("[bold cyan]Welcome to Adaptive Agent Harness 2.0![/bold cyan]")
         log.write(
             "[dim]Autonomous coding agent with pervasive ML routing, active verification, and interactive clarification.[/dim]\n"
@@ -196,7 +206,9 @@ class AdaptiveHarnessApp(App):
         self.session.skills = list(self.agent.active_skills)
         self.session.settings = {"classifier_backend": self.agent.classifier_backend.name,
                                  "classifier_model": self.agent.classifier_backend.model,
-                                 "classifier_endpoint": self.classifier_endpoint or ""}
+                                 "classifier_endpoint": self.classifier_endpoint or "",
+                                 "semif_device": self.semif_device, "semif_4bit": str(self.semif_4bit),
+                                 "semif_temperature": str(self.semif_temperature)}
         self.session_store.save(self.session)
 
     def _restore_session(self) -> None:
@@ -208,10 +220,18 @@ class AdaptiveHarnessApp(App):
         self.agent.set_workspace(self.session.workspace)
         settings = self.session.settings or {}
         self.classifier_endpoint = settings.get("classifier_endpoint") or None
+        self.semif_device = settings.get("semif_device", self.semif_device)
+        self.semif_4bit = settings.get("semif_4bit", str(self.semif_4bit)).lower() == "true"
+        try:
+            self.semif_temperature = float(settings.get("semif_temperature", self.semif_temperature))
+        except (TypeError, ValueError):
+            self.semif_temperature = 1.0
         if settings.get("classifier_backend"):
             try:
                 self.agent.classifier_backend = create_backend(settings["classifier_backend"],
-                    settings.get("classifier_model"), self.classifier_endpoint, api_key=self.api_key)
+                    settings.get("classifier_model"), self.classifier_endpoint, api_key=self.api_key,
+                    device=self.semif_device, load_in_4bit=self.semif_4bit,
+                    temperature=self.semif_temperature)
             except (ValueError, RuntimeError, OSError) as exc:
                 self.agent.classifier_backend = create_backend("sklearn")
                 self._session_restore_warning = f"Saved classifier could not load ({exc}); using sklearn."
@@ -278,7 +298,7 @@ class AdaptiveHarnessApp(App):
         log.write("  /key <API_KEY>         - Set OpenRouter API key")
         log.write("  /model <MODEL_ID>      - Switch active LLM model")
         log.write("  /tier <fast|standard|reasoning> - Force model tier")
-        log.write("  /classifier <backend> [model] - Switch classifier engine")
+        log.write("  /classifier <semif|sklearn|backend> [model/path] - Switch decision engine")
         log.write("  /workspace [path]      - Show or change working directory")
         log.write("  /sessions              - List saved sessions")
         log.write("  /session new [title] | load <id> | save")
@@ -368,7 +388,8 @@ class AdaptiveHarnessApp(App):
                 return
             try:
                 backend = create_backend(args[0], args[1] if len(args) > 1 else None, self.classifier_endpoint,
-                                         api_key=self.api_key)
+                    api_key=self.api_key, device=self.semif_device, load_in_4bit=self.semif_4bit,
+                    temperature=self.semif_temperature)
             except (ValueError, RuntimeError, OSError) as exc:
                 log.write(Text(str(exc), style="red"))
                 return
@@ -376,6 +397,7 @@ class AdaptiveHarnessApp(App):
             log.write(Text(f"✓ Classifier: {backend.name} {backend.model}", style="green"))
             self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
                 classifier_engine=backend.name, classifier_model=backend.model)
+            self._save_session()
             self._refresh_status()
         elif cmd == "/workspace":
             if not arg:
@@ -528,6 +550,10 @@ class AdaptiveHarnessApp(App):
                 )
         elif et == "classifier_error":
                 log.write(Text(f"Classifier {p['backend']} failed: {p['error']}; using sklearn", style="yellow"))
+        elif et == "classifier_loading":
+                log.write(Text(f"Loading local SemIf model {p['model']} for its first decision…", style="cyan"))
+        elif et == "classifier_fallback":
+                telemetry.update_telemetry(classifier_engine=p["backend"], classifier_model=p["model"])
         elif et == "llm_error":
                 log.write(Text(p["message"], style="bold red"))
         elif et == "storage_error":

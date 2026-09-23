@@ -14,7 +14,8 @@ from adaptive_harness.classifiers.complexity_router import ComplexityRouter, Com
 from adaptive_harness.classifiers.skill_classifier import SkillClassificationResult, SkillClassifier
 from adaptive_harness.classifiers.verification_classifier import VerificationAssessment, VerificationClassifier
 from adaptive_harness.classifiers.risk_classifier import ToolRiskClassifier
-from adaptive_harness.classifiers.engine import BaseClassifierBackend, SklearnBackend, DOMAIN_LABELS, THINKING_LABELS
+from adaptive_harness.classifiers.engine import (BaseClassifierBackend, SklearnBackend, DOMAIN_LABELS,
+    THINKING_LABELS, TIER_LABELS, VERIFICATION_LABELS)
 from adaptive_harness.classifiers.domain_classifier import DomainClassifier, DomainAssessment, DOMAIN_GUIDANCE, DomainMode
 from adaptive_harness.classifiers.thinking_classifier import ThinkingClassifier, ThinkingAssessment, ThinkingLevel, BUDGET_TOKENS
 from adaptive_harness.classifiers.skill_classifier import SKILL_CLASSES
@@ -127,6 +128,11 @@ class DeveloperAgent:
         start_time = time.perf_counter()
 
         # 1. Skill classification
+        semif_engine = getattr(self.classifier_backend, "engine", None)
+        if (self.classifier_backend.name == "semif" and semif_engine is not None and
+                not getattr(semif_engine, "loaded", False)):
+            yield AgentEvent("classifier_loading", {"backend": "semif",
+                "model": self.classifier_backend.model})
         try:
             classification = self.classifier_backend.classify(user_input, SKILL_CLASSES)
             classifier_name = self.classifier_backend.name
@@ -135,10 +141,13 @@ class DeveloperAgent:
             yield AgentEvent("classifier_error", {"backend": self.classifier_backend.name, "error": str(exc)})
             fallback = self.fallback_classifier
             classification = fallback.classify(user_input, SKILL_CLASSES)
+            self.classifier_backend = fallback
             classifier_name, classifier_model = fallback.name, fallback.model
+            yield AgentEvent("classifier_fallback", {"backend": classifier_name, "model": classifier_model})
         probabilities = classification.probabilities
         ranked = sorted(probabilities.items(), key=lambda item: item[1], reverse=True)
-        skill_res = SkillClassificationResult(classification.label, ranked[0][1], probabilities, ranked)
+        skill_res = SkillClassificationResult(classification.label, ranked[0][1], probabilities, ranked,
+                                              classification.entropy, classification.margin)
         yield AgentEvent(
             event_type="skill_classification",
             payload={
@@ -152,7 +161,8 @@ class DeveloperAgent:
         )
 
         # 2. Ambiguity & Clarification assessment ("questions in the middle of development")
-        ambiguity_res = self.ambiguity_classifier.evaluate(user_input, skill_res)
+        ambiguity_res = self.ambiguity_classifier.evaluate(user_input, skill_res,
+            semantic_decision=(classifier_name == "semif" and self.clarification_callback is not None))
         yield AgentEvent(
             event_type="ambiguity_assessment",
             payload=ambiguity_res.to_dict(),
@@ -188,25 +198,40 @@ class DeveloperAgent:
             user_input = f"{user_input}\n[User Clarification]: {user_answer}"
 
         # 3. Model tier routing
-        complexity_res = self.complexity_router.route(user_input)
+        try:
+            tier_prediction = self.classifier_backend.classify(user_input, TIER_LABELS)
+        except Exception as exc:
+            yield AgentEvent("classifier_error", {"backend": self.classifier_backend.name,
+                                                    "error": f"Complexity: {exc}"})
+            self.classifier_backend = self.fallback_classifier
+            tier_prediction = self.fallback_classifier.classify(user_input, TIER_LABELS)
+            classifier_name, classifier_model = self.fallback_classifier.name, self.fallback_classifier.model
+            yield AgentEvent("classifier_fallback", {"backend": classifier_name, "model": classifier_model})
+        complexity_res = self.complexity_router.route(user_input, tier_prediction.probabilities)
         try:
             domain_prediction = self.classifier_backend.classify(user_input, DOMAIN_LABELS)
         except Exception as exc:
             yield AgentEvent("classifier_error", {"backend": self.classifier_backend.name, "error": f"Domain: {exc}"})
+            self.classifier_backend = self.fallback_classifier
             domain_prediction = self.fallback_classifier.classify(user_input, DOMAIN_LABELS)
+            classifier_name, classifier_model = self.fallback_classifier.name, self.fallback_classifier.model
+            yield AgentEvent("classifier_fallback", {"backend": classifier_name, "model": classifier_model})
         try:
             thinking_prediction = self.classifier_backend.classify(user_input, THINKING_LABELS)
         except Exception as exc:
             yield AgentEvent("classifier_error", {"backend": self.classifier_backend.name, "error": f"Thinking: {exc}"})
+            self.classifier_backend = self.fallback_classifier
             thinking_prediction = self.fallback_classifier.classify(user_input, THINKING_LABELS)
+            classifier_name, classifier_model = self.fallback_classifier.name, self.fallback_classifier.model
+            yield AgentEvent("classifier_fallback", {"backend": classifier_name, "model": classifier_model})
         domain_res = DomainAssessment(DomainMode(domain_prediction.label), max(domain_prediction.probabilities.values()))
         heuristic_domain = self.domain_classifier.classify(user_input)
-        if heuristic_domain.confidence >= 0.8:
+        if classifier_name != "semif" and heuristic_domain.confidence >= 0.8:
             domain_res = heuristic_domain
         predicted_level = ThinkingLevel(thinking_prediction.label)
         heuristic_thinking = self.thinking_classifier.classify(user_input)
         order = list(ThinkingLevel)
-        if order.index(heuristic_thinking.level) > order.index(predicted_level):
+        if classifier_name != "semif" and order.index(heuristic_thinking.level) > order.index(predicted_level):
             predicted_level = heuristic_thinking.level
         thinking_res = ThinkingAssessment(predicted_level, BUDGET_TOKENS[predicted_level],
                                           None if predicted_level == ThinkingLevel.NONE else
@@ -219,7 +244,9 @@ class DeveloperAgent:
                                           "latency_ms": round(domain_prediction.latency_ms, 2)})
         yield AgentEvent("thinking_budget", {"level": thinking_res.level.value, "tokens": thinking_res.budget_tokens,
                                                "latency_ms": round(thinking_prediction.latency_ms, 2),
-                                               "classifier_total_ms": round(classification.latency_ms + domain_prediction.latency_ms + thinking_prediction.latency_ms, 2)})
+                                               "classifier_total_ms": round(classification.latency_ms + tier_prediction.latency_ms
+                                                                             + domain_prediction.latency_ms
+                                                                             + thinking_prediction.latency_ms, 2)})
         selected_model = self.explicit_model or complexity_res.recommended_model
         selected_tier = (next((tier for tier, model in self.complexity_router.tier_models.items()
                                if model == selected_model), "manual") if self.explicit_model else complexity_res.tier)
@@ -343,7 +370,21 @@ class DeveloperAgent:
                 )
 
                 # 4. Verification Classifier on tool execution output
-                verif_res = self.verification_classifier.evaluate(tc.name, tool_res)
+                try:
+                    verification_prediction = self.classifier_backend.classify(
+                        f"Tool: {tc.name}\nSuccess: {tool_res.success}\nError: {tool_res.error or ''}\nOutput: {shown_output}",
+                        VERIFICATION_LABELS)
+                except Exception as exc:
+                    yield AgentEvent("classifier_error", {"backend": self.classifier_backend.name,
+                                                            "error": f"Verification: {exc}"})
+                    self.classifier_backend = self.fallback_classifier
+                    verification_prediction = self.fallback_classifier.classify(
+                        f"Tool: {tc.name}\nSuccess: {tool_res.success}\nError: {tool_res.error or ''}\nOutput: {shown_output}",
+                        VERIFICATION_LABELS)
+                    yield AgentEvent("classifier_fallback", {"backend": self.fallback_classifier.name,
+                                                               "model": self.fallback_classifier.model})
+                verif_res = self.verification_classifier.evaluate(tc.name, tool_res,
+                                                                   verification_prediction.label)
                 if verif_res.needs_retry:
                     unresolved_failures.add(tc.name)
                 elif tool_res.success:
