@@ -95,8 +95,16 @@ class LLMClient:
                               any(marker in model_name for marker in
                                   ("gemini-2.5", "gemini-3", "deepseek-r1", "o3-mini", "reasoning",
                                    "z-ai/glm-5.3")))
+        legacy_thinking_history = bool(is_claude_reasoning and reasoning_effort and reasoning_budget_tokens != 0 and any(
+            message.get("role") == "assistant" and message.get("tool_calls") and
+            not message.get("reasoning_details") for message in messages))
         if is_openrouter and supports_reasoning:
-            if reasoning_budget_tokens == 0:
+            if legacy_thinking_history:
+                # Older saved turns contain tool calls without the opaque
+                # thinking signature OpenRouter needs to replay with Claude.
+                # Use provider defaults for this conversation until it resets.
+                pass
+            elif reasoning_budget_tokens == 0:
                 kwargs["extra_body"] = {"reasoning": {"enabled": False} if is_claude_reasoning
                                         else {"effort": "none"}}
                 kwargs.pop("temperature", None)
@@ -116,14 +124,16 @@ class LLMClient:
 
         try:
             assert self._openai_client is not None
-            thinking_fallback = False
+            thinking_fallback = legacy_thinking_history
             try:
                 response = self._openai_client.chat.completions.create(**kwargs)
             except Exception as exc:
                 detail = str(exc).lower()
                 status = getattr(exc, "status_code", None)
-                reasoning_rejected = status in {400, 422} and any(
-                    token in detail for token in ("reasoning", "max_tokens", "effort", "unsupported parameter"))
+                history_rejected = status in {400, 422} and (
+                    "thinking block" in detail or "thinking is enabled" in detail)
+                reasoning_rejected = history_rejected or (status in {400, 422} and any(
+                    token in detail for token in ("reasoning", "max_tokens", "effort", "unsupported parameter")))
                 if not reasoning_rejected or "reasoning" not in kwargs.get("extra_body", {}):
                     raise
                 # Keep the chosen model and request intact; retry once with the
@@ -169,13 +179,22 @@ class LLMClient:
                     getattr(details, "cached_tokens", None) or
                     getattr(response.usage, "cache_read_input_tokens", None) or 0)
 
+            reasoning_details = getattr(msg, "reasoning_details", None)
+            if reasoning_details is None:
+                extra = getattr(msg, "model_extra", None)
+                if isinstance(extra, dict):
+                    reasoning_details = extra.get("reasoning_details")
+
             return LLMResponse(
                 content=msg.content,
                 tool_calls=tool_calls,
                 model=response.model or selected_model,
                 finish_reason=choice.finish_reason or "stop",
                 usage=usage_dict,
-                metadata={"thinking_fallback": thinking_fallback},
+                metadata={"thinking_fallback": thinking_fallback,
+                          "thinking_fallback_reason": "legacy_tool_history" if legacy_thinking_history else
+                              "provider_rejected_thinking" if thinking_fallback else "",
+                          "reasoning_details": self._serialize_reasoning_details(reasoning_details)},
             )
 
         except Exception as e:
@@ -190,3 +209,17 @@ class LLMClient:
                 finish_reason="error",
                 usage={"prompt_tokens": 0, "completion_tokens": 0},
             )
+
+    @staticmethod
+    def _serialize_reasoning_details(details):
+        """Keep OpenRouter's opaque reasoning blocks intact for tool-call replay."""
+        if details is None:
+            return None
+        serialized = []
+        for item in details:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(exclude_none=True)
+            elif hasattr(item, "dict"):
+                item = item.dict(exclude_none=True)
+            serialized.append(item)
+        return serialized

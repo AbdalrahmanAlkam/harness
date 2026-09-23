@@ -57,7 +57,7 @@ def test_reasoning_parameter_rejection_retries_same_model_without_thinking():
     def create(**kwargs):
         requests.append(kwargs)
         if len(requests) == 1:
-            error = ValueError("Unsupported reasoning effort parameter")
+            error = ValueError("Provider returned error: messages.9.content.0.type expected thinking; when thinking is enabled, an assistant message must start with a thinking block.")
             error.status_code = 400
             raise error
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="answer", tool_calls=None),
@@ -71,6 +71,24 @@ def test_reasoning_parameter_rejection_retries_same_model_without_thinking():
     assert requests[0]["model"] == requests[1]["model"] == "anthropic/claude-3.7-sonnet"
     assert "reasoning" not in requests[1].get("extra_body", {})
     assert requests[1]["temperature"] == 0.2
+
+
+def test_claude_history_without_tool_thinking_uses_default_mode_safely():
+    client = LLMClient(api_key="test-key")
+    captured = {}
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None),
+            finish_reason="stop")], usage=None, model=kwargs["model"])
+    client._openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    messages = [{"role": "user", "content": "old task"},
+                {"role": "assistant", "content": "running", "tool_calls": [{"id": "1"}]},
+                {"role": "user", "content": "new task"}]
+    response = client.complete(messages, model="anthropic/claude-sonnet-4", reasoning_effort="high",
+                               reasoning_budget_tokens=16000)
+    assert response.content == "ok"
+    assert response.metadata["thinking_fallback_reason"] == "legacy_tool_history"
+    assert "reasoning" not in captured.get("extra_body", {})
 
 
 @pytest.mark.anyio
@@ -146,6 +164,22 @@ def test_agent_recovers_from_missing_file_then_hits_memory(tmp_path):
     cached = list(agent.run_stream("read sample.py", max_steps=4))
     assert any(event.event_type == "memory_hit" for event in cached)
     assert client.calls == calls
+
+
+def test_agent_preserves_provider_reasoning_blocks_between_tool_steps(tmp_path):
+    captured = []
+    class Client:
+        def complete(self, **kwargs):
+            captured.append(kwargs["messages"])
+            if len(captured) == 1:
+                return LLMResponse(content="Checking", metadata={"reasoning_details": [
+                    {"type": "reasoning.encrypted", "data": "opaque-signature"}]},
+                    tool_calls=[ToolCall(id="1", name="run_bash", arguments={"command": "echo ok"})])
+            return LLMResponse(content="Done")
+    agent = DeveloperAgent(llm_client=Client(), workspace_root=str(tmp_path))
+    list(agent.run_stream("run command echo ok", max_steps=2))
+    assistant = next(message for message in captured[1] if message.get("role") == "assistant")
+    assert assistant["reasoning_details"] == [{"type": "reasoning.encrypted", "data": "opaque-signature"}]
 
 
 @pytest.mark.anyio

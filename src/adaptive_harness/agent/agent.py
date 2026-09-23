@@ -418,8 +418,11 @@ class DeveloperAgent:
                 usage[token_type] += int((llm_resp.usage or {}).get(token_type, 0) or 0)
             cached_tokens += int((llm_resp.usage or {}).get("cached_tokens", 0) or 0)
             if (llm_resp.metadata or {}).get("thinking_fallback"):
-                yield AgentEvent("llm_notice", {"message":
-                    "The provider rejected the requested thinking settings; this request was retried with its default reasoning behavior."})
+                reason = (llm_resp.metadata or {}).get("thinking_fallback_reason")
+                notice = ("Older assistant tool history has no replayable thinking blocks; using provider default reasoning for this session. Start a new session to re-enable the selected thinking budget."
+                          if reason == "legacy_tool_history" else
+                          "The provider rejected the requested thinking settings; this request was retried with its default reasoning behavior.")
+                yield AgentEvent("llm_notice", {"message": notice})
             if llm_resp.finish_reason == "error":
                 yield AgentEvent("llm_error", {"message": llm_resp.content or "Unknown model error", "model": selected_model})
                 final_answer = llm_resp.content or "Model request failed"
@@ -435,7 +438,10 @@ class DeveloperAgent:
 
             # If no tool calls, task is finished
             if not llm_resp.tool_calls:
-                self.messages.append({"role": "assistant", "content": llm_resp.content or ""})
+                assistant_message = {"role": "assistant", "content": llm_resp.content or ""}
+                if (llm_resp.metadata or {}).get("reasoning_details"):
+                    assistant_message["reasoning_details"] = llm_resp.metadata["reasoning_details"]
+                self.messages.append(assistant_message)
                 completed = not unresolved_failures
                 break
 
@@ -457,11 +463,14 @@ class DeveloperAgent:
                         return
 
             # Handle tool calls
-            self.messages.append({
+            assistant_tool_message = {
                 "role": "assistant", "content": llm_resp.content or "",
                 "tool_calls": [{"id": tc.id, "type": "function", "function": {
                     "name": tc.name, "arguments": json.dumps(tc.arguments)}} for tc in llm_resp.tool_calls],
-            })
+            }
+            if (llm_resp.metadata or {}).get("reasoning_details"):
+                assistant_tool_message["reasoning_details"] = llm_resp.metadata["reasoning_details"]
+            self.messages.append(assistant_tool_message)
             for tc in llm_resp.tool_calls:
                 yield AgentEvent("agent_stage", {"stage": "tool_running", "step": step, "tool": tc.name})
                 yield AgentEvent(
