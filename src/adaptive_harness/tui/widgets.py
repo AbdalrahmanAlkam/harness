@@ -131,10 +131,14 @@ class ClassifierTelemetryWidget(Static):
         status.append("MODEL  ", style="bold cyan")
         status.append(f"{self.selection.upper()} · {self.tier.upper()}\n", style="bold magenta")
         status.append(self.active_model + "\n")
-        status.append("CLASSIFIER  ", style="bold cyan")
-        status.append(self.classifier_engine.upper() + "\n", style="bold")
-        status.append(self.classifier_model + "\n")
-        status.append(f"Latency  {self.classifier_latency_ms:.2f} ms\n", style="cyan")
+        engine_name = {"semif": "SemIf", "sklearn": "SKLearn", "ollama": "Ollama",
+                       "local-slm": "Local SLM", "onnx": "ONNX", "openrouter": "OpenRouter"}.get(
+                           self.classifier_engine.lower(), self.classifier_engine)
+        model_name = self.classifier_model.rstrip("/").rsplit("/", 1)[-1] if self.classifier_model else ""
+        engine_color = "bold cyan" if self.classifier_engine.lower() == "semif" else "bold green"
+        status.append("Engine: ", style="bold cyan")
+        status.append(f"{engine_name} ({model_name})\n", style=engine_color)
+        status.append(f"Latency: {self.classifier_latency_ms:.2f} ms\n", style="cyan")
         status.append(f"Domain  {self.domain_mode.upper()}\n", style="bold magenta")
         status.append(f"Thinking  {self.thinking_level.upper()} · {self.thinking_tokens:,} tokens\n", style="bold yellow")
         status.append(f"Skill  {self.primary_skill}\n")

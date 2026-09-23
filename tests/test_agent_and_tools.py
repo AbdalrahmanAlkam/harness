@@ -23,7 +23,7 @@ from adaptive_harness.tools.file_ops import EditFileTool, ReadFileTool, WriteFil
 from adaptive_harness.tools.testing import RunPytestTool
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 from adaptive_harness.tui.app import AdaptiveHarnessApp
-from adaptive_harness.tui.widgets import ClarificationModal
+from adaptive_harness.tui.widgets import ClarificationModal, ClassifierTelemetryWidget
 from adaptive_harness.data.sessions import SessionStore
 from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.llm.mock_client import LLMResponse
@@ -377,6 +377,16 @@ async def test_tui_app_headless(tmp_path: Path):
         app._handle_slash_command("/classifier semif Qwen/Qwen2.5-3B-Instruct")
         assert app.agent.classifier_backend.name == "semif"
         assert app.agent.classifier_backend.model == "Qwen/Qwen2.5-3B-Instruct"
+        app.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+            classifier_engine="semif", classifier_model=app.agent.classifier_backend.model,
+            classifier_latency_ms=18.5)
+        from rich.console import Console
+        console = Console(width=52, color_system=None)
+        with console.capture() as capture:
+            console.print(app.query_one("#telemetry").render())
+        telemetry_render = capture.get()
+        assert "Engine:" in telemetry_render and "SemIf" in telemetry_render
+        assert "Qwen2.5-3B-Instruct" in telemetry_render and "18.50 ms" in telemetry_render
         app._handle_slash_command("/classifier sklearn")
         assert app.agent.classifier_backend.name == "sklearn"
 
