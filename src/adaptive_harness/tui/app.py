@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 import concurrent.futures
+from datetime import datetime
+import json
+import os
 from typing import Optional
 from rich.syntax import Syntax
 from rich.text import Text
 from rich.markdown import Markdown
 from textual import work
 from textual.app import App, ComposeResult
+from textual import events
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
@@ -17,9 +21,16 @@ from adaptive_harness.agent.agent import AgentEvent, DeveloperAgent
 from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.classifiers.engine import create_backend
 from adaptive_harness.data.storage import ExperienceRepository
+from adaptive_harness.data.config import ConfigManager, PromptHistoryStore
 from adaptive_harness.data.sessions import SessionStore
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
-from adaptive_harness.tui.widgets import ClarificationModal, ClassifierTelemetryWidget
+from adaptive_harness.tui.widgets import (ClarificationModal, ClassifierTelemetryWidget,
+    HistoryInput, PinnedRichLog, ThemePickerModal, THEME_CHOICES)
+
+
+COMMANDS = ("/key", "/model", "/tier", "/theme", "/classifier", "/new",
+            "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions",
+            "/session", "/skills", "/skill", "/output", "/export")
 
 
 class AdaptiveHarnessApp(App):
@@ -49,22 +60,28 @@ class AdaptiveHarnessApp(App):
     #prompt-input {
         width: 100%;
     }
+    #command-hints { height: 1; color: $accent; display: none; }
+    #command-hints.visible { display: block; }
+    #scroll-indicator { height: 1; color: $warning; background: $surface; display: none; padding: 0 1; }
+    #scroll-indicator.visible { display: block; }
     #waiting-indicator {
         height: 1;
-        color: #fbbf24;
+        color: $warning;
         background: $surface;
         display: none;
         padding: 0 1;
     }
     #waiting-indicator.visible { display: block; }
-    #waiting-indicator.pulse { color: #22d3ee; }
+    #waiting-indicator.pulse { color: $accent; }
     """
 
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+l", "clear_screen", "Clear Log"),
+        ("ctrl+n", "new_session", "New Session"),
         ("f1", "show_help", "Help"),
-        ("f2", "toggle_telemetry", "Telemetry"),
+        ("f2", "choose_theme", "Theme"),
+        ("f3", "toggle_telemetry", "Telemetry"),
     ]
 
     def __init__(
@@ -81,10 +98,18 @@ class AdaptiveHarnessApp(App):
         semif_4bit: bool = False,
         semif_temperature: float = 1.0,
         session_id: Optional[str] = None,
+        config_dir: Path | str | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.api_key = api_key
+        self.config = ConfigManager(config_dir)
+        saved_config = self.config.load()
+        self.history_store = PromptHistoryStore(config_dir)
+        env_key = os.environ.get("OPENROUTER_API_KEY")
+        self.api_key = api_key or env_key or saved_config.get("api_key")
+        self.key_source = ("CLI flag" if api_key else "environment" if env_key else
+                           "saved configuration" if saved_config.get("api_key") else "offline")
+        self.saved_theme = saved_config.get("theme", "textual-dark")
         self.base_url = base_url
         if default_model and default_model.lower() == "auto":
             default_model = None
@@ -103,6 +128,7 @@ class AdaptiveHarnessApp(App):
             api_key=self.api_key,
             base_url=self.base_url,
             default_model=self.default_model,
+            force_mock=not bool(self.api_key) and not self._local_endpoint(),
         )
         self.repository = ExperienceRepository(self.db_path)
         self.session_store = SessionStore(self.db_path)
@@ -121,6 +147,10 @@ class AdaptiveHarnessApp(App):
         self._clarification_future: concurrent.futures.Future[str] | None = None
         self._session_restore_warning = ""
         self._quit_when_finished = False
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self._has_focus = True
+        self._bell_rung = False
 
         # Developer Agent with interactive clarification hook
         self.agent = DeveloperAgent(
@@ -136,23 +166,32 @@ class AdaptiveHarnessApp(App):
         if session_id:
             self._restore_session()
 
+    def _local_endpoint(self) -> bool:
+        from urllib.parse import urlparse
+        return urlparse(self.base_url or os.environ.get("OPENROUTER_BASE_URL", "")).hostname in {
+            "localhost", "127.0.0.1", "::1"}
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="main-container"):
-            yield RichLog(id="chat-log", min_width=1, wrap=True, highlight=True, markup=True)
+            yield PinnedRichLog(id="chat-log", min_width=1, wrap=True, highlight=True, markup=True)
             yield ClassifierTelemetryWidget(id="telemetry")
 
         yield Static(id="status-line")
+        yield Static("[Pinned: Scroll to bottom ↓]", id="scroll-indicator")
 
         with Container(id="input-container"):
-            yield Input(
+            yield HistoryInput(
                 placeholder="Ask agent to code, inspect, test, or run commands (/help for commands)...",
-                id="prompt-input",
+                id="prompt-input", history=self.history_store.entries,
             )
+            yield Static(id="command-hints")
         yield Static("⚡ Agent waiting on your clarification", id="waiting-indicator")
         yield Footer()
 
     def on_mount(self) -> None:
+        if self.saved_theme in self.available_themes:
+            self.theme = self.saved_theme
         self.title = "Adaptive Agent Harness - Developer TUI"
         self.sub_title = f"Model: {self.agent.llm_client.default_model} | {'LIVE' if not self.agent.llm_client.is_mock else 'OFFLINE MOCK'}"
 
@@ -171,6 +210,8 @@ class AdaptiveHarnessApp(App):
             log.write(Text(f"Connected to {self.agent.llm_client.base_url} using {self.agent.llm_client.default_model}\n", style="green"))
         if self._session_restore_warning:
             log.write(Text(self._session_restore_warning, style="yellow"))
+        if self.config.last_error:
+            log.write(Text(self.config.last_error, style="yellow"))
 
         self.query_one("#prompt-input", Input).focus()
         self._refresh_status()
@@ -190,14 +231,15 @@ class AdaptiveHarnessApp(App):
     def _apply_layout(self) -> None:
         matches = self.query("#telemetry")
         if matches:
-            matches.first().display = self._show_telemetry and self.size.width >= 85
+            matches.first().display = self._show_telemetry and self.size.width >= 110
 
     def _refresh_status(self) -> None:
         model = self.agent.explicit_model or "auto"
-        skills = ", ".join(self.agent.active_skills) or "none"
-        self.sub_title = f"Model: {model} | Classifier: {self.agent.classifier_backend.name} | {'OFFLINE MOCK' if self.agent.llm_client.is_mock else 'LIVE'}"
+        provider = ("🟡 Offline Mock Engine" if self.agent.llm_client.is_mock else
+                    "🟢 OpenRouter" if "openrouter.ai" in self.agent.llm_client.base_url else "🟢 Local/Custom")
+        self.sub_title = f"{provider} ({model})  ·  P:{self.prompt_tokens:,} C:{self.completion_tokens:,}"
         self.query_one("#status-line", Static).update(Text(
-            f"{self.workspace_root}  ·  Session {self.session.id}  ·  Model {model}  ·  Skills {skills}", style="bold cyan"))
+            f"{provider}  ·  P:{self.prompt_tokens:,} C:{self.completion_tokens:,}  ·  Session {self.session.id}  ·  {self.workspace_root}", style="bold cyan"))
 
     def _save_session(self) -> None:
         self.session.workspace = self.workspace_root
@@ -208,7 +250,9 @@ class AdaptiveHarnessApp(App):
                                  "classifier_model": self.agent.classifier_backend.model,
                                  "classifier_endpoint": self.classifier_endpoint or "",
                                  "semif_device": self.semif_device, "semif_4bit": str(self.semif_4bit),
-                                 "semif_temperature": str(self.semif_temperature)}
+                                 "semif_temperature": str(self.semif_temperature),
+                                 "prompt_tokens": str(self.prompt_tokens),
+                                 "completion_tokens": str(self.completion_tokens)}
         self.session_store.save(self.session)
 
     def _restore_session(self) -> None:
@@ -219,6 +263,11 @@ class AdaptiveHarnessApp(App):
             self.agent.llm_client.default_model = self.session.model
         self.agent.set_workspace(self.session.workspace)
         settings = self.session.settings or {}
+        for field in ("prompt_tokens", "completion_tokens"):
+            try:
+                setattr(self, field, max(0, int(settings.get(field, "0"))))
+            except (ValueError, TypeError):
+                setattr(self, field, 0)
         self.classifier_endpoint = settings.get("classifier_endpoint") or None
         self.semif_device = settings.get("semif_device", self.semif_device)
         self.semif_4bit = settings.get("semif_4bit", str(self.semif_4bit)).lower() == "true"
@@ -276,8 +325,9 @@ class AdaptiveHarnessApp(App):
         return fut.result()
 
     def action_clear_screen(self) -> None:
-        log = self.query_one("#chat-log", RichLog)
+        log = self.query_one("#chat-log", PinnedRichLog)
         log.clear()
+        log._set_pinned(False)
 
     def action_quit(self) -> None:
         if self._busy and not self._quit_when_finished:
@@ -290,12 +340,75 @@ class AdaptiveHarnessApp(App):
 
     def action_toggle_telemetry(self) -> None:
         self._show_telemetry = not self._show_telemetry
-        self.query_one("#telemetry", ClassifierTelemetryWidget).display = self._show_telemetry
+        self._apply_layout()
+
+    def action_new_session(self) -> None:
+        if self._busy:
+            self.query_one("#chat-log", RichLog).write(Text("Wait for the current task to finish.", style="yellow"))
+            return
+        self._reset_session(new=True)
+
+    def action_choose_theme(self) -> None:
+        original = self.theme
+        def selected(theme: str | None) -> None:
+            if theme is None:
+                self.theme = original
+                return
+            try:
+                self.config.save_theme(theme)
+            except OSError as exc:
+                self.theme = original
+                self.query_one("#chat-log", RichLog).write(Text(f"Could not save theme: {exc}", style="red"))
+                return
+            self.theme = theme
+            self.saved_theme = theme
+            self.query_one("#chat-log", RichLog).write(Text(f"✓ Theme saved: {theme}", style="green"))
+        self.push_screen(ThemePickerModal(original, tuple(t for t in THEME_CHOICES if t in self.available_themes)), callback=selected)
+
+    def _reset_session(self, *, new: bool, title: str = "New session") -> None:
+        if new:
+            self._save_session()
+            self.session = self.session_store.create(self.workspace_root, title)
+        else:
+            self.session.title = title
+        self.agent.messages = [{"role": "system", "content": self.agent.system_prompt}]
+        self.agent.active_skills.clear()
+        self._last_tool_output = ""
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        telemetry = self.query_one("#telemetry", ClassifierTelemetryWidget)
+        telemetry.reset_telemetry(classifier_engine=self.agent.classifier_backend.name,
+                                  classifier_model=self.agent.classifier_backend.model,
+                                  model=self.agent.explicit_model or self.agent.llm_client.default_model,
+                                  selection="forced" if self.agent.explicit_model else "auto")
+        log = self.query_one("#chat-log", PinnedRichLog)
+        log.clear()
+        log._set_pinned(False)
+        log.write(Text(f"━━━ {'New session' if new else 'Session reset'} · {self.session.id} ━━━", style="bold cyan"))
+        self._save_session()
+        self._refresh_status()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        value = event.value.strip().lower()
+        hints = self.query_one("#command-hints", Static)
+        matches = [cmd for cmd in COMMANDS if cmd.startswith(value)][:10] if value.startswith("/") and " " not in value else []
+        hints.update(Text("  ".join(matches), style="bold cyan"))
+        hints.set_class(bool(matches), "visible")
+        self.query_one("#input-container", Container).styles.height = 4 if matches else 3
+
+    def on_pinned_rich_log_pin_changed(self, event: PinnedRichLog.PinChanged) -> None:
+        self.query_one("#scroll-indicator", Static).set_class(event.pinned, "visible")
+
+    def on_app_blur(self, event: events.AppBlur) -> None:
+        self._has_focus = False
+
+    def on_app_focus(self, event: events.AppFocus) -> None:
+        self._has_focus = True
 
     def action_show_help(self) -> None:
         log = self.query_one("#chat-log", RichLog)
         log.write("[bold yellow]Available Commands:[/bold yellow]")
-        log.write("  /key <API_KEY>         - Set OpenRouter API key")
+        log.write("  /key <API_KEY> | status | clear  - Manage private OpenRouter key")
         log.write("  /model <MODEL_ID>      - Switch active LLM model")
         log.write("  /tier <fast|standard|reasoning> - Force model tier")
         log.write("  /classifier <semif|sklearn|backend> [model/path] - Switch decision engine")
@@ -305,7 +418,11 @@ class AdaptiveHarnessApp(App):
         log.write("  /skills                - List installed skills")
         log.write("  /skill <name|off>      - Toggle skill guidance")
         log.write("  /output                - Show the last tool result (up to 20k characters)")
-        log.write("  F2                    - Show or hide telemetry")
+        log.write("  /new | /reset          - Start a new session or reset current one")
+        log.write("  /theme [name]          - Preview and save terminal theme (F2)")
+        log.write("  /history               - Show recent prompts; Up/Down recalls prompts")
+        log.write("  /export [markdown|json] - Save the session to output/sessions/")
+        log.write("  F3                    - Show or hide telemetry")
         log.write("  /clear                 - Clear chat history")
         log.write("  /exit                  - Exit application")
 
@@ -314,24 +431,32 @@ class AdaptiveHarnessApp(App):
         if not text:
             return
 
-        input_widget = self.query_one("#prompt-input", Input)
+        input_widget = self.query_one("#prompt-input", HistoryInput)
         if self._busy and not text.startswith("/"):
             self.query_one("#chat-log", RichLog).write(Text("Agent is still working. Wait for this task to finish.", style="yellow"))
             return
         input_widget.value = ""
+        input_widget.reset_navigation()
 
         # Handle slash commands
         if text.startswith("/"):
             self._handle_slash_command(text)
             return
 
+        try:
+            if self.history_store.record(text):
+                input_widget.history = list(self.history_store.entries)
+        except OSError as exc:
+            self.query_one("#chat-log", RichLog).write(Text(f"Prompt history could not be saved: {exc}", style="yellow"))
+
         log = self.query_one("#chat-log", RichLog)
-        log.write(Text("\nDeveloper > " + text, style="bold white"))
+        log.write(Text("\nDeveloper > " + text, style="bold"))
         if self.session.title == "New session":
             self.session.title = text[:72]
 
         # Launch agent execution in non-blocking worker thread
         self._busy = True
+        self._bell_rung = False
         self.execute_agent_task(text)
 
     def _handle_slash_command(self, cmd_text: str) -> None:
@@ -341,7 +466,7 @@ class AdaptiveHarnessApp(App):
         arg = parts[1].strip() if len(parts) > 1 else ""
 
         if self._busy and cmd in {"/key", "/model", "/tier", "/classifier",
-                                  "/workspace", "/session", "/skill"}:
+                                  "/workspace", "/session", "/skill", "/new", "/reset", "/export"}:
             log.write(Text("Wait for the current task before changing settings or exiting.", style="yellow"))
             return
 
@@ -351,16 +476,70 @@ class AdaptiveHarnessApp(App):
             self.action_clear_screen()
         elif cmd == "/help":
             self.action_show_help()
+        elif cmd == "/new":
+            self._reset_session(new=True, title=arg or "New session")
+        elif cmd == "/reset":
+            self._reset_session(new=False)
+        elif cmd == "/history":
+            recent = self.history_store.entries[-15:]
+            log.write(Text("Recent prompts:" if recent else "No saved prompts yet.", style="bold cyan"))
+            for index, prompt in enumerate(recent, 1):
+                log.write(Text(f"{index:2}. {prompt}"))
+        elif cmd == "/theme":
+            if not arg:
+                self.action_choose_theme()
+            elif arg in self.available_themes:
+                try:
+                    self.config.save_theme(arg)
+                except OSError as exc:
+                    log.write(Text(f"Could not save theme: {exc}", style="red"))
+                    return
+                self.theme = arg
+                self.saved_theme = arg
+                log.write(Text(f"✓ Theme saved: {arg}", style="green"))
+            else:
+                log.write(Text(f"Unknown theme: {arg}. Use /theme to browse.", style="yellow"))
+        elif cmd == "/export":
+            self._export_session(arg or "markdown")
         elif cmd == "/key":
             if not arg:
-                log.write("[red]Usage: /key <OPENROUTER_API_KEY>[/red]")
+                log.write(Text("Use /key <OPENROUTER_API_KEY>, /key status, or /key clear", style="yellow"))
+                return
+            if arg.lower() == "status":
+                masked = (self.api_key[:8] + "••••••••" + self.api_key[-4:]
+                          if self.api_key and len(self.api_key) > 12 else
+                          "••••••••" if self.api_key else "none")
+                log.write(Text(f"API key source: {self.key_source} · {masked}", style="cyan"))
+                return
+            if arg.lower() == "clear":
+                try:
+                    self.config.clear_key()
+                except OSError as exc:
+                    log.write(Text(f"Could not clear saved key: {exc}", style="red"))
+                    return
+                self.api_key = None
+                self.key_source = "offline"
+                self.agent.llm_client = LLMClient(api_key=None, base_url=self.base_url,
+                    default_model=self.agent.llm_client.default_model, force_mock=True)
+                self.llm_client = self.agent.llm_client
+                if self.agent.classifier_backend.name == "openrouter":
+                    self.agent.classifier_backend.api_key = None
+                log.write(Text("✓ Saved API key cleared; offline mock mode is active.", style="green"))
+                self._refresh_status()
+                return
+            try:
+                self.config.save_key(arg)
+            except (OSError, ValueError) as exc:
+                log.write(Text(f"Could not save API key: {exc}", style="red"))
                 return
             self.api_key = arg
+            self.key_source = "saved configuration"
             self.agent.llm_client = LLMClient(api_key=arg, base_url=self.base_url,
                                               default_model=self.agent.llm_client.default_model)
+            self.llm_client = self.agent.llm_client
             if self.agent.classifier_backend.name == "openrouter":
                 self.agent.classifier_backend.api_key = arg
-            log.write("[green]✓ OpenRouter API key updated![/green]")
+            log.write(Text("✓ API key securely saved for future sessions", style="green"))
             self._refresh_status()
         elif cmd == "/model":
             if not arg:
@@ -370,7 +549,10 @@ class AdaptiveHarnessApp(App):
             if self.agent.explicit_model:
                 self.agent.llm_client.default_model = arg
             log.write(Text(f"✓ Model selection: {arg}", style="green"))
-            self.sub_title = f"Model: {arg} | Mode: {'LIVE' if not self.agent.llm_client.is_mock else 'MOCK'}"
+            self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+                model=self.agent.explicit_model or self.agent.llm_client.default_model,
+                selection="forced" if self.agent.explicit_model else "auto")
+            self._save_session()
             self._refresh_status()
         elif cmd == "/tier":
             if arg in MODEL_TIERS:
@@ -378,6 +560,9 @@ class AdaptiveHarnessApp(App):
                 self.agent.llm_client.default_model = target_model
                 self.agent.explicit_model = target_model
                 log.write(f"[green]✓ Switched to {arg.upper()} tier ({target_model})[/green]")
+                self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+                    model=target_model, tier=arg, selection="forced")
+                self._save_session()
                 self._refresh_status()
             else:
                 log.write(f"[red]Invalid tier. Choose from: {', '.join(MODEL_TIERS.keys())}[/red]")
@@ -419,20 +604,14 @@ class AdaptiveHarnessApp(App):
             log.write(Text(f"Workspace: {self.workspace_root}", style="green"))
         elif cmd == "/sessions":
             for saved in self.session_store.list():
-                log.write(Text(f"{saved.id}  {saved.title}  ·  {saved.workspace}", style="cyan" if saved.id == self.session.id else "white"))
+                log.write(Text(f"{saved.id}  {saved.title}  ·  {saved.workspace}", style="cyan" if saved.id == self.session.id else ""))
         elif cmd == "/session":
             if self._busy:
                 log.write(Text("Wait for the current task before switching sessions.", style="yellow"))
                 return
             action, _, value = arg.partition(" ")
             if action == "new":
-                self._save_session()
-                self.session = self.session_store.create(self.workspace_root, value.strip() or "New session")
-                self.agent.messages = [{"role": "system", "content": self.agent.system_prompt}]
-                self.agent.active_skills.clear()
-                self.agent.explicit_model = None
-                log.clear()
-                log.write(Text(f"New session {self.session.id}", style="green"))
+                self._reset_session(new=True, title=value.strip() or "New session")
             elif action == "load" and value.strip():
                 saved = self.session_store.load(value.strip())
                 if saved is None:
@@ -445,6 +624,10 @@ class AdaptiveHarnessApp(App):
                 self.session = saved
                 self.workspace_root = saved.workspace
                 self._restore_session()
+                self._last_tool_output = ""
+                self.query_one("#telemetry", ClassifierTelemetryWidget).reset_telemetry(
+                    classifier_engine=self.agent.classifier_backend.name,
+                    classifier_model=self.agent.classifier_backend.model)
                 log.clear()
                 log.write(Text(f"Loaded session {saved.id}: {saved.title} ({len(saved.messages)} messages)", style="green"))
                 if self._session_restore_warning:
@@ -481,11 +664,47 @@ class AdaptiveHarnessApp(App):
             log.write(Text(f"Active skills: {', '.join(self.agent.active_skills) or 'none'}", style="green"))
         elif cmd == "/output":
             if self._last_tool_output:
-                log.write(Text(self._last_tool_output, style="white"))
+                log.write(Text(self._last_tool_output))
             else:
                 log.write(Text("No tool result yet.", style="yellow"))
         else:
             log.write(Text(f"Unknown command: {cmd}. Type /help for options.", style="red"))
+
+    def _export_session(self, export_format: str) -> None:
+        log = self.query_one("#chat-log", RichLog)
+        if export_format not in {"markdown", "json"}:
+            log.write(Text("Use /export markdown or /export json", style="yellow"))
+            return
+        self._save_session()
+        export_dir = Path(self.workspace_root) / "output" / "sessions"
+        suffix = "md" if export_format == "markdown" else "json"
+        path = export_dir / f"{self.session.id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.{suffix}"
+        transcript = {
+            "session_id": self.session.id, "title": self.session.title,
+            "workspace": self.workspace_root, "model": self.agent.explicit_model or "auto",
+            "usage": {"prompt_tokens": self.prompt_tokens, "completion_tokens": self.completion_tokens},
+            "messages": self.agent.messages,
+        }
+        if export_format == "json":
+            content = json.dumps(transcript, indent=2, ensure_ascii=False) + "\n"
+        else:
+            lines = [f"# {self.session.title}", "", f"Session: `{self.session.id}`",
+                     f"Workspace: `{self.workspace_root}`", "",
+                     f"Tokens: prompt {self.prompt_tokens:,}, completion {self.completion_tokens:,}", ""]
+            for message in self.agent.messages:
+                lines.extend([f"## {message.get('role', 'message').title()}", "", str(message.get("content") or ""), ""])
+                for call in message.get("tool_calls", []):
+                    function = call.get("function", {})
+                    lines.extend([f"Tool call: `{function.get('name', 'unknown')}`", "", "````json",
+                                  str(function.get("arguments", "{}")), "````", ""])
+            content = "\n".join(lines)
+        try:
+            export_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            log.write(Text(f"Could not export session: {exc}", style="red"))
+            return
+        log.write(Text(f"✓ Exported session to {path}", style="green"))
 
     @work(thread=True)
     def execute_agent_task(self, task_text: str) -> None:
@@ -575,12 +794,22 @@ class AdaptiveHarnessApp(App):
                     diff = output.split("Diff:\n", 1)[-1]
                     log.write(Syntax(diff, "diff", theme="monokai", line_numbers=False))
                 elif len(output) > 800:
-                    log.write(Text(output[:800] + f"\n… {len(output)-800} more characters. Use /output to expand.", style="white"))
+                    log.write(Text(output[:800] + f"\n… {len(output)-800} more characters. Use /output to expand."))
                 else:
-                    log.write(Text(output, style="white"))
+                    log.write(Text(output))
+                if p.get("time_ms", 0) >= 5000 and not self._has_focus and not self._bell_rung:
+                    self.bell()
+                    self._bell_rung = True
         elif et == "verification":
                 log.write(Text(f"Verification: {p['status']} → {p['action']}", style="green" if p["status"] == "SUCCESS" else "red"))
         elif et == "response":
+                usage = p.get("usage") or {}
+                self.prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
+                self.completion_tokens += int(usage.get("completion_tokens", 0) or 0)
                 status = "✓ Task completed" if p["success"] else "Task stopped before completion"
                 log.write(Text(f"\n{status} in {p['total_time_ms']} ms ({p['steps']} steps)\n",
                                style="bold green" if p["success"] else "bold yellow"))
+                if p.get("total_time_ms", 0) >= 5000 and not self._has_focus and not self._bell_rung:
+                    self.bell()
+                    self._bell_rung = True
+                self._refresh_status()

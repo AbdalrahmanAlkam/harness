@@ -22,7 +22,9 @@ The Ollama backend calls the local `/api/generate` endpoint with JSON output. Fo
 
 Each task also receives domain, thinking, model-tier, skill, and tool-verification decisions from the selected classifier engine. SemIf classifies these using typed choices; sklearn provides statistical fallback. Destructive-operation checks remain separate safety gates. Set `BRAVE_SEARCH_API_KEY` to enable web search with source URLs in research mode. Python file writes receive automatic AST validation, with syntax errors fed into the verification and recovery loop. The thinking level is shown as an estimate and maps to supported OpenRouter reasoning effort settings. The telemetry panel shows the active classifier, its observed latency, domain, thinking level, entropy, margin, skill probabilities, and model selection.
 
-Clarification opens for detected destructive operations or a genuinely missing task target. Numeric keys 1–9 select options, arrows navigate, Enter confirms, Tab reaches the custom instruction field, and Escape cancels. Long text wraps in a scrollable card, and empty custom input cannot approve an action. Entropy and requests for the agent's design judgment do not pause the task. F2 toggles the telemetry panel on wide terminals; narrow terminals hide it automatically. `/output` shows the last tool result up to the 20,000-character output limit.
+Clarification opens for detected destructive operations or a genuinely missing task target. Numeric keys 1–9 select options, arrows navigate, Enter confirms, Tab reaches the custom instruction field, and Escape cancels. Long text wraps in a scrollable card, and empty custom input cannot approve an action. Entropy and requests for the agent's design judgment do not pause the task. F2 opens a live theme preview; F3 toggles telemetry on wide terminals. `/output` shows the last tool result up to the 20,000-character output limit.
+
+The TUI stores `/key` credentials in `~/.config/adaptive-harness/config.json` with mode `0600`; key priority is `--key`, `OPENROUTER_API_KEY`, saved key, then offline mock. `/key status` shows the source and a masked value, and `/key clear` removes the saved key and switches the current TUI to mock mode. The prompt input recalls the last 500 task prompts with Up/Down, restoring an unfinished draft when you return to the bottom; slash commands are excluded from `prompt_history.txt`. `/new` or Ctrl+N starts a clean session, while `/reset` clears the current one. `/theme` previews built-in themes on hover or arrow focus; Enter saves and Escape restores the old theme. `/export markdown|json` writes the session transcript and tool calls/results to the workspace's `output/sessions/` folder. The header shows provider and token totals; scrolling up pins the chat log until you return to the bottom.
 
 > **An Autonomous AI Developer Agent Harness powered by OpenRouter LLMs and Pervasive ML Classifiers everywhere — featuring real-time intent routing, middle-of-development clarification dialogs, multi-tier complexity routing, active output verification, and an interactive Terminal User Interface (TUI).**
 
@@ -130,10 +132,12 @@ adaptive-harness tui --key sk-or-v1-xxxxxxxxxxxxxxxxx
 - **Rich Streaming Agent Log**:
   - Live streaming of agent thoughts, tool execution invocations with argument inspection, real-time tool results, and verification classifications.
 - **Built-in Slash Commands**:
-  - `/key <OPENROUTER_API_KEY>`: Set or update OpenRouter API key on the fly.
+  - `/key <OPENROUTER_API_KEY>`: Save a private OpenRouter key; `/key status` and `/key clear` inspect or remove it.
   - `/model <MODEL_ID>`: Switch active LLM (e.g. `anthropic/claude-sonnet-4`).
   - `/tier <fast|standard|reasoning>`: Switch between optimized cost/capability tiers.
-  - `/clear`: Clear terminal history log.
+  - `/new`, `/reset`: Start a new session or clear the current session state.
+  - `/theme`, `/history`, `/export markdown|json`: Preview colors, recall prompts, and export a transcript.
+  - `/clear`: Clear only the visible terminal log.
   - `/help`: Display available commands.
   - `/exit`: Terminate application.
 

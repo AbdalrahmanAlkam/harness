@@ -280,6 +280,7 @@ class DeveloperAgent:
         completed = False
         execution_attempts: List[ExecutionAttempt] = []
         unresolved_failures: set[str] = set()
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
 
         while step < max_steps:
             step += 1
@@ -290,6 +291,8 @@ class DeveloperAgent:
                 tier=complexity_res.tier,
                 reasoning_effort=thinking_res.effort,
             )
+            for token_type in usage:
+                usage[token_type] += int((llm_resp.usage or {}).get(token_type, 0) or 0)
             if llm_resp.finish_reason == "error":
                 yield AgentEvent("llm_error", {"message": llm_resp.content or "Unknown model error", "model": selected_model})
                 final_answer = llm_resp.content or "Model request failed"
@@ -323,7 +326,7 @@ class DeveloperAgent:
                     if not answer.lower().startswith("proceed"):
                         yield AgentEvent("response", {"content": "Action cancelled by user.",
                             "total_time_ms": round((time.perf_counter()-start_time)*1000, 2),
-                            "steps": step, "success": False})
+                            "steps": step, "success": False, "usage": usage})
                         return
 
             # Handle tool calls
@@ -435,6 +438,7 @@ class DeveloperAgent:
                 "total_time_ms": round(total_wall_ms, 2),
                 "steps": step,
                 "success": completed,
+                "usage": usage,
             },
         )
 

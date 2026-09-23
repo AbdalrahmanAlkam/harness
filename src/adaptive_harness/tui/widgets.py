@@ -11,9 +11,25 @@ from rich.text import Text
 from adaptive_harness.llm.client import MODEL_TIERS
 from textual.app import ComposeResult
 from textual import events
+from textual.message import Message
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Static
+from textual.widgets import Button, Input, Label, RichLog, Static
+
+
+SKILL_LABELS = {
+    "code_edit": "🛠️  Code Edit",
+    "run_command": "⚡  Run Command",
+    "search_explore": "🔍  Search & Explore",
+    "testing": "🧪  Run Tests",
+    "ask_clarification": "❓  Clarification",
+    "general_reasoning": "🧠  Reasoning",
+}
+
+THEME_CHOICES = (
+    "textual-dark", "nord", "tokyo-night", "dracula",
+    "catppuccin-mocha", "gruvbox", "monokai", "textual-light",
+)
 
 
 class ClassifierTelemetryWidget(Static):
@@ -21,7 +37,7 @@ class ClassifierTelemetryWidget(Static):
 
     DEFAULT_CSS = """
     ClassifierTelemetryWidget {
-        width: 38;
+        width: 52;
         height: 100%;
         background: $surface;
         border-left: solid $primary;
@@ -32,20 +48,43 @@ class ClassifierTelemetryWidget(Static):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.probabilities: Dict[str, float] = {}
+        self.probabilities: Dict[str, float] = {skill: 0.0 for skill in SKILL_LABELS}
         self.entropy: float = 0.0
         self.margin: float = 0.0
-        self.risk_level: str = "low"
-        self.tier: str = "standard"
+        self.risk_level: str = "idle"
+        self.tier: str = "—"
         self.active_model: str = MODEL_TIERS["standard"]
         self.primary_skill: str = "none"
         self.selection: str = "auto"
         self.classifier_engine: str = "sklearn"
         self.classifier_model: str = "TF-IDF + Logistic Regression"
         self.classifier_latency_ms: float = 0.0
-        self.domain_mode: str = "coding"
-        self.thinking_level: str = "low"
-        self.thinking_tokens: int = 1000
+        self.domain_mode: str = "—"
+        self.thinking_level: str = "—"
+        self.thinking_tokens: int = 0
+
+    def reset_telemetry(self, *, classifier_engine: str | None = None,
+                        classifier_model: str | None = None, model: str | None = None,
+                        selection: str | None = None) -> None:
+        self.probabilities = {skill: 0.0 for skill in SKILL_LABELS}
+        self.entropy = 0.0
+        self.margin = 0.0
+        self.risk_level = "idle"
+        self.tier = "—"
+        self.primary_skill = "none"
+        self.classifier_latency_ms = 0.0
+        self.domain_mode = "—"
+        self.thinking_level = "—"
+        self.thinking_tokens = 0
+        if classifier_engine is not None:
+            self.classifier_engine = classifier_engine
+        if classifier_model is not None:
+            self.classifier_model = classifier_model
+        if model is not None:
+            self.active_model = model
+        if selection is not None:
+            self.selection = selection
+        self.refresh()
 
     def update_telemetry(
         self,
@@ -91,33 +130,203 @@ class ClassifierTelemetryWidget(Static):
         status = Text(overflow="fold")
         status.append("MODEL  ", style="bold cyan")
         status.append(f"{self.selection.upper()} · {self.tier.upper()}\n", style="bold magenta")
-        status.append(self.active_model + "\n", style="white")
+        status.append(self.active_model + "\n")
         status.append("CLASSIFIER  ", style="bold cyan")
-        status.append(self.classifier_engine.upper() + "\n", style="bold white")
-        status.append(self.classifier_model + "\n", style="white")
+        status.append(self.classifier_engine.upper() + "\n", style="bold")
+        status.append(self.classifier_model + "\n")
         status.append(f"Latency  {self.classifier_latency_ms:.2f} ms\n", style="cyan")
         status.append(f"Domain  {self.domain_mode.upper()}\n", style="bold magenta")
         status.append(f"Thinking  {self.thinking_level.upper()} · {self.thinking_tokens:,} tokens\n", style="bold yellow")
-        status.append(f"Skill  {self.primary_skill}\n", style="white")
+        status.append(f"Skill  {self.primary_skill}\n")
         status.append(f"H(p)  {self.entropy:.3f} bits   Margin  {self.margin*100:.1f}%\n", style="cyan")
-        risk_style = "green" if self.risk_level == "low" else "yellow" if self.risk_level == "medium" else "bold red"
+        risk_style = "cyan" if self.risk_level == "idle" else "green" if self.risk_level == "low" else "yellow" if self.risk_level == "medium" else "bold red"
         status.append(f"Risk  {self.risk_level.upper()}", style=risk_style)
 
-        bars_table = Table(box=None, show_header=False, expand=True, padding=(0, 0))
-        bars_table.add_column("Skill", width=10)
-        bars_table.add_column("Bar", width=8)
-        bars_table.add_column("Pct", justify="right", width=6)
+        bars_table = Table(box=None, show_header=False, expand=False, padding=(0, 1))
+        bars_table.add_column("Skill", width=21, no_wrap=True)
+        bars_table.add_column("Bar", width=10, no_wrap=True)
+        bars_table.add_column("Pct", justify="right", width=6, no_wrap=True)
 
         sorted_skills = sorted(self.probabilities.items(), key=lambda x: x[1], reverse=True)
         for skill, prob in sorted_skills:
-            bar_len = max(0, min(8, round(prob * 8)))
-            bar_str = "█" * bar_len + "░" * (8 - bar_len)
+            bar_len = max(0, min(10, round(prob * 10)))
+            bar_str = "█" * bar_len + "░" * (10 - bar_len)
             c = "green" if prob >= 0.4 else ("yellow" if prob >= 0.15 else "bright_black")
-            clean_name = skill.replace("_", " ")[:10]
-            bars_table.add_row(Text(clean_name), Text(bar_str, style=c), Text(f"{prob*100:4.1f}%"))
+            label = SKILL_LABELS.get(skill, skill.replace("_", " ").title())
+            bars_table.add_row(Text(label), Text(bar_str, style=c), Text(f"{prob*100:5.1f}%"))
 
         return Panel(Group(status, Rule(style="cyan"), Text("SKILL PROBABILITIES", style="bold cyan"), bars_table),
                      title="[bold cyan]ROUTING[/bold cyan]", border_style="cyan")
+
+
+class HistoryInput(Input):
+    """Prompt input with shell-like Up/Down history and draft restoration."""
+
+    def __init__(self, *args, history: Optional[List[str]] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.history = list(history or [])
+        self._history_index: int | None = None
+        self._draft = ""
+
+    def reset_navigation(self) -> None:
+        self._history_index = None
+        self._draft = ""
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "up" and self.history:
+            if self._history_index is None:
+                self._draft = self.value
+                self._history_index = len(self.history) - 1
+            else:
+                self._history_index = max(0, self._history_index - 1)
+            self.value = self.history[self._history_index]
+            self.cursor_position = len(self.value)
+            event.prevent_default()
+            event.stop()
+        elif event.key == "down" and self._history_index is not None:
+            if self._history_index >= len(self.history) - 1:
+                self.value = self._draft
+                self.reset_navigation()
+            else:
+                self._history_index += 1
+                self.value = self.history[self._history_index]
+            self.cursor_position = len(self.value)
+            event.prevent_default()
+            event.stop()
+        elif self._history_index is not None and (event.character or event.key in {"backspace", "delete"}):
+            self.reset_navigation()
+
+
+class PinnedRichLog(RichLog):
+    """A log that stops following output while the reader scrolls upward."""
+
+    class PinChanged(Message):
+        def __init__(self, pinned: bool):
+            super().__init__()
+            self.pinned = pinned
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pinned = False
+
+    def _set_pinned(self, pinned: bool) -> None:
+        if self.pinned != pinned:
+            self.pinned = pinned
+            self.auto_scroll = not pinned
+            self.post_message(self.PinChanged(pinned))
+
+    def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        super()._on_mouse_scroll_up(event)
+        self._set_pinned(True)
+
+    def _on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        super()._on_mouse_scroll_down(event)
+        self.call_after_refresh(self._unpin_if_bottom)
+
+    def _unpin_if_bottom(self) -> None:
+        if self.is_vertical_scroll_end:
+            self._set_pinned(False)
+
+    def action_scroll_end(self) -> None:
+        super().action_scroll_end()
+        self._set_pinned(False)
+
+    def action_scroll_up(self) -> None:
+        super().action_scroll_up()
+        self._set_pinned(True)
+
+    def action_page_up(self) -> None:
+        super().action_page_up()
+        self._set_pinned(True)
+
+    def action_scroll_home(self) -> None:
+        super().action_scroll_home()
+        self._set_pinned(True)
+
+    def action_scroll_down(self) -> None:
+        super().action_scroll_down()
+        self.call_after_refresh(self._unpin_if_bottom)
+
+    def action_page_down(self) -> None:
+        super().action_page_down()
+        self.call_after_refresh(self._unpin_if_bottom)
+
+
+class ThemeOption(Button):
+    def __init__(self, theme_name: str, index: int):
+        super().__init__(theme_name.replace("-", " ").title(), id=f"theme-{index}", classes="theme-option")
+        self.theme_name = theme_name
+
+    def _preview(self) -> None:
+        if isinstance(self.screen, ThemePickerModal):
+            self.screen.preview(self.theme_name)
+
+    def on_enter(self, event: events.Enter) -> None:
+        self._preview()
+
+    def on_focus(self, event: events.Focus) -> None:
+        self._preview()
+
+
+class ThemePickerModal(ModalScreen[str | None]):
+    """Preview themes on hover/focus; Enter saves and Escape restores."""
+
+    DEFAULT_CSS = """
+    ThemePickerModal { align: center middle; background: rgba(0, 0, 0, 0.65); }
+    #theme-card { width: 75%; max-width: 58; height: 85%; max-height: 27;
+                  background: $surface; border: round $accent; padding: 1 2; }
+    #theme-title { height: 2; text-align: center; text-style: bold; color: $accent; }
+    #theme-scroll { height: 1fr; }
+    .theme-option { width: 100%; height: 2; min-height: 2; margin-bottom: 0; }
+    .theme-option:focus { border: heavy $accent; }
+    #theme-help { height: 2; color: $text; text-align: center; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel"), ("up", "previous_theme", "Previous"),
+                ("down", "next_theme", "Next"), ("enter", "choose_theme", "Apply")]
+
+    def __init__(self, original_theme: str, themes: tuple[str, ...] = THEME_CHOICES):
+        super().__init__()
+        self.original_theme = original_theme
+        self.themes = themes
+        self.selected_theme = original_theme
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="theme-card"):
+            yield Label("🎨 Choose a Theme", id="theme-title")
+            with VerticalScroll(id="theme-scroll"):
+                for index, theme in enumerate(self.themes):
+                    yield ThemeOption(theme, index)
+            yield Static("↑↓ preview  ·  Enter apply  ·  Esc restore", id="theme-help")
+
+    def on_mount(self) -> None:
+        index = self.themes.index(self.original_theme) if self.original_theme in self.themes else 0
+        self.query_one(f"#theme-{index}", ThemeOption).focus()
+
+    def preview(self, theme: str) -> None:
+        if theme in self.themes:
+            self.selected_theme = theme
+            self.app.theme = theme
+
+    def _focused_index(self) -> int:
+        focused = getattr(self.focused, "id", "") or ""
+        return int(focused[6:]) if focused.startswith("theme-") else 0
+
+    def action_previous_theme(self) -> None:
+        self.query_one(f"#theme-{(self._focused_index() - 1) % len(self.themes)}", ThemeOption).focus()
+
+    def action_next_theme(self) -> None:
+        self.query_one(f"#theme-{(self._focused_index() + 1) % len(self.themes)}", ThemeOption).focus()
+
+    def action_choose_theme(self) -> None:
+        self.dismiss(self.selected_theme)
+
+    def action_cancel(self) -> None:
+        self.app.theme = self.original_theme
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if isinstance(event.button, ThemeOption):
+            self.dismiss(event.button.theme_name)
 
 
 class OptionDescription(Static):
@@ -141,14 +350,14 @@ class ClarificationModal(ModalScreen[str]):
         max-width: 88;
         height: 90%;
         background: $surface;
-        border: round #fbbf24;
+        border: round $warning;
         padding: 0 2;
     }
     #modal-title {
         height: 2;
         text-align: center;
         text-style: bold;
-        color: #fbbf24;
+        color: $warning;
         padding-top: 1;
     }
     #modal-scroll { height: 1fr; width: 100%; overflow-y: auto; }
@@ -156,8 +365,8 @@ class ClarificationModal(ModalScreen[str]):
     #modal-context {
         width: 100%;
         height: auto;
-        color: #ffffff;
-        background: #493b20;
+        color: $text;
+        background: $warning 20%;
         padding: 1;
         margin-bottom: 1;
     }
@@ -169,14 +378,14 @@ class ClarificationModal(ModalScreen[str]):
     .opt-btn { width: 12; min-width: 12; margin-right: 1; }
     .option-text { width: 1fr; min-width: 0; height: auto; padding: 0 1; color: $text; }
     .option-text:hover { background: $primary 20%; }
-    .opt-btn:focus { border: heavy #22d3ee; }
+    .opt-btn:focus { border: heavy $accent; }
     #write-in-input {
         width: 100%;
         height: 3;
         background: $panel;
         color: $text;
     }
-    #modal-help { height: 1; color: #22d3ee; }
+    #modal-help { height: 1; color: $accent; }
     #modal-buttons { height: 3; }
     #modal-buttons Button { width: 1fr; }
     """

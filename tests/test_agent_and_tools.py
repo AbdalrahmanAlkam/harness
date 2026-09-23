@@ -352,7 +352,7 @@ def test_developer_agent_stream(tmp_path: Path):
 @pytest.mark.anyio
 async def test_tui_app_headless(tmp_path: Path):
     db_path = tmp_path / "tui_test.db"
-    app = AdaptiveHarnessApp(db_path=db_path)
+    app = AdaptiveHarnessApp(db_path=db_path, config_dir=tmp_path / "config")
 
     async with app.run_test() as pilot:
         # Verify app mounted and widgets exist
@@ -414,8 +414,8 @@ def test_classifier_backends_and_modes():
 
 
 @pytest.mark.anyio
-async def test_clarification_modal_keyboard():
-    app = AdaptiveHarnessApp(db_path=":memory:")
+async def test_clarification_modal_keyboard(tmp_path: Path):
+    app = AdaptiveHarnessApp(db_path=":memory:", config_dir=tmp_path / "config")
     async with app.run_test() as pilot:
         selected = []
         app.push_screen(ClarificationModal("Choose one", ["First", "Second"], "Reason"), callback=selected.append)
@@ -483,7 +483,7 @@ async def test_tui_workspace_sessions_and_skills(tmp_path: Path):
     skill_path = workspace / ".harness" / "skills" / "review" / "SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text("# Review\nCheck evidence.")
-    app = AdaptiveHarnessApp(db_path=tmp_path / "ui.db", workspace_root=str(tmp_path))
+    app = AdaptiveHarnessApp(db_path=tmp_path / "ui.db", workspace_root=str(tmp_path), config_dir=tmp_path / "config")
     async with app.run_test(size=(70, 24)) as pilot:
         app._handle_slash_command(f"/workspace {workspace}")
         assert app.agent.workspace_root == workspace
@@ -500,7 +500,7 @@ async def test_tui_workspace_sessions_and_skills(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_long_clarification_fits_small_terminal(tmp_path: Path):
-    app = AdaptiveHarnessApp(db_path=tmp_path / "small.db")
+    app = AdaptiveHarnessApp(db_path=tmp_path / "small.db", config_dir=tmp_path / "config")
     async with app.run_test(size=(60, 20)) as pilot:
         choices = []
         app.push_screen(ClarificationModal("Long question " * 15,
@@ -745,7 +745,7 @@ def test_agent_denies_unavailable_domain_tool_and_retains_failure(tmp_path: Path
 
 @pytest.mark.anyio
 async def test_classifier_api_key_and_narrow_layout(tmp_path: Path):
-    app = AdaptiveHarnessApp(db_path=tmp_path / "layout.db", classifier_backend="openrouter")
+    app = AdaptiveHarnessApp(db_path=tmp_path / "layout.db", classifier_backend="openrouter", config_dir=tmp_path / "config")
     async with app.run_test(size=(70, 22)) as pilot:
         app._handle_slash_command("/key secret-test-key")
         assert app.agent.classifier_backend.api_key == "secret-test-key"
