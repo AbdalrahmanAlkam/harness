@@ -108,6 +108,9 @@ def tui(
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID (e.g. anthropic/claude-sonnet-4)"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
+    mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
+    thinking: str = typer.Option("auto", "--thinking", help="Thinking level: none, low, medium, deep, auto"),
+    safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo or cautious (default turbo)"),
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Local or OpenRouter classifier endpoint"),
@@ -122,15 +125,27 @@ def tui(
     """Launches the interactive Textual TUI development environment with pervasive classifiers."""
     from adaptive_harness.tui.app import AdaptiveHarnessApp
     from adaptive_harness.llm.client import MODEL_TIERS
+    from adaptive_harness.classifiers.domain_classifier import parse_domain_mode
+    from adaptive_harness.classifiers.thinking_classifier import parse_thinking_level
 
     if tier and tier not in MODEL_TIERS:
         raise typer.BadParameter("Choose fast, standard, or reasoning", param_hint="--tier")
+    if safety is not None and safety not in {"turbo", "cautious"}:
+        raise typer.BadParameter("Choose turbo or cautious", param_hint="--safety")
+    try:
+        parse_domain_mode(mode)
+        parse_thinking_level(thinking)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
     try:
         tui_app = AdaptiveHarnessApp(
             api_key=api_key,
             base_url=base_url,
             default_model=(None if model and model.lower() == "auto" else model) or (MODEL_TIERS[tier] if tier in MODEL_TIERS else None),
+            mode=mode,
+            thinking=thinking,
+            safety=safety,
             classifier_backend="semif" if semif_model else classifier_backend,
             classifier_model=semif_model or classifier_model,
             classifier_endpoint=classifier_endpoint,
@@ -153,6 +168,9 @@ def dev(
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
+    mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
+    thinking: str = typer.Option("auto", "--thinking", help="Thinking level: none, low, medium, deep, auto"),
+    safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo or cautious (default turbo)"),
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Classifier endpoint"),
@@ -170,9 +188,18 @@ def dev(
     from adaptive_harness.llm.client import MODEL_TIERS
     from adaptive_harness.classifiers.engine import create_backend
     from adaptive_harness.agent.skills import SkillCatalog
+    from adaptive_harness.classifiers.domain_classifier import parse_domain_mode
+    from adaptive_harness.classifiers.thinking_classifier import parse_thinking_level
 
     if tier and tier not in MODEL_TIERS:
         raise typer.BadParameter("Choose fast, standard, or reasoning", param_hint="--tier")
+    if safety is not None and safety not in {"turbo", "cautious"}:
+        raise typer.BadParameter("Choose turbo or cautious", param_hint="--safety")
+    try:
+        selected_mode = parse_domain_mode(mode)
+        selected_thinking = parse_thinking_level(thinking)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
     selected_model = (None if model and model.lower() == "auto" else model) or (MODEL_TIERS[tier] if tier in MODEL_TIERS else None)
     client = LLMClient(api_key=api_key, base_url=base_url, default_model=selected_model)
@@ -186,7 +213,8 @@ def dev(
     except (ValueError, RuntimeError, OSError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--classifier-backend") from exc
     agent = DeveloperAgent(llm_client=client, repository=repo, workspace_root=str(workspace), explicit_model=selected_model,
-                           classifier_backend=backend)
+                           classifier_backend=backend, forced_mode=selected_mode, forced_thinking=selected_thinking,
+                           safety_profile=safety or "turbo")
     catalog = SkillCatalog(workspace)
     for name in skill or []:
         try:
@@ -211,12 +239,22 @@ def dev(
             console.print(f"  [{color}]Ambiguity & Risk:[/{color}] H={p['entropy']:.2f} bits | Risk={p['risk_level'].upper()} | Ask={p['should_ask_question']}")
         elif et == "model_routing":
             console.print(f"  [magenta]Model Tier:[/magenta] [{p['tier'].upper()}] -> {p['model']}")
+        elif et == "domain_mode":
+            console.print(f"  [cyan]Domain:[/cyan] {p['mode'].upper()} ({p['selection']})")
+        elif et == "thinking_budget":
+            console.print(f"  [yellow]Thinking:[/yellow] {p['level'].upper()} ({p['tokens']:,} token budget, {p['selection']})")
+        elif et == "agent_stage":
+            stage = p["stage"]
+            label = {"thinking": "Thinking / generating", "generating": "Generating",
+                     "tool_running": f"Running {p.get('tool', '')}",
+                     "verifying": f"Verifying {p.get('tool', '')}"}.get(stage, stage)
+            console.print(f"  [dim]◦ {escape(label)}[/dim]")
         elif et == "llm_error":
             console.print(f"[red]Model error: {escape(p['message'])}[/red]")
         elif et == "storage_error":
             console.print(f"[yellow]{escape(p['error'])}[/yellow]")
         elif et == "thought":
-            console.print(f"\n[bold magenta]Agent Thought:[/bold magenta] {escape(p['content'])}")
+            console.print(f"\n[bold magenta]Agent:[/bold magenta] {escape(p['content'])}")
         elif et == "tool_call":
             console.print(f"  [bold yellow]Tool Call:[/bold yellow] [cyan]{p['name']}[/cyan] [dim]{escape(str(p['arguments']))}[/dim]")
         elif et == "tool_result":

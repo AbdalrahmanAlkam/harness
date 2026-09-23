@@ -16,7 +16,7 @@ from adaptive_harness.classifiers.verification_classifier import VerificationCla
 from adaptive_harness.data.storage import ExperienceRepository
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
 from adaptive_harness.llm.mock_client import MockLLMClient
-from adaptive_harness.tools.base import ToolResult
+from adaptive_harness.tools.base import Tool, ToolResult
 from adaptive_harness.tools.bash import RunBashTool
 from adaptive_harness.tools.clarification import AskUserTool
 from adaptive_harness.tools.file_ops import EditFileTool, ReadFileTool, WriteFileTool
@@ -29,13 +29,15 @@ from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.llm.mock_client import LLMResponse
 from adaptive_harness.llm.mock_client import ToolCall
 from adaptive_harness.classifiers.risk_classifier import ToolRiskClassifier
-from adaptive_harness.tools.science import CalculateTool
+from adaptive_harness.tools.science import CalculateTool, CheckConvergenceTool
 from adaptive_harness.tools.research import WebSearchTool
 from adaptive_harness.classifiers.engine import (BaseClassifierBackend, Classification, create_backend,
     _parse_response, semif_weights_cached)
 from adaptive_harness.classifiers.semif_engine import SemIfEngine
-from adaptive_harness.classifiers.domain_classifier import DomainClassifier, DomainMode
-from adaptive_harness.classifiers.thinking_classifier import ThinkingClassifier, ThinkingLevel
+from adaptive_harness.classifiers.domain_classifier import (DomainClassifier, DomainMode,
+    audit_command_is_read_only, parse_domain_mode)
+from adaptive_harness.classifiers.thinking_classifier import (ThinkingClassifier, ThinkingLevel,
+    parse_thinking_level)
 import time
 
 
@@ -55,6 +57,36 @@ def test_llm_client_mock_mode():
     resp_tool = client.complete(messages=[{"role": "user", "content": "run tests with pytest"}])
     assert len(resp_tool.tool_calls) == 1
     assert resp_tool.tool_calls[0].name == "run_bash"
+
+
+def test_turbo_skips_semantic_question_but_keeps_destructive_gate(tmp_path: Path):
+    from adaptive_harness.classifiers.ambiguity_classifier import AmbiguityAssessment
+
+    class Backend:
+        name = "semif"
+        model = "test"
+        engine = SimpleNamespace(loaded=True)
+        def classify(self, text, labels):
+            return Classification(labels[0], {label: 1 / len(labels) for label in labels}, 0)
+
+    seen = []
+    agent = DeveloperAgent(llm_client=LLMClient(force_mock=True), workspace_root=str(tmp_path),
+                           classifier_backend=Backend(), clarification_callback=lambda *args: "Abort operation")
+    original = agent.ambiguity_classifier.evaluate
+    def evaluate(task, skills, semantic_decision=False):
+        seen.append(semantic_decision)
+        return AmbiguityAssessment(False, 2.0, 0.0, "medium", "Uncertain")
+    agent.ambiguity_classifier.evaluate = evaluate
+    events = list(agent.run_stream("explain this architecture", max_steps=1))
+    assert seen == [False]
+    assert any(event.event_type == "agent_stage" for event in events)
+    agent.safety_profile = "cautious"
+    list(agent.run_stream("explain this architecture", max_steps=1))
+    assert seen[-1] is True
+    agent.ambiguity_classifier.evaluate = original
+    events = list(agent.run_stream("rm -rf important files", max_steps=1))
+    assert any(event.event_type == "clarification_needed" for event in events)
+    assert not any(event.event_type == "agent_stage" for event in events)
 
 
 def test_local_task_endpoint_does_not_receive_environment_api_key(monkeypatch):
@@ -81,6 +113,34 @@ def test_openrouter_reasoning_request_uses_effort_without_temperature():
     assert captured["model"] == MODEL_TIERS["reasoning"]
     assert captured["extra_body"] == {"reasoning": {"effort": "high"}}
     assert "temperature" not in captured
+
+
+def test_reasoning_budget_uses_supported_openrouter_parameters():
+    requests = []
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None),
+                                                      finish_reason="stop")], usage=None, model=kwargs["model"])
+
+    client = LLMClient(force_mock=True)
+    client._openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    messages = [{"role": "user", "content": "Analyze the proof"}]
+    client.complete(messages, model="anthropic/claude-3.7-sonnet", reasoning_effort="high",
+                    reasoning_budget_tokens=16000)
+    assert requests[-1]["extra_body"] == {"reasoning": {"max_tokens": 16000}}
+    assert requests[-1]["max_completion_tokens"] > 16000
+    assert "temperature" not in requests[-1]
+    client.complete(messages, model="deepseek/deepseek-r1", reasoning_effort="medium",
+                    reasoning_budget_tokens=4000)
+    assert requests[-1]["extra_body"] == {"reasoning": {"effort": "medium"}}
+    client.complete(messages, model="anthropic/claude-3.7-sonnet", reasoning_budget_tokens=0)
+    assert requests[-1]["extra_body"] == {"reasoning": {"enabled": False}}
+    client.complete(messages, model=MODEL_TIERS["standard"], reasoning_effort="low",
+                    reasoning_budget_tokens=1000)
+    assert requests[-1]["extra_body"] == {"reasoning": {"effort": "low"}}
+    client.complete(messages, model=MODEL_TIERS["standard"], reasoning_budget_tokens=0)
+    assert requests[-1]["extra_body"] == {"reasoning": {"effort": "none"}}
 
 
 def test_run_bash_tool(tmp_path: Path):
@@ -423,6 +483,134 @@ def test_classifier_backends_and_modes():
     assert ThinkingClassifier().classify("find a deadlock in concurrency").level == ThinkingLevel.DEEP
 
 
+def test_domain_and_thinking_overrides_control_agent(tmp_path: Path):
+    for prompt, expected in (
+        ("fix the parser bug in code", "coding"),
+        ("survey academic literature and cite primary sources", "research"),
+        ("prove this numerical convergence theorem", "science"),
+        ("audit the code for SQL injection vulnerabilities", "audit"),
+    ):
+        agent = DeveloperAgent(llm_client=LLMClient(force_mock=True), workspace_root=str(tmp_path))
+        event = next(item.payload for item in agent.run_stream(prompt, max_steps=1)
+                     if item.event_type == "domain_mode")
+        assert event["mode"] == expected
+        assert event["selection"] == "auto"
+
+    assert parse_domain_mode("security") == DomainMode.AUDIT
+    assert parse_domain_mode("AUTO") is None
+    assert parse_thinking_level("deep") == ThinkingLevel.DEEP
+    assert parse_thinking_level("auto") is None
+    with pytest.raises(ValueError):
+        parse_thinking_level("extreme")
+
+    calls = []
+    client = LLMClient(force_mock=True)
+    def complete(**kwargs):
+        calls.append(kwargs)
+        return LLMResponse(content="done", model=kwargs["model"])
+    client.complete = complete
+    agent = DeveloperAgent(llm_client=client, workspace_root=str(tmp_path),
+                           forced_mode="security", forced_thinking="deep")
+    events = list(agent.run_stream("git status", max_steps=1))
+    domain = next(item.payload for item in events if item.event_type == "domain_mode")
+    thinking = next(item.payload for item in events if item.event_type == "thinking_budget")
+    routing = next(item.payload for item in events if item.event_type == "model_routing")
+    assert domain["mode"] == "audit" and domain["selection"] == "forced"
+    assert thinking["level"] == "deep" and thinking["tokens"] == 16000
+    assert thinking["effort"] == "high" and routing["tier"] == "reasoning"
+    assert calls[0]["reasoning_budget_tokens"] == 16000
+    assert "memory safety" in calls[0]["messages"][0]["content"]
+    tool_names = {item["function"]["name"] for item in calls[0]["tools"]}
+    assert "write_file" not in tool_names and "edit_file" not in tool_names
+    assert "run_bash" in tool_names
+
+    agent.forced_mode = DomainMode.SCIENCE
+    agent.forced_thinking = ThinkingLevel.NONE
+    events = list(agent.run_stream("prove convergence", max_steps=1))
+    assert next(item.payload for item in events if item.event_type == "model_routing")["tier"] == "fast"
+    assert calls[-1]["reasoning_effort"] is None
+    assert "convergence" in calls[-1]["messages"][0]["content"]
+    assert {"calculate", "check_convergence"}.issubset(
+        {item["function"]["name"] for item in calls[-1]["tools"]})
+
+
+def test_thinking_classification_adjusts_automatic_model_tier(tmp_path: Path):
+    class RoutedBackend(BaseClassifierBackend):
+        name = "fixture"
+        model = "fixed"
+        def __init__(self, thinking_label, tier_label):
+            self.thinking_label = thinking_label
+            self.tier_label = tier_label
+        def classify(self, text, labels):
+            if "code_edit" in labels:
+                selected = "general_reasoning"
+            elif "coding" in labels:
+                selected = "science"
+            elif "none" in labels:
+                selected = self.thinking_label
+            else:
+                selected = self.tier_label
+            return Classification(selected, {label: float(label == selected) for label in labels}, 0.1)
+
+    for text, thinking, tier, expected in (
+        ("analyze system architecture", "deep", "fast", "reasoning"),
+        ("git status", "none", "reasoning", "fast"),
+    ):
+        agent = DeveloperAgent(llm_client=LLMClient(force_mock=True), workspace_root=str(tmp_path),
+                               classifier_backend=RoutedBackend(thinking, tier))
+        events = list(agent.run_stream(text, max_steps=1))
+        route = next(item.payload for item in events if item.event_type == "model_routing")
+        assert route["tier"] == expected
+        assert route["selection"] == "auto"
+
+
+def test_security_mode_blocks_mutating_shell_commands(tmp_path: Path):
+    assert audit_command_is_read_only("git diff --stat")
+    assert not audit_command_is_read_only("touch changed.txt")
+    assert not audit_command_is_read_only("git diff --output=changed.txt")
+    assert not audit_command_is_read_only("git status; touch changed.txt")
+
+    class MutatingClient:
+        default_model = "mock"
+        def complete(self, **kwargs):
+            if kwargs["messages"][-1]["role"] == "tool":
+                return LLMResponse(content="Stopped after denial", model="mock")
+            return LLMResponse(model="mock", tool_calls=[ToolCall(id="write", name="run_bash",
+                arguments={"command": "touch changed.txt"})])
+
+    agent = DeveloperAgent(llm_client=MutatingClient(), workspace_root=str(tmp_path), forced_mode="security")
+    events = list(agent.run_stream("review this code", max_steps=2))
+    result = next(item.payload for item in events if item.event_type == "tool_result")
+    assert not result["success"]
+    assert "read-only git" in result["error"]
+    assert not (tmp_path / "changed.txt").exists()
+
+
+def test_research_mode_rejects_uncited_search_results(tmp_path: Path):
+    class UncitedSearch(Tool):
+        name = "web_search"
+        description = "Fixture search"
+        parameters = {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+        def execute(self, **kwargs):
+            return ToolResult(success=True, output="Unattributed result", metadata={"source_urls": []})
+
+    class ResearchClient:
+        default_model = "mock"
+        def complete(self, **kwargs):
+            if kwargs["messages"][-1]["role"] == "tool":
+                return LLMResponse(content="No cited sources available", model="mock")
+            return LLMResponse(model="mock", tool_calls=[ToolCall(id="search", name="web_search",
+                arguments={"query": "test"})])
+
+    agent = DeveloperAgent(llm_client=ResearchClient(), tools=[UncitedSearch()],
+                           workspace_root=str(tmp_path), forced_mode="research")
+    events = list(agent.run_stream("summarize papers", max_steps=2))
+    result = next(item.payload for item in events if item.event_type == "tool_result")
+    assert not result["success"]
+    assert "no cited sources" in result["error"]
+    assert next(item.payload for item in events if item.event_type == "response")["success"] is False
+
+
 @pytest.mark.anyio
 async def test_clarification_modal_keyboard(tmp_path: Path):
     app = AdaptiveHarnessApp(db_path=":memory:", config_dir=tmp_path / "config")
@@ -580,6 +768,11 @@ def test_science_and_optional_research_tools(monkeypatch):
     calculator = CalculateTool()
     assert calculator.execute("(2 + 3) * 4").metadata["value"] == 20
     assert not calculator.execute("__import__('os')").success
+    convergence = CheckConvergenceTool()
+    assert convergence.execute([1.0, 0.1, 0.01, 0.001], tolerance=0.1, expected_limit=0).success
+    assert not convergence.execute([1.0, -1.0, 1.0], tolerance=0.1).success
+    assert not convergence.execute([0.0, float("inf"), 1.0], tolerance=0.1).success
+    assert not convergence.execute([1.0, 1.0, 1.0], tolerance=0).success
     monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
     assert not WebSearchTool().execute("test").success
 

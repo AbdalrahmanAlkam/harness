@@ -16,7 +16,7 @@ DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 MODEL_TIERS = {
     "fast": "google/gemini-2.5-flash-lite",
-    "standard": "openai/gpt-4o",
+    "standard": "z-ai/glm-5.3-flash",
     "reasoning": "anthropic/claude-sonnet-4",
 }
 
@@ -67,6 +67,7 @@ class LLMClient:
         tier: Optional[str] = None,
         temperature: float = 0.2,
         reasoning_effort: Optional[str] = None,
+        reasoning_budget_tokens: Optional[int] = None,
     ) -> LLMResponse:
         """Executes a chat completion call with automatic model selection and tool handling."""
         selected_model = model or (self.get_model_for_tier(tier) if tier else self.default_model)
@@ -83,11 +84,28 @@ class LLMClient:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        if reasoning_effort and self.base_url.rstrip("/").startswith("https://openrouter.ai") and any(
-            marker in selected_model.lower() for marker in ("claude-sonnet-4", "gemini-2.5", "deepseek-r1", "o3-mini", "reasoning")
-        ):
-            kwargs["extra_body"] = {"reasoning": {"effort": reasoning_effort}}
-            kwargs.pop("temperature", None)
+        model_name = selected_model.lower()
+        is_openrouter = self.base_url.rstrip("/").startswith("https://openrouter.ai")
+        is_claude_reasoning = (model_name.startswith("anthropic/claude") and any(
+            marker in model_name for marker in ("claude-3.7", "claude-3-7", "claude-sonnet-4",
+                                                 "claude-opus-4", "claude-haiku-4", "claude-4", "claude-5")))
+        supports_reasoning = (is_claude_reasoning or
+                              any(marker in model_name for marker in
+                                  ("gemini-2.5", "gemini-3", "deepseek-r1", "o3-mini", "reasoning",
+                                   "z-ai/glm-5.3")))
+        if is_openrouter and supports_reasoning:
+            if reasoning_budget_tokens == 0:
+                kwargs["extra_body"] = {"reasoning": {"enabled": False} if is_claude_reasoning
+                                        else {"effort": "none"}}
+                kwargs.pop("temperature", None)
+            elif reasoning_effort:
+                if reasoning_budget_tokens and is_claude_reasoning:
+                    budget = max(1024, reasoning_budget_tokens)
+                    kwargs["extra_body"] = {"reasoning": {"max_tokens": budget}}
+                    kwargs["max_completion_tokens"] = budget + max(1024, budget // 4)
+                else:
+                    kwargs["extra_body"] = {"reasoning": {"effort": reasoning_effort}}
+                kwargs.pop("temperature", None)
 
         try:
             assert self._openai_client is not None

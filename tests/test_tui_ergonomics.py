@@ -5,12 +5,16 @@ from pathlib import Path
 
 import pytest
 from rich.console import Console
+from textual.widgets import Footer, Input
 
 from adaptive_harness.data.config import ConfigManager, PromptHistoryStore
-from adaptive_harness.agent.agent import DeveloperAgent
+from adaptive_harness.agent.agent import AgentEvent, DeveloperAgent
 from adaptive_harness.llm.client import LLMClient
 from adaptive_harness.tui.app import AdaptiveHarnessApp
-from adaptive_harness.tui.widgets import ClassifierTelemetryWidget, HistoryInput, ThemePickerModal
+from adaptive_harness.tui.widgets import ClassifierTelemetryWidget, HistoryInput, ThemePickerModal, QuickSelectModal
+from adaptive_harness.llm.catalog import CatalogModel, fetch_models
+from adaptive_harness.llm.client import MODEL_TIERS
+from adaptive_harness.data.sessions import SessionStore
 
 
 def test_private_config_and_bounded_history(tmp_path: Path):
@@ -68,6 +72,81 @@ def test_agent_reports_token_usage_for_tui(tmp_path: Path):
     response = next(event.payload for event in agent.run_stream("say hello", max_steps=1)
                     if event.event_type == "response")
     assert response["usage"] == {"prompt_tokens": 100, "completion_tokens": 50}
+
+
+def test_model_catalog_parses_text_models(monkeypatch):
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def read(self):
+            return json.dumps({"data": [
+                {"id": "z-ai/glm-5.3-flash", "name": "GLM 5.3 Flash", "context_length": 1000000},
+                {"id": "image/only", "architecture": {"output_modalities": ["image"]}},
+            ]}).encode()
+    monkeypatch.setattr("adaptive_harness.llm.catalog.urlopen", lambda request, timeout: Response())
+    assert fetch_models() == [CatalogModel("z-ai/glm-5.3-flash", "GLM 5.3 Flash", 1000000)]
+    assert MODEL_TIERS["standard"] == "z-ai/glm-5.3-flash"
+
+
+def test_launch_model_override_wins_saved_session(tmp_path: Path):
+    database = tmp_path / "sessions.db"
+    store = SessionStore(database)
+    saved = store.create(str(tmp_path))
+    saved.model = "saved/model"
+    saved.settings = {"safety": "cautious"}
+    store.save(saved)
+    store.close()
+    app = AdaptiveHarnessApp(db_path=database, session_id=saved.id,
+                             default_model="cli/model", config_dir=tmp_path / "prefs")
+    assert app.agent.explicit_model == "cli/model"
+    assert app.agent.llm_client.default_model == "cli/model"
+    assert app.agent.safety_profile == "cautious"
+    app.session_store.close()
+
+
+@pytest.mark.anyio
+async def test_quick_picker_model_and_session_keyboard(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr("adaptive_harness.tui.app.fetch_models", lambda key: [
+        CatalogModel("z-ai/glm-5.3-flash", "GLM 5.3 Flash", 1000000),
+        CatalogModel("openai/test-model", "Test Model", 10000),
+    ])
+    app = AdaptiveHarnessApp(db_path=tmp_path / "picker.db", workspace_root=str(tmp_path),
+                             config_dir=tmp_path / "prefs")
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.press("f4")
+        await pilot.pause()
+        assert isinstance(app.screen, QuickSelectModal)
+        search = app.screen.query_one("#quick-search", Input)
+        search.value = "test-model"
+        await pilot.pause()
+        assert len(app.screen.visible_choices) == 1
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.agent.explicit_model == "openai/test-model"
+        app._reset_session(new=True, title="Other task")
+        await pilot.press("f5")
+        await pilot.pause()
+        assert isinstance(app.screen, QuickSelectModal)
+        await pilot.press("down", "enter")
+        await pilot.pause()
+        assert app.session.title != "Other task"
+
+
+@pytest.mark.anyio
+async def test_activity_and_safety_controls(tmp_path: Path):
+    app = AdaptiveHarnessApp(db_path=tmp_path / "activity.db", workspace_root=str(tmp_path),
+                             config_dir=tmp_path / "prefs")
+    async with app.run_test(size=(120, 30)):
+        app._render_event(AgentEvent(
+            "agent_stage", {"stage": "thinking", "step": 1, "model": "test", "thinking_tokens": 1000}))
+        assert "Thinking / generating" in app._activity
+        app._render_event(AgentEvent(
+            "agent_stage", {"stage": "tool_running", "step": 1, "tool": "run_bash"}))
+        assert "Running run_bash" in app._activity
+        app._handle_slash_command("/safety cautious")
+        assert app.agent.safety_profile == "cautious"
+        assert app.session.settings["safety"] == "cautious"
 
 
 @pytest.mark.anyio
@@ -140,3 +219,46 @@ async def test_tui_history_theme_reset_and_export(tmp_path: Path, monkeypatch):
     assert reopened.saved_theme == "nord"
     assert reopened.api_key is None
     reopened.session_store.close()
+
+
+@pytest.mark.anyio
+async def test_footer_clearance_and_mode_controls(tmp_path: Path):
+    db_path = tmp_path / "layout.db"
+    app = AdaptiveHarnessApp(db_path=db_path, config_dir=tmp_path / "preferences",
+                             workspace_root=str(tmp_path))
+    async with app.run_test(size=(120, 30)) as pilot:
+        prompt = app.query_one("#prompt-input", HistoryInput)
+        footer = app.query_one(Footer)
+        for width, height in ((120, 30), (70, 20), (50, 14)):
+            await pilot.resize_terminal(width, height)
+            await pilot.pause()
+            assert prompt.region.y + prompt.region.height < footer.region.y
+            prompt.value = "/"
+            await pilot.pause()
+            assert prompt.region.y + prompt.region.height < footer.region.y
+            app.query_one("#waiting-indicator").add_class("visible")
+            await pilot.pause()
+            assert prompt.region.y + prompt.region.height < footer.region.y
+            app.query_one("#waiting-indicator").remove_class("visible")
+            prompt.value = ""
+
+        app._handle_slash_command("/mode security")
+        app._handle_slash_command("/thinking deep")
+        telemetry = app.query_one("#telemetry", ClassifierTelemetryWidget)
+        assert app.agent.forced_mode.value == "audit"
+        assert app.agent.forced_thinking.value == "deep"
+        assert telemetry.domain_selection == telemetry.thinking_selection == "forced"
+        assert telemetry.thinking_tokens == 16000
+        assert "SECURITY" in str(app.query_one("#status-line").render())
+        app._handle_slash_command("/mode research")
+        session_id = app.session.id
+        assert app.session_store.load(session_id).settings["mode"] == "research"
+        assert app.session_store.load(session_id).settings["thinking"] == "deep"
+        app._handle_slash_command("/thinking auto")
+        assert app.agent.forced_thinking is None
+        app._handle_slash_command("/thinking deep")
+
+    restored = AdaptiveHarnessApp(db_path=db_path, config_dir=tmp_path / "preferences", session_id=session_id)
+    assert restored.agent.forced_mode.value == "research"
+    assert restored.agent.forced_thinking.value == "deep"
+    restored.session_store.close()

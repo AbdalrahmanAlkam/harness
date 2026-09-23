@@ -15,9 +15,11 @@ from adaptive_harness.classifiers.skill_classifier import SkillClassificationRes
 from adaptive_harness.classifiers.verification_classifier import VerificationAssessment, VerificationClassifier
 from adaptive_harness.classifiers.risk_classifier import ToolRiskClassifier
 from adaptive_harness.classifiers.engine import (BaseClassifierBackend, SklearnBackend, DOMAIN_LABELS,
-    THINKING_LABELS, TIER_LABELS, VERIFICATION_LABELS)
-from adaptive_harness.classifiers.domain_classifier import DomainClassifier, DomainAssessment, DOMAIN_GUIDANCE, DomainMode
-from adaptive_harness.classifiers.thinking_classifier import ThinkingClassifier, ThinkingAssessment, ThinkingLevel, BUDGET_TOKENS
+    THINKING_LABELS, TIER_LABELS, VERIFICATION_LABELS, Classification)
+from adaptive_harness.classifiers.domain_classifier import (DomainClassifier, DomainAssessment, DOMAIN_GUIDANCE,
+    DomainMode, parse_domain_mode, audit_command_is_read_only)
+from adaptive_harness.classifiers.thinking_classifier import (ThinkingClassifier, ThinkingAssessment,
+    ThinkingLevel, BUDGET_TOKENS, parse_thinking_level)
 from adaptive_harness.classifiers.skill_classifier import SKILL_CLASSES
 from adaptive_harness.data.storage import ExperienceRepository
 from adaptive_harness.llm.client import LLMClient
@@ -28,7 +30,7 @@ from adaptive_harness.tools.bash import RunBashTool
 from adaptive_harness.tools.clarification import AskUserTool
 from adaptive_harness.tools.file_ops import EditFileTool, ReadFileTool, WriteFileTool
 from adaptive_harness.tools.testing import RunPytestTool
-from adaptive_harness.tools.science import CalculateTool
+from adaptive_harness.tools.science import CalculateTool, CheckConvergenceTool
 from adaptive_harness.tools.research import WebSearchTool
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 
@@ -62,7 +64,13 @@ class DeveloperAgent:
         workspace_root: Optional[str] = None,
         explicit_model: Optional[str] = None,
         classifier_backend: Optional[BaseClassifierBackend] = None,
+        forced_mode: str | DomainMode | None = None,
+        forced_thinking: str | ThinkingLevel | None = None,
+        safety_profile: str = "turbo",
     ):
+        if safety_profile not in {"turbo", "cautious"}:
+            raise ValueError("Safety profile must be turbo or cautious")
+        self.safety_profile = safety_profile
         self.llm_client = llm_client or LLMClient()
         self.repository = repository
         self.clarification_callback = clarification_callback
@@ -70,6 +78,8 @@ class DeveloperAgent:
         self.workspace_root = Path(workspace_root or ".").resolve()
         self.active_skills: dict[str, str] = {}
         self.explicit_model = explicit_model
+        self.forced_mode = parse_domain_mode(forced_mode)
+        self.forced_thinking = parse_thinking_level(forced_thinking)
         self.classifier_backend = classifier_backend or SklearnBackend()
         self.fallback_classifier = SklearnBackend()
         self.domain_classifier = DomainClassifier()
@@ -92,6 +102,7 @@ class DeveloperAgent:
             SearchFilesTool(workspace_root=workspace_root),
             RunPytestTool(workspace_root=workspace_root),
             CalculateTool(),
+            CheckConvergenceTool(),
             AskUserTool(callback=self._handle_clarification),
         ]
         if WebSearchTool().api_key:
@@ -162,7 +173,8 @@ class DeveloperAgent:
 
         # 2. Ambiguity & Clarification assessment ("questions in the middle of development")
         ambiguity_res = self.ambiguity_classifier.evaluate(user_input, skill_res,
-            semantic_decision=(classifier_name == "semif" and self.clarification_callback is not None))
+            semantic_decision=(self.safety_profile == "cautious" and classifier_name == "semif"
+                               and self.clarification_callback is not None))
         yield AgentEvent(
             event_type="ambiguity_assessment",
             payload=ambiguity_res.to_dict(),
@@ -208,41 +220,69 @@ class DeveloperAgent:
             classifier_name, classifier_model = self.fallback_classifier.name, self.fallback_classifier.model
             yield AgentEvent("classifier_fallback", {"backend": classifier_name, "model": classifier_model})
         complexity_res = self.complexity_router.route(user_input, tier_prediction.probabilities)
-        try:
-            domain_prediction = self.classifier_backend.classify(user_input, DOMAIN_LABELS)
-        except Exception as exc:
-            yield AgentEvent("classifier_error", {"backend": self.classifier_backend.name, "error": f"Domain: {exc}"})
-            self.classifier_backend = self.fallback_classifier
-            domain_prediction = self.fallback_classifier.classify(user_input, DOMAIN_LABELS)
-            classifier_name, classifier_model = self.fallback_classifier.name, self.fallback_classifier.model
-            yield AgentEvent("classifier_fallback", {"backend": classifier_name, "model": classifier_model})
-        try:
-            thinking_prediction = self.classifier_backend.classify(user_input, THINKING_LABELS)
-        except Exception as exc:
-            yield AgentEvent("classifier_error", {"backend": self.classifier_backend.name, "error": f"Thinking: {exc}"})
-            self.classifier_backend = self.fallback_classifier
-            thinking_prediction = self.fallback_classifier.classify(user_input, THINKING_LABELS)
-            classifier_name, classifier_model = self.fallback_classifier.name, self.fallback_classifier.model
-            yield AgentEvent("classifier_fallback", {"backend": classifier_name, "model": classifier_model})
+        if self.forced_mode is not None:
+            domain_prediction = Classification(self.forced_mode.value,
+                {label: float(label == self.forced_mode.value) for label in DOMAIN_LABELS}, 0.0)
+        else:
+            try:
+                domain_prediction = self.classifier_backend.classify(user_input, DOMAIN_LABELS)
+            except Exception as exc:
+                yield AgentEvent("classifier_error", {"backend": self.classifier_backend.name, "error": f"Domain: {exc}"})
+                self.classifier_backend = self.fallback_classifier
+                domain_prediction = self.fallback_classifier.classify(user_input, DOMAIN_LABELS)
+                classifier_name, classifier_model = self.fallback_classifier.name, self.fallback_classifier.model
+                yield AgentEvent("classifier_fallback", {"backend": classifier_name, "model": classifier_model})
+        if self.forced_thinking is not None:
+            thinking_prediction = Classification(self.forced_thinking.value,
+                {label: float(label == self.forced_thinking.value) for label in THINKING_LABELS}, 0.0)
+        else:
+            try:
+                thinking_prediction = self.classifier_backend.classify(user_input, THINKING_LABELS)
+            except Exception as exc:
+                yield AgentEvent("classifier_error", {"backend": self.classifier_backend.name, "error": f"Thinking: {exc}"})
+                self.classifier_backend = self.fallback_classifier
+                thinking_prediction = self.fallback_classifier.classify(user_input, THINKING_LABELS)
+                classifier_name, classifier_model = self.fallback_classifier.name, self.fallback_classifier.model
+                yield AgentEvent("classifier_fallback", {"backend": classifier_name, "model": classifier_model})
         domain_res = DomainAssessment(DomainMode(domain_prediction.label), max(domain_prediction.probabilities.values()))
         heuristic_domain = self.domain_classifier.classify(user_input)
-        if classifier_name != "semif" and heuristic_domain.confidence >= 0.8:
+        if self.forced_mode is None and classifier_name != "semif" and heuristic_domain.confidence >= 0.8:
             domain_res = heuristic_domain
         predicted_level = ThinkingLevel(thinking_prediction.label)
         heuristic_thinking = self.thinking_classifier.classify(user_input)
         order = list(ThinkingLevel)
-        if classifier_name != "semif" and order.index(heuristic_thinking.level) > order.index(predicted_level):
+        if self.forced_thinking is None and classifier_name != "semif" and order.index(heuristic_thinking.level) > order.index(predicted_level):
             predicted_level = heuristic_thinking.level
         thinking_res = ThinkingAssessment(predicted_level, BUDGET_TOKENS[predicted_level],
                                           None if predicted_level == ThinkingLevel.NONE else
                                           "high" if predicted_level in (ThinkingLevel.DEEP, ThinkingLevel.EXTREME) else predicted_level.value)
+        if self.forced_thinking is not None and self.explicit_model is None:
+            forced_tier = ("fast" if predicted_level == ThinkingLevel.NONE else
+                           "reasoning" if predicted_level in (ThinkingLevel.DEEP, ThinkingLevel.EXTREME) else
+                           "standard")
+            complexity_res = ComplexityRoutingResult(forced_tier,
+                self.complexity_router.tier_models[forced_tier], 1.0,
+                "Manual thinking level selected this model tier.")
+        elif self.explicit_model is None:
+            aligned_tier = ("fast" if predicted_level == ThinkingLevel.NONE else
+                            "reasoning" if predicted_level in (ThinkingLevel.DEEP, ThinkingLevel.EXTREME) else
+                            "standard" if predicted_level == ThinkingLevel.MEDIUM and complexity_res.tier == "fast" else
+                            complexity_res.tier)
+            if aligned_tier != complexity_res.tier:
+                complexity_res = ComplexityRoutingResult(aligned_tier,
+                    self.complexity_router.tier_models[aligned_tier],
+                    thinking_prediction.probabilities.get(predicted_level.value, 0.0),
+                    "Thinking classification adjusted the model tier.")
         if max_steps is None:
             max_steps = {ThinkingLevel.NONE: 4, ThinkingLevel.LOW: 8, ThinkingLevel.MEDIUM: 12,
                          ThinkingLevel.DEEP: 16, ThinkingLevel.EXTREME: 20}[thinking_res.level]
         max_steps = max(1, min(max_steps, 24))
         yield AgentEvent("domain_mode", {"mode": domain_res.mode.value, "confidence": domain_res.confidence,
+                                          "selection": "forced" if self.forced_mode else "auto",
                                           "latency_ms": round(domain_prediction.latency_ms, 2)})
         yield AgentEvent("thinking_budget", {"level": thinking_res.level.value, "tokens": thinking_res.budget_tokens,
+                                               "selection": "forced" if self.forced_thinking else "auto",
+                                               "effort": thinking_res.effort,
                                                "latency_ms": round(thinking_prediction.latency_ms, 2),
                                                "classifier_total_ms": round(classification.latency_ms + tier_prediction.latency_ms
                                                                              + domain_prediction.latency_ms
@@ -267,11 +307,13 @@ class DeveloperAgent:
                             + "\nOperating mode: " + domain_res.mode.value + ". " + DOMAIN_GUIDANCE[domain_res.mode]
                             + ("\n" + skill_guidance if skill_guidance else "")}
         domain_tool_names = {
-            DomainMode.CODING: set(self.tools),
+            DomainMode.CODING: set(self.tools) - {"check_convergence"},
             DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "run_bash", "calculate", "ask_user"},
-            DomainMode.SCIENCE: {"read_file", "write_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "ask_user"},
+            DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "ask_user"},
             DomainMode.AUDIT: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user"},
         }[domain_res.mode]
+        if self.safety_profile == "turbo":
+            domain_tool_names.discard("ask_user")
         tool_schemas = [t.to_openai_schema() for t in self.tools.values() if t.name in domain_tool_names]
 
         # Agent execution loop (LLM call -> tool execution -> verification -> repeat if needed)
@@ -284,12 +326,16 @@ class DeveloperAgent:
 
         while step < max_steps:
             step += 1
+            yield AgentEvent("agent_stage", {"stage": "thinking" if thinking_res.budget_tokens else "generating",
+                                             "step": step, "model": selected_model,
+                                             "thinking_tokens": thinking_res.budget_tokens})
             llm_resp = self.llm_client.complete(
                 messages=self._request_messages(),
                 tools=tool_schemas,
                 model=selected_model,
                 tier=complexity_res.tier,
                 reasoning_effort=thinking_res.effort,
+                reasoning_budget_tokens=thinking_res.budget_tokens,
             )
             for token_type in usage:
                 usage[token_type] += int((llm_resp.usage or {}).get(token_type, 0) or 0)
@@ -336,6 +382,7 @@ class DeveloperAgent:
                     "name": tc.name, "arguments": json.dumps(tc.arguments)}} for tc in llm_resp.tool_calls],
             })
             for tc in llm_resp.tool_calls:
+                yield AgentEvent("agent_stage", {"stage": "tool_running", "step": step, "tool": tc.name})
                 yield AgentEvent(
                     event_type="tool_call",
                     payload={"name": tc.name, "arguments": tc.arguments, "call_id": tc.id},
@@ -343,7 +390,11 @@ class DeveloperAgent:
 
                 tool = self.tools.get(tc.name) if tc.name in domain_tool_names else None
                 t_start = time.perf_counter()
-                if tool:
+                if (tool and domain_res.mode == DomainMode.AUDIT and tc.name == "run_bash" and
+                        not audit_command_is_read_only(str(tc.arguments.get("command", "")))):
+                    tool_res = ToolResult(success=False, output="",
+                        error="Security audit mode permits only read-only git status, diff, show, or log commands")
+                elif tool:
                     try:
                         tool_res = tool.execute(**tc.arguments)
                     except Exception as exc:
@@ -356,6 +407,11 @@ class DeveloperAgent:
                         ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
                     except (SyntaxError, OSError) as exc:
                         tool_res = ToolResult(success=False, output=tool_res.output, error=f"SyntaxError: Python AST validation failed: {exc}")
+                if tool_res.success and domain_res.mode == DomainMode.RESEARCH and tc.name == "web_search":
+                    urls = (tool_res.metadata.get("source_urls") or []) if tool_res.metadata else []
+                    if not any(isinstance(url, str) and url.startswith(("https://", "http://")) for url in urls):
+                        tool_res = ToolResult(success=False, output=tool_res.output,
+                            error="Research search returned no cited sources; refine the query or use local documents")
                 t_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
                 shown_output = tool_res.output
                 if len(shown_output) > 20_000:
@@ -373,6 +429,7 @@ class DeveloperAgent:
                 )
 
                 # 4. Verification Classifier on tool execution output
+                yield AgentEvent("agent_stage", {"stage": "verifying", "step": step, "tool": tc.name})
                 try:
                     verification_prediction = self.classifier_backend.classify(
                         f"Tool: {tc.name}\nSuccess: {tool_res.success}\nError: {tool_res.error or ''}\nOutput: {shown_output}",

@@ -60,8 +60,10 @@ class ClassifierTelemetryWidget(Static):
         self.classifier_model: str = "TF-IDF + Logistic Regression"
         self.classifier_latency_ms: float = 0.0
         self.domain_mode: str = "—"
+        self.domain_selection: str = "auto"
         self.thinking_level: str = "—"
         self.thinking_tokens: int = 0
+        self.thinking_selection: str = "auto"
 
     def reset_telemetry(self, *, classifier_engine: str | None = None,
                         classifier_model: str | None = None, model: str | None = None,
@@ -74,8 +76,10 @@ class ClassifierTelemetryWidget(Static):
         self.primary_skill = "none"
         self.classifier_latency_ms = 0.0
         self.domain_mode = "—"
+        self.domain_selection = "auto"
         self.thinking_level = "—"
         self.thinking_tokens = 0
+        self.thinking_selection = "auto"
         if classifier_engine is not None:
             self.classifier_engine = classifier_engine
         if classifier_model is not None:
@@ -100,8 +104,10 @@ class ClassifierTelemetryWidget(Static):
         classifier_model: Optional[str] = None,
         classifier_latency_ms: Optional[float] = None,
         domain_mode: Optional[str] = None,
+        domain_selection: Optional[str] = None,
         thinking_level: Optional[str] = None,
         thinking_tokens: Optional[int] = None,
+        thinking_selection: Optional[str] = None,
     ) -> None:
         if probabilities is not None:
             self.probabilities = probabilities
@@ -119,8 +125,9 @@ class ClassifierTelemetryWidget(Static):
             self.primary_skill = primary_skill
         for key, value in (("selection", selection), ("classifier_engine", classifier_engine),
                            ("classifier_model", classifier_model), ("classifier_latency_ms", classifier_latency_ms),
-                           ("domain_mode", domain_mode), ("thinking_level", thinking_level),
-                           ("thinking_tokens", thinking_tokens)):
+                           ("domain_mode", domain_mode), ("domain_selection", domain_selection),
+                           ("thinking_level", thinking_level), ("thinking_tokens", thinking_tokens),
+                           ("thinking_selection", thinking_selection)):
             if value is not None:
                 setattr(self, key, value)
 
@@ -139,8 +146,16 @@ class ClassifierTelemetryWidget(Static):
         status.append("Engine: ", style="bold cyan")
         status.append(f"{engine_name} ({model_name})\n", style=engine_color)
         status.append(f"Latency: {self.classifier_latency_ms:.2f} ms\n", style="cyan")
-        status.append(f"Domain  {self.domain_mode.upper()}\n", style="bold magenta")
-        status.append(f"Thinking  {self.thinking_level.upper()} · {self.thinking_tokens:,} tokens\n", style="bold yellow")
+        domain_label = "SECURITY" if self.domain_mode == "audit" else self.domain_mode.upper()
+        domain_color = {"coding": "bold cyan", "research": "bold magenta", "science": "bold green",
+                        "audit": "bold red"}.get(self.domain_mode, "bold cyan")
+        status.append("Domain Mode: ", style="bold cyan")
+        status.append(f"[{domain_label}]", style=domain_color)
+        status.append(f" {self.domain_selection.upper()}\n", style="dim")
+        budget_label = f"{self.thinking_tokens // 1000}k" if self.thinking_tokens >= 1000 else "0"
+        status.append("Thinking Level: ", style="bold cyan")
+        status.append(f"[{self.thinking_level.upper()} ({budget_label} tokens)]", style="bold yellow")
+        status.append(f" {self.thinking_selection.upper()}\n", style="dim")
         status.append(f"Skill  {self.primary_skill}\n")
         status.append(f"H(p)  {self.entropy:.3f} bits   Margin  {self.margin*100:.1f}%\n", style="cyan")
         risk_style = "cyan" if self.risk_level == "idle" else "green" if self.risk_level == "low" else "yellow" if self.risk_level == "medium" else "bold red"
@@ -331,6 +346,104 @@ class ThemePickerModal(ModalScreen[str | None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if isinstance(event.button, ThemeOption):
             self.dismiss(event.button.theme_name)
+
+
+class QuickSelectModal(ModalScreen[str | None]):
+    """Searchable, keyboard- and mouse-operated selector for models and sessions."""
+
+    DEFAULT_CSS = """
+    QuickSelectModal { align: center middle; background: rgba(0, 0, 0, 0.70); }
+    #quick-card { width: 88%; max-width: 96; height: 80%; max-height: 30;
+                  background: $surface; border: round $accent; padding: 1 2; }
+    #quick-title { height: 2; text-align: center; text-style: bold; color: $accent; }
+    #quick-search { margin-bottom: 1; }
+    #quick-results { height: 1fr; }
+    #quick-detail { height: 3; color: $text; background: $panel; padding: 0 1; }
+    #quick-help { height: 1; color: $text-muted; text-align: center; }
+    .quick-choice { width: 100%; height: 2; min-height: 2; }
+    .quick-choice:focus { border: heavy $accent; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel"), ("up", "previous", "Previous"),
+                ("down", "next", "Next"), ("enter", "choose", "Select")]
+
+    def __init__(self, title: str, choices: list[tuple[str, str]], *, current: str | None = None):
+        super().__init__()
+        self.title_text = title
+        self.choices = choices
+        self.current = current
+        self.visible_choices: list[tuple[str, str]] = []
+        self.selected_index = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="quick-card"):
+            yield Label(self.title_text, id="quick-title")
+            yield Input(placeholder="Type to filter…", id="quick-search")
+            yield VerticalScroll(id="quick-results")
+            yield Static("", id="quick-detail")
+            yield Static("Type to filter · ↑↓ navigate · Enter select · Esc cancel", id="quick-help")
+
+    async def on_mount(self) -> None:
+        await self._filter("")
+        self.query_one("#quick-search", Input).focus()
+
+    async def _filter(self, query: str) -> None:
+        words = query.casefold().split()
+        self.visible_choices = [choice for choice in self.choices
+                                if all(word in (choice[0] + " " + choice[1]).casefold() for word in words)][:60]
+        self.selected_index = next((i for i, choice in enumerate(self.visible_choices)
+                                    if choice[0] == self.current), 0)
+        self._update_detail()
+        results = self.query_one("#quick-results", VerticalScroll)
+        await results.remove_children()
+        if not self.visible_choices:
+            await results.mount(Static("No matching choices."))
+            return
+        await results.mount_all(
+            Button(label, id=f"quick-{index}", classes="quick-choice",
+                   variant="primary" if index == self.selected_index else "default")
+            for index, (_, label) in enumerate(self.visible_choices))
+
+    async def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "quick-search":
+            await self._filter(event.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "quick-search":
+            self.action_choose()
+
+    def _select_index(self, index: int) -> None:
+        if not self.visible_choices:
+            return
+        old = self.query(f"#quick-{self.selected_index}")
+        if old:
+            old.first().variant = "default"
+        self.selected_index = max(0, min(index, len(self.visible_choices) - 1))
+        selected = self.query_one(f"#quick-{self.selected_index}", Button)
+        selected.variant = "primary"
+        selected.scroll_visible()
+        self._update_detail()
+
+    def _update_detail(self) -> None:
+        detail = self.query_one("#quick-detail", Static)
+        detail.update(Text(self.visible_choices[self.selected_index][1] if self.visible_choices
+                           else "No matching choices."))
+
+    def action_previous(self) -> None:
+        self._select_index(self.selected_index - 1)
+
+    def action_next(self) -> None:
+        self._select_index(self.selected_index + 1)
+
+    def action_choose(self) -> None:
+        if self.visible_choices:
+            self.dismiss(self.visible_choices[self.selected_index][0])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id and event.button.id.startswith("quick-"):
+            self.dismiss(self.visible_choices[int(event.button.id[6:])][0])
 
 
 class OptionDescription(Static):

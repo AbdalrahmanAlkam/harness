@@ -14,8 +14,24 @@ class ThinkingLevel(str, Enum):
 
 
 BUDGET_TOKENS = {ThinkingLevel.NONE: 0, ThinkingLevel.LOW: 1000,
-                 ThinkingLevel.MEDIUM: 4000, ThinkingLevel.DEEP: 8000,
-                 ThinkingLevel.EXTREME: 16000}
+                 ThinkingLevel.MEDIUM: 4000, ThinkingLevel.DEEP: 16000,
+                 ThinkingLevel.EXTREME: 32000}
+
+
+def parse_thinking_level(value: str | ThinkingLevel | None) -> ThinkingLevel | None:
+    if value is None:
+        return None
+    if isinstance(value, ThinkingLevel):
+        return value
+    if value.strip().lower() == "auto":
+        return None
+    try:
+        level = ThinkingLevel(value.strip().lower())
+    except ValueError as exc:
+        raise ValueError("Thinking must be none, low, medium, deep, or auto") from exc
+    if level == ThinkingLevel.EXTREME:
+        raise ValueError("Thinking must be none, low, medium, deep, or auto")
+    return level
 
 
 @dataclass

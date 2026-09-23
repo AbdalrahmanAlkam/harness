@@ -20,15 +20,18 @@ from textual.widgets import Footer, Header, Input, RichLog, Static
 from adaptive_harness.agent.agent import AgentEvent, DeveloperAgent
 from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.classifiers.engine import create_backend
+from adaptive_harness.classifiers.domain_classifier import parse_domain_mode
+from adaptive_harness.classifiers.thinking_classifier import parse_thinking_level, BUDGET_TOKENS
 from adaptive_harness.data.storage import ExperienceRepository
 from adaptive_harness.data.config import ConfigManager, PromptHistoryStore
 from adaptive_harness.data.sessions import SessionStore
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
+from adaptive_harness.llm.catalog import CatalogModel, fetch_models
 from adaptive_harness.tui.widgets import (ClarificationModal, ClassifierTelemetryWidget,
-    HistoryInput, PinnedRichLog, ThemePickerModal, THEME_CHOICES)
+    HistoryInput, PinnedRichLog, ThemePickerModal, QuickSelectModal, THEME_CHOICES)
 
 
-COMMANDS = ("/key", "/model", "/tier", "/theme", "/classifier", "/new",
+COMMANDS = ("/key", "/model", "/models", "/tier", "/mode", "/thinking", "/safety", "/theme", "/classifier", "/new",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions",
             "/session", "/skills", "/skill", "/output", "/export")
 
@@ -52,9 +55,9 @@ class AdaptiveHarnessApp(App):
     }
     #input-container {
         height: 3;
-        dock: bottom;
         background: $surface;
         padding: 0 1;
+        margin: 1 0 1 0;
     }
     #status-line { height: 1; background: $surface; color: $text; padding: 0 1; }
     #prompt-input {
@@ -82,6 +85,8 @@ class AdaptiveHarnessApp(App):
         ("f1", "show_help", "Help"),
         ("f2", "choose_theme", "Theme"),
         ("f3", "toggle_telemetry", "Telemetry"),
+        ("f4", "choose_model", "Models"),
+        ("f5", "choose_session", "Sessions"),
     ]
 
     def __init__(
@@ -97,6 +102,9 @@ class AdaptiveHarnessApp(App):
         semif_device: str = "auto",
         semif_4bit: bool = False,
         semif_temperature: float = 1.0,
+        mode: str = "auto",
+        thinking: str = "auto",
+        safety: str | None = None,
         session_id: Optional[str] = None,
         config_dir: Path | str | None = None,
         **kwargs,
@@ -113,6 +121,7 @@ class AdaptiveHarnessApp(App):
         self.base_url = base_url
         if default_model and default_model.lower() == "auto":
             default_model = None
+        self._cli_model_override = default_model
         self.default_model = default_model or MODEL_TIERS["standard"]
         self.db_path = db_path
         self.workspace_root = str(Path(workspace_root or ".").expanduser().resolve())
@@ -122,6 +131,17 @@ class AdaptiveHarnessApp(App):
         self.semif_device = semif_device
         self.semif_4bit = semif_4bit
         self.semif_temperature = semif_temperature
+        initial_mode = parse_domain_mode(mode)
+        initial_thinking = parse_thinking_level(thinking)
+        self._cli_mode_override = initial_mode
+        self._cli_thinking_override = initial_thinking
+        if safety is not None and safety not in {"turbo", "cautious"}:
+            raise ValueError("Safety profile must be turbo or cautious")
+        self._cli_safety_override = safety
+        self._default_safety = "turbo"
+        self._model_catalog: list[CatalogModel] = []
+        self._activity = "Ready"
+        self._activity_pulse = False
 
         # LLM Client & Repo
         self.llm_client = LLMClient(
@@ -144,6 +164,7 @@ class AdaptiveHarnessApp(App):
         self._busy = False
         self._show_telemetry = True
         self._last_tool_output = ""
+        self._last_agent_content = ""
         self._clarification_future: concurrent.futures.Future[str] | None = None
         self._session_restore_warning = ""
         self._quit_when_finished = False
@@ -159,12 +180,15 @@ class AdaptiveHarnessApp(App):
             clarification_callback=self._request_interactive_clarification,
             workspace_root=self.workspace_root,
             explicit_model=default_model,
+            forced_mode=initial_mode,
+            forced_thinking=initial_thinking,
+            safety_profile=safety or self._default_safety,
             classifier_backend=create_backend(classifier_backend, classifier_model, classifier_endpoint,
                 api_key=self.api_key, device=semif_device, load_in_4bit=semif_4bit,
                 temperature=semif_temperature),
         )
         if session_id:
-            self._restore_session()
+            self._restore_session(preserve_cli_overrides=True)
 
     def _local_endpoint(self) -> bool:
         from urllib.parse import urlparse
@@ -198,7 +222,12 @@ class AdaptiveHarnessApp(App):
         log = self.query_one("#chat-log", RichLog)
         self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
             classifier_engine=self.agent.classifier_backend.name,
-            classifier_model=self.agent.classifier_backend.model)
+            classifier_model=self.agent.classifier_backend.model,
+            domain_mode=self.agent.forced_mode.value if self.agent.forced_mode else "—",
+            domain_selection="forced" if self.agent.forced_mode else "auto",
+            thinking_level=self.agent.forced_thinking.value if self.agent.forced_thinking else "—",
+            thinking_tokens=BUDGET_TOKENS[self.agent.forced_thinking] if self.agent.forced_thinking else 0,
+            thinking_selection="forced" if self.agent.forced_thinking else "auto")
         log.write("[bold cyan]Welcome to Adaptive Agent Harness 2.0![/bold cyan]")
         log.write(
             "[dim]Autonomous coding agent with pervasive ML routing, active verification, and interactive clarification.[/dim]\n"
@@ -212,6 +241,8 @@ class AdaptiveHarnessApp(App):
             log.write(Text(self._session_restore_warning, style="yellow"))
         if self.config.last_error:
             log.write(Text(self.config.last_error, style="yellow"))
+        if self.session.messages:
+            self._render_session_messages(log)
 
         self.query_one("#prompt-input", Input).focus()
         self._refresh_status()
@@ -224,6 +255,9 @@ class AdaptiveHarnessApp(App):
             indicator.toggle_class("pulse")
         else:
             indicator.remove_class("pulse")
+        if self._busy:
+            self._activity_pulse = not self._activity_pulse
+            self._refresh_status()
 
     def on_resize(self, event) -> None:
         self._apply_layout()
@@ -237,9 +271,14 @@ class AdaptiveHarnessApp(App):
         model = self.agent.explicit_model or "auto"
         provider = ("🟡 Offline Mock Engine" if self.agent.llm_client.is_mock else
                     "🟢 OpenRouter" if "openrouter.ai" in self.agent.llm_client.base_url else "🟢 Local/Custom")
-        self.sub_title = f"{provider} ({model})  ·  P:{self.prompt_tokens:,} C:{self.completion_tokens:,}"
+        telemetry = self.query_one("#telemetry", ClassifierTelemetryWidget)
+        mode = ("SECURITY" if telemetry.domain_mode == "audit" else
+                telemetry.domain_mode.upper() if telemetry.domain_mode != "—" else "AUTO")
+        thinking = telemetry.thinking_level.upper() if telemetry.thinking_level != "—" else "AUTO"
+        activity = ("● " if self._activity_pulse and self._busy else "◦ ") + self._activity
+        self.sub_title = f"{provider} ({model})  ·  {activity}  ·  {mode} / {thinking}  ·  P:{self.prompt_tokens:,} C:{self.completion_tokens:,}"
         self.query_one("#status-line", Static).update(Text(
-            f"{provider}  ·  P:{self.prompt_tokens:,} C:{self.completion_tokens:,}  ·  Session {self.session.id}  ·  {self.workspace_root}", style="bold cyan"))
+            f"{activity}  ·  {provider}  ·  {mode} / {thinking}  ·  {self.agent.safety_profile.upper()}  ·  P:{self.prompt_tokens:,} C:{self.completion_tokens:,}  ·  Session {self.session.id}  ·  {self.workspace_root}", style="bold cyan"))
 
     def _save_session(self) -> None:
         self.session.workspace = self.workspace_root
@@ -251,18 +290,37 @@ class AdaptiveHarnessApp(App):
                                  "classifier_endpoint": self.classifier_endpoint or "",
                                  "semif_device": self.semif_device, "semif_4bit": str(self.semif_4bit),
                                  "semif_temperature": str(self.semif_temperature),
+                                 "mode": self.agent.forced_mode.value if self.agent.forced_mode else "auto",
+                                 "thinking": self.agent.forced_thinking.value if self.agent.forced_thinking else "auto",
+                                 "safety": self.agent.safety_profile,
                                  "prompt_tokens": str(self.prompt_tokens),
                                  "completion_tokens": str(self.completion_tokens)}
         self.session_store.save(self.session)
 
-    def _restore_session(self) -> None:
+    def _restore_session(self, *, preserve_cli_overrides: bool = False) -> None:
         self._session_restore_warning = ""
         self.agent.messages = self.session.messages or [{"role": "system", "content": self.agent.system_prompt}]
-        self.agent.explicit_model = self.session.model
-        if self.session.model:
-            self.agent.llm_client.default_model = self.session.model
+        self.agent.explicit_model = (self._cli_model_override if preserve_cli_overrides and self._cli_model_override
+                                     else self.session.model)
+        if self.agent.explicit_model:
+            self.agent.llm_client.default_model = self.agent.explicit_model
+        else:
+            self.agent.llm_client.default_model = MODEL_TIERS["standard"]
         self.agent.set_workspace(self.session.workspace)
         settings = self.session.settings or {}
+        try:
+            self.agent.forced_mode = (self._cli_mode_override if preserve_cli_overrides and self._cli_mode_override
+                                      else parse_domain_mode(settings.get("mode", "auto")))
+            self.agent.forced_thinking = (self._cli_thinking_override if preserve_cli_overrides and self._cli_thinking_override
+                                          else parse_thinking_level(settings.get("thinking", "auto")))
+        except ValueError as exc:
+            self.agent.forced_mode = None
+            self.agent.forced_thinking = None
+            self._session_restore_warning = f"Saved mode or thinking level is invalid ({exc}); using auto."
+        self.agent.safety_profile = (self._cli_safety_override if preserve_cli_overrides and self._cli_safety_override
+                                     else settings.get("safety", self._default_safety))
+        if self.agent.safety_profile not in {"turbo", "cautious"}:
+            self.agent.safety_profile = "turbo"
         for field in ("prompt_tokens", "completion_tokens"):
             try:
                 setattr(self, field, max(0, int(settings.get(field, "0"))))
@@ -342,6 +400,129 @@ class AdaptiveHarnessApp(App):
         self._show_telemetry = not self._show_telemetry
         self._apply_layout()
 
+    def action_choose_model(self) -> None:
+        if self._busy:
+            return
+        self._activity = "Fetching models"
+        self._refresh_status()
+        self._fetch_model_catalog()
+
+    @work(thread=True)
+    def _fetch_model_catalog(self) -> None:
+        error = ""
+        try:
+            models = fetch_models(self.api_key)
+        except Exception as exc:
+            models = self._model_catalog
+            error = f"Model catalog unavailable ({type(exc).__name__}); showing saved choices."
+        if self.is_running:
+            self.call_from_thread(self._show_model_picker, models, error)
+
+    def _show_model_picker(self, models: list[CatalogModel], error: str = "") -> None:
+        self._activity = "Ready"
+        self._refresh_status()
+        if error:
+            self.query_one("#chat-log", RichLog).write(Text(error, style="yellow"))
+        if models:
+            self._model_catalog = models
+        choices = [("auto", "AUTO  ·  route by task complexity")]
+        seen = {"auto"}
+        for model_id in [*MODEL_TIERS.values(), self.agent.explicit_model or ""]:
+            if model_id and model_id not in seen:
+                choices.append((model_id, f"★ {model_id}"))
+                seen.add(model_id)
+        for model in models:
+            if model.id not in seen:
+                context = f" · {model.context_length // 1000}k context" if model.context_length else ""
+                choices.append((model.id, f"{model.name}  ·  {model.id}{context}"))
+                seen.add(model.id)
+        def picked(model_id: str | None) -> None:
+            if model_id is not None:
+                self._set_model(model_id)
+        self.push_screen(QuickSelectModal("Choose an OpenRouter model", choices,
+                                          current=self.agent.explicit_model or "auto"), callback=picked)
+
+    def _set_model(self, model_id: str) -> None:
+        self.agent.explicit_model = None if model_id.lower() == "auto" else model_id
+        if self.agent.explicit_model:
+            self.agent.llm_client.default_model = model_id
+        else:
+            self.agent.llm_client.default_model = MODEL_TIERS["standard"]
+        self.query_one("#chat-log", RichLog).write(Text(f"✓ Model: {model_id}", style="green"))
+        self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+            model=self.agent.explicit_model or self.agent.llm_client.default_model,
+            selection="forced" if self.agent.explicit_model else "auto")
+        self._save_session()
+        self._refresh_status()
+
+    def _set_safety(self, profile: str) -> None:
+        if profile not in {"turbo", "cautious"}:
+            self.query_one("#chat-log", RichLog).write(Text("Choose turbo or cautious.", style="yellow"))
+            return
+        self.agent.safety_profile = profile
+        self._save_session()
+        self._refresh_status()
+        self.query_one("#chat-log", RichLog).write(Text(f"✓ Interaction profile: {profile}", style="green"))
+
+    def action_choose_session(self) -> None:
+        if self._busy:
+            return
+        choices = [(saved.id, f"{saved.title}  ·  {saved.id}  ·  {saved.workspace}")
+                   for saved in self.session_store.list(limit=100)]
+        self.push_screen(QuickSelectModal("Choose a session", choices, current=self.session.id),
+                         callback=lambda session_id: self._load_session(session_id) if session_id else None)
+
+    def _load_session(self, session_id: str) -> None:
+        log = self.query_one("#chat-log", RichLog)
+        saved = self.session_store.load(session_id)
+        if saved is None:
+            log.write(Text(f"Session not found: {session_id}", style="red"))
+            return
+        if not Path(saved.workspace).is_dir():
+            log.write(Text(f"Session workspace is unavailable: {saved.workspace}", style="red"))
+            return
+        self._save_session()
+        self.session = saved
+        self.workspace_root = saved.workspace
+        self._restore_session()
+        self._last_tool_output = ""
+        self._last_agent_content = ""
+        telemetry = self.query_one("#telemetry", ClassifierTelemetryWidget)
+        telemetry.reset_telemetry(classifier_engine=self.agent.classifier_backend.name,
+                                  classifier_model=self.agent.classifier_backend.model)
+        telemetry.update_telemetry(
+            domain_mode=self.agent.forced_mode.value if self.agent.forced_mode else "—",
+            domain_selection="forced" if self.agent.forced_mode else "auto",
+            thinking_level=self.agent.forced_thinking.value if self.agent.forced_thinking else "—",
+            thinking_tokens=BUDGET_TOKENS[self.agent.forced_thinking] if self.agent.forced_thinking else 0,
+            thinking_selection="forced" if self.agent.forced_thinking else "auto")
+        log.clear()
+        log.write(Text(f"Loaded session {saved.id}: {saved.title} ({len(saved.messages)} messages)", style="green"))
+        self._render_session_messages(log)
+        if self._session_restore_warning:
+            log.write(Text(self._session_restore_warning, style="yellow"))
+        self._refresh_status()
+
+    def _render_session_messages(self, log: RichLog) -> None:
+        """Restore recent conversation context without exposing the system prompt."""
+        history = [message for message in self.agent.messages if message.get("role") != "system"]
+        for message in history[-40:]:
+            role = message.get("role")
+            content = str(message.get("content") or "")
+            if role == "user":
+                log.write(Text("\nDeveloper > " + content, style="bold"))
+            elif role == "assistant":
+                if content:
+                    log.write(Text("\nAgent:", style="bold magenta"))
+                    log.write(Markdown(content))
+                for call in message.get("tool_calls") or []:
+                    name = (call.get("function") or {}).get("name", "tool")
+                    log.write(Text(f"⚡ {name}", style="yellow"))
+            elif role == "tool":
+                label = message.get("name", "tool")
+                preview = content[:800] + ("\n… Use /export for the full transcript." if len(content) > 800 else "")
+                log.write(Text(f"{label}: {preview}", style="green" if not content.startswith("ERROR:") else "red"))
+
     def action_new_session(self) -> None:
         if self._busy:
             self.query_one("#chat-log", RichLog).write(Text("Wait for the current task to finish.", style="yellow"))
@@ -373,14 +554,24 @@ class AdaptiveHarnessApp(App):
             self.session.title = title
         self.agent.messages = [{"role": "system", "content": self.agent.system_prompt}]
         self.agent.active_skills.clear()
+        self.agent.forced_mode = self._cli_mode_override
+        self.agent.forced_thinking = self._cli_thinking_override
+        self.agent.safety_profile = self._cli_safety_override or self._default_safety
         self._last_tool_output = ""
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self._activity = "Ready"
         telemetry = self.query_one("#telemetry", ClassifierTelemetryWidget)
         telemetry.reset_telemetry(classifier_engine=self.agent.classifier_backend.name,
                                   classifier_model=self.agent.classifier_backend.model,
                                   model=self.agent.explicit_model or self.agent.llm_client.default_model,
                                   selection="forced" if self.agent.explicit_model else "auto")
+        telemetry.update_telemetry(
+            domain_mode=self.agent.forced_mode.value if self.agent.forced_mode else "—",
+            domain_selection="forced" if self.agent.forced_mode else "auto",
+            thinking_level=self.agent.forced_thinking.value if self.agent.forced_thinking else "—",
+            thinking_tokens=BUDGET_TOKENS[self.agent.forced_thinking] if self.agent.forced_thinking else 0,
+            thinking_selection="forced" if self.agent.forced_thinking else "auto")
         log = self.query_one("#chat-log", PinnedRichLog)
         log.clear()
         log._set_pinned(False)
@@ -409,11 +600,15 @@ class AdaptiveHarnessApp(App):
         log = self.query_one("#chat-log", RichLog)
         log.write("[bold yellow]Available Commands:[/bold yellow]")
         log.write("  /key <API_KEY> | status | clear  - Manage private OpenRouter key")
-        log.write("  /model <MODEL_ID>      - Switch active LLM model")
+        log.write("  /model [MODEL_ID]      - Browse models (F4) or set one directly")
+        log.write("  /models                - Search live OpenRouter catalog")
         log.write("  /tier <fast|standard|reasoning> - Force model tier")
+        log.write("  /mode <coding|research|science|security|auto> - Set operational mode")
+        log.write("  /thinking <none|low|medium|deep|auto> - Set reasoning budget")
+        log.write("  /safety <turbo|cautious> - Control ordinary ambiguity prompts (default: turbo)")
         log.write("  /classifier <semif|sklearn|backend> [model/path] - Switch decision engine")
         log.write("  /workspace [path]      - Show or change working directory")
-        log.write("  /sessions              - List saved sessions")
+        log.write("  /sessions              - Browse saved sessions (F5); /sessions list prints IDs")
         log.write("  /session new [title] | load <id> | save")
         log.write("  /skills                - List installed skills")
         log.write("  /skill <name|off>      - Toggle skill guidance")
@@ -456,6 +651,9 @@ class AdaptiveHarnessApp(App):
 
         # Launch agent execution in non-blocking worker thread
         self._busy = True
+        self._activity = "Classifying task"
+        self._last_agent_content = ""
+        self._refresh_status()
         self._bell_rung = False
         self.execute_agent_task(text)
 
@@ -465,7 +663,7 @@ class AdaptiveHarnessApp(App):
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        if self._busy and cmd in {"/key", "/model", "/tier", "/classifier",
+        if self._busy and cmd in {"/key", "/model", "/models", "/tier", "/mode", "/thinking", "/safety", "/classifier", "/sessions",
                                   "/workspace", "/session", "/skill", "/new", "/reset", "/export"}:
             log.write(Text("Wait for the current task before changing settings or exiting.", style="yellow"))
             return
@@ -543,17 +741,11 @@ class AdaptiveHarnessApp(App):
             self._refresh_status()
         elif cmd == "/model":
             if not arg:
-                log.write(Text(f"Current model: {self.agent.explicit_model or 'auto'}", style="yellow"))
+                self.action_choose_model()
                 return
-            self.agent.explicit_model = None if arg.lower() == "auto" else arg
-            if self.agent.explicit_model:
-                self.agent.llm_client.default_model = arg
-            log.write(Text(f"✓ Model selection: {arg}", style="green"))
-            self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
-                model=self.agent.explicit_model or self.agent.llm_client.default_model,
-                selection="forced" if self.agent.explicit_model else "auto")
-            self._save_session()
-            self._refresh_status()
+            self._set_model(arg)
+        elif cmd == "/models":
+            self.action_choose_model()
         elif cmd == "/tier":
             if arg in MODEL_TIERS:
                 target_model = MODEL_TIERS[arg]
@@ -566,6 +758,46 @@ class AdaptiveHarnessApp(App):
                 self._refresh_status()
             else:
                 log.write(f"[red]Invalid tier. Choose from: {', '.join(MODEL_TIERS.keys())}[/red]")
+        elif cmd == "/mode":
+            if not arg:
+                log.write(Text(f"Mode: {self.agent.forced_mode.value if self.agent.forced_mode else 'auto'}", style="cyan"))
+                return
+            try:
+                self.agent.forced_mode = parse_domain_mode(arg)
+            except ValueError as exc:
+                log.write(Text(str(exc), style="red"))
+                return
+            self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+                domain_mode=self.agent.forced_mode.value if self.agent.forced_mode else "—",
+                domain_selection="forced" if self.agent.forced_mode else "auto")
+            self._save_session()
+            self._refresh_status()
+            log.write(Text(f"✓ Mode: {self.agent.forced_mode.value if self.agent.forced_mode else 'auto'}", style="green"))
+        elif cmd == "/thinking":
+            if not arg:
+                log.write(Text(f"Thinking: {self.agent.forced_thinking.value if self.agent.forced_thinking else 'auto'}", style="cyan"))
+                return
+            try:
+                self.agent.forced_thinking = parse_thinking_level(arg)
+            except ValueError as exc:
+                log.write(Text(str(exc), style="red"))
+                return
+            self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+                thinking_level=self.agent.forced_thinking.value if self.agent.forced_thinking else "—",
+                thinking_tokens=BUDGET_TOKENS[self.agent.forced_thinking] if self.agent.forced_thinking else 0,
+                thinking_selection="forced" if self.agent.forced_thinking else "auto")
+            self._save_session()
+            self._refresh_status()
+            log.write(Text(f"✓ Thinking: {self.agent.forced_thinking.value if self.agent.forced_thinking else 'auto'}", style="green"))
+        elif cmd == "/safety":
+            if not arg:
+                self.push_screen(QuickSelectModal("Choose interaction profile", [
+                    ("turbo", "Turbo · proceed through uncertainty; stop for destructive actions"),
+                    ("cautious", "Cautious · ask on high semantic uncertainty"),
+                ], current=self.agent.safety_profile),
+                    callback=lambda selected: self._set_safety(selected) if selected else None)
+            else:
+                self._set_safety(arg)
         elif cmd == "/classifier":
             args = arg.split(maxsplit=1)
             if not args:
@@ -603,8 +835,11 @@ class AdaptiveHarnessApp(App):
             self._refresh_status()
             log.write(Text(f"Workspace: {self.workspace_root}", style="green"))
         elif cmd == "/sessions":
-            for saved in self.session_store.list():
-                log.write(Text(f"{saved.id}  {saved.title}  ·  {saved.workspace}", style="cyan" if saved.id == self.session.id else ""))
+            if arg == "list":
+                for saved in self.session_store.list():
+                    log.write(Text(f"{saved.id}  {saved.title}  ·  {saved.workspace}", style="cyan" if saved.id == self.session.id else ""))
+            else:
+                self.action_choose_session()
         elif cmd == "/session":
             if self._busy:
                 log.write(Text("Wait for the current task before switching sessions.", style="yellow"))
@@ -613,25 +848,7 @@ class AdaptiveHarnessApp(App):
             if action == "new":
                 self._reset_session(new=True, title=value.strip() or "New session")
             elif action == "load" and value.strip():
-                saved = self.session_store.load(value.strip())
-                if saved is None:
-                    log.write(Text(f"Session not found: {value.strip()}", style="red"))
-                    return
-                if not Path(saved.workspace).is_dir():
-                    log.write(Text(f"Session workspace is unavailable: {saved.workspace}", style="red"))
-                    return
-                self._save_session()
-                self.session = saved
-                self.workspace_root = saved.workspace
-                self._restore_session()
-                self._last_tool_output = ""
-                self.query_one("#telemetry", ClassifierTelemetryWidget).reset_telemetry(
-                    classifier_engine=self.agent.classifier_backend.name,
-                    classifier_model=self.agent.classifier_backend.model)
-                log.clear()
-                log.write(Text(f"Loaded session {saved.id}: {saved.title} ({len(saved.messages)} messages)", style="green"))
-                if self._session_restore_warning:
-                    log.write(Text(self._session_restore_warning, style="yellow"))
+                self._load_session(value.strip())
             elif action == "save":
                 self._save_session()
                 log.write(Text(f"Saved session {self.session.id}", style="green"))
@@ -727,6 +944,7 @@ class AdaptiveHarnessApp(App):
 
     def _finish_task(self) -> None:
         self._busy = False
+        self._activity = "Ready"
         self._save_session()
         self._refresh_status()
         if self._quit_when_finished:
@@ -735,6 +953,8 @@ class AdaptiveHarnessApp(App):
             self.query_one("#prompt-input", Input).focus()
 
     def _render_error(self, message: str) -> None:
+        self._activity = "Error"
+        self._refresh_status()
         self.query_one("#chat-log", RichLog).write(Text(message, style="bold red"))
 
     def _render_event(self, event: AgentEvent) -> None:
@@ -743,7 +963,16 @@ class AdaptiveHarnessApp(App):
         et = event.event_type
         p = event.payload
 
-        if et == "skill_classification":
+        if et == "agent_stage":
+                stage = p["stage"]
+                self._activity = {
+                    "thinking": f"Thinking / generating · step {p['step']}",
+                    "generating": f"Generating · step {p['step']}",
+                    "tool_running": f"Running {p.get('tool', '')}",
+                    "verifying": f"Verifying {p.get('tool', '')}",
+                }.get(stage, stage)
+                self._refresh_status()
+        elif et == "skill_classification":
                 telemetry.update_telemetry(
                     probabilities=p["probabilities"],
                     primary_skill=p["primary_skill"],
@@ -757,10 +986,13 @@ class AdaptiveHarnessApp(App):
                     risk_level=p["risk_level"],
                 )
         elif et == "domain_mode":
-                telemetry.update_telemetry(domain_mode=p["mode"])
+                telemetry.update_telemetry(domain_mode=p["mode"], domain_selection=p.get("selection", "auto"))
+                self._refresh_status()
         elif et == "thinking_budget":
                 telemetry.update_telemetry(thinking_level=p["level"], thinking_tokens=p["tokens"],
+                                           thinking_selection=p.get("selection", "auto"),
                                            classifier_latency_ms=p["classifier_total_ms"])
+                self._refresh_status()
         elif et == "model_routing":
                 telemetry.update_telemetry(
                     tier=p["tier"],
@@ -770,18 +1002,30 @@ class AdaptiveHarnessApp(App):
         elif et == "classifier_error":
                 log.write(Text(f"Classifier {p['backend']} failed: {p['error']}; using sklearn", style="yellow"))
         elif et == "classifier_loading":
+                self._activity = "Loading local classifier"
+                self._refresh_status()
                 log.write(Text(f"Loading local SemIf model {p['model']} for its first decision…", style="cyan"))
         elif et == "classifier_fallback":
                 telemetry.update_telemetry(classifier_engine=p["backend"], classifier_model=p["model"])
+        elif et == "clarification_needed":
+                self._activity = "Waiting for your choice"
+                self._refresh_status()
+                log.write(Text(f"Clarification needed: {p.get('reason') or p['question']}", style="yellow"))
+        elif et == "clarification_answered":
+                self._activity = "Resuming task"
+                self._refresh_status()
         elif et == "llm_error":
                 log.write(Text(p["message"], style="bold red"))
         elif et == "storage_error":
                 log.write(Text(p["error"], style="yellow"))
         elif et == "thought":
-                log.write(Text(f"\nAgent ({p.get('model', 'thought')}):", style="bold magenta"))
+                self._last_agent_content = p["content"]
+                log.write(Text(f"\nAgent · {p.get('model', 'model')}:", style="bold magenta"))
                 log.write(Markdown(p["content"]))
         elif et == "tool_call":
-                log.write(Text(f"⚡ Tool Call: {p['name']} args={p['arguments']}", style="yellow"))
+                arguments = json.dumps(p["arguments"], ensure_ascii=False)
+                preview = arguments[:400] + ("… Use /output after completion." if len(arguments) > 400 else "")
+                log.write(Text(f"⚡ {p['name']}  {preview}", style="yellow"))
         elif et == "tool_result":
                 status_color = "green" if p["success"] else "red"
                 log.write(Text(f"Result ({p['time_ms']} ms) · {p['name']}", style=status_color))
@@ -803,6 +1047,11 @@ class AdaptiveHarnessApp(App):
         elif et == "verification":
                 log.write(Text(f"Verification: {p['status']} → {p['action']}", style="green" if p["status"] == "SUCCESS" else "red"))
         elif et == "response":
+                if p.get("content") and p["content"] != self._last_agent_content:
+                    log.write(Text("\nAgent:", style="bold magenta"))
+                    log.write(Markdown(p["content"]))
+                elif not p.get("content") and not p["success"]:
+                    log.write(Text("No final answer was produced; inspect the last tool result or retry.", style="yellow"))
                 usage = p.get("usage") or {}
                 self.prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
                 self.completion_tokens += int(usage.get("completion_tokens", 0) or 0)

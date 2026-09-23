@@ -4,9 +4,9 @@
 
 Install the project into its virtual environment, then run `adaptive-harness dev "git status"` or `adaptive-harness tui`. With no API key or custom task-model endpoint, completions use the offline mock client. Set `OPENROUTER_API_KEY` or pass `--key` for live completions. `--base-url` points the task model at an OpenAI-compatible local server; the classifier backend is configured separately.
 
-Model selection is automatic by default. The complexity router selects fast, standard, or reasoning for each task. `--model MODEL_ID` or `--tier fast|standard|reasoning` fixes the model for every step. In the TUI, `/model MODEL_ID` and `/tier NAME` do the same; `/model auto` restores automatic routing. A forced model appears as `FORCED` in telemetry.
+Model selection is automatic by default. The complexity router selects fast, standard, or reasoning for each task; the standard tier uses `z-ai/glm-5.3-flash`. `--model MODEL_ID` or `--tier fast|standard|reasoning` fixes the model for every step. In the TUI, `/model` or F4 opens a searchable OpenRouter catalog, while `/model MODEL_ID` selects one directly and `/model auto` restores automatic routing. The catalog falls back to built-in and previously fetched choices when the network is unavailable. A forced model appears as `FORCED` in telemetry.
 
-Choose a working directory with `--workspace PATH` or `/workspace PATH`. Conversations and classifier settings save automatically to the configured SQLite database. Use `/sessions` to list them, `/session new [title]` to start fresh, `/session load ID` to resume, or `--session ID` at launch. Put optional `SKILL.md` files under `.harness/skills/NAME/` in the workspace or `~/.config/adaptive-harness/skills/NAME/`; `/skills` lists them and `/skill NAME` toggles one. `dev --skill NAME` enables a skill for a headless task.
+Choose a working directory with `--workspace PATH` or `/workspace PATH`. Conversations and classifier settings save automatically to the configured SQLite database. Use `/sessions` or F5 for a searchable session picker, `/sessions list` to print IDs, `/session new [title]` to start fresh, `/session load ID` to resume, or `--session ID` at launch. Put optional `SKILL.md` files under `.harness/skills/NAME/` in the workspace or `~/.config/adaptive-harness/skills/NAME/`; `/skills` lists them and `/skill NAME` toggles one. `dev --skill NAME` enables a skill for a headless task.
 
 The classifier auto-selects local SemIf when PyTorch, Transformers, and a cached checkpoint are present; otherwise it uses TF-IDF and logistic regression. Install the optional runtime with `pip install '.[semif]'`, then download weights into the Hugging Face cache, for example `hf download Qwen/Qwen2.5-3B-Instruct`. SemIf runs locally and scores candidate choices from next-token logits in one model pass without generating text. Select it with `--classifier-engine semif --semif-model Qwen/Qwen2.5-3B-Instruct`; use `--classifier-engine sklearn` for the lightweight fallback. TUI: `/classifier semif [model_path]` or `/classifier sklearn`. If the model, tokenizer, or optional runtime cannot load, the current task falls back to sklearn and reports why.
 
@@ -20,7 +20,11 @@ adaptive-harness tui --classifier-backend ollama --classifier-model qwen2.5:1.5b
 
 The Ollama backend calls the local `/api/generate` endpoint with JSON output. For llama.cpp or another local OpenAI-compatible server, select `local-slm` and set `--classifier-endpoint` to its `/v1/chat/completions` URL. The ONNX backend requires `onnxruntime` and `transformers` installed separately and a local model directory containing `model.onnx` and tokenizer files. It scores task and label embeddings by cosine similarity. The OpenRouter classifier uses `OPENROUTER_API_KEY` and a separate, configurable classifier model; it consumes API tokens.
 
-Each task also receives domain, thinking, model-tier, skill, and tool-verification decisions from the selected classifier engine. SemIf classifies these using typed choices; sklearn provides statistical fallback. Destructive-operation checks remain separate safety gates. Set `BRAVE_SEARCH_API_KEY` to enable web search with source URLs in research mode. Python file writes receive automatic AST validation, with syntax errors fed into the verification and recovery loop. The thinking level is shown as an estimate and maps to supported OpenRouter reasoning effort settings. The telemetry panel shows the active classifier, its observed latency, domain, thinking level, entropy, margin, skill probabilities, and model selection.
+Each task also receives domain, thinking, model-tier, skill, and tool-verification decisions from the selected classifier engine. SemIf classifies these using typed choices; sklearn provides statistical fallback. Choose `--mode coding|research|science|security|auto` for either `dev` or `tui`, or change it with `/mode NAME` in the TUI; `security` maps to the internal audit mode. The selected mode changes the system guidance and available tools. Coding validates edited Python syntax, research checks that web results contain source URLs, science exposes a finite-value convergence check, and security restricts shell commands to read-only Git inspection. Set `BRAVE_SEARCH_API_KEY` to enable cited web search. Destructive-operation checks remain separate safety gates.
+
+Thinking levels are `none` (0), `low` (about 1k), `medium` (about 4k), and `deep` (16k) reasoning tokens. Use `--thinking NAME` or `/thinking NAME`; `auto` restores classifier routing. A manual thinking choice also selects a corresponding model tier unless a specific model was forced. Supported OpenRouter models receive reasoning effort; Claude requests use a direct token cap and a completion limit above it. Model support varies, so the displayed budget is a request target, not a measured token count. The telemetry panel shows domain and thinking badges, classifier latency, entropy, margin, skill probabilities, and model selection. The prompt sits in the normal vertical layout with a blank row above the footer, including when command suggestions appear.
+
+The default interaction profile is `turbo`: the agent proceeds through ordinary uncertainty without opening a question, while destructive operations and requests with no identifiable target still pause. Set `--safety cautious` or `/safety cautious` to allow semantic uncertainty to trigger a question; `/safety turbo` restores the default. The TUI status line pulses while classifying, waiting for a model response, running a tool, or verifying output. “Thinking / generating” denotes an in-flight non-streaming model request, not a live view of private reasoning tokens.
 
 Clarification opens for detected destructive operations or a genuinely missing task target. Numeric keys 1–9 select options, arrows navigate, Enter confirms, Tab reaches the custom instruction field, and Escape cancels. Long text wraps in a scrollable card, and empty custom input cannot approve an action. Entropy and requests for the agent's design judgment do not pause the task. F2 opens a live theme preview; F3 toggles telemetry on wide terminals. `/output` shows the last tool result up to the 20,000-character output limit.
 
@@ -40,7 +44,7 @@ The **Adaptive Agent Harness 2.0** solves this by embedding **pervasive machine 
 2. **Ambiguity & Risk Classifier (`AmbiguityClassifier`)**: Quantifies task uncertainty via Shannon entropy $H(p)$ and confidence margin. In the interactive SemIf path, high uncertainty can open the clarification modal; destructive actions also remain behind a separate risk check.
 3. **Cognitive Complexity & Model Tier Router (`ComplexityRouter`)**: Dynamically routes requests across LLM model tiers:
    - **Fast Tier** (e.g. `google/gemini-2.5-flash-lite`): rapid queries, file reads, git status, typo fixes.
-   - **Standard Tier** (e.g. `openai/gpt-4o`): core coding, refactoring, unit test authoring.
+   - **Standard Tier** (`z-ai/glm-5.3-flash`): core coding, refactoring, unit test authoring.
    - **Reasoning Tier** (e.g. `anthropic/claude-sonnet-4`): complex architectures, concurrency/deadlocks, multi-file algorithms.
 4. **Tool Verification & Self-Healing Classifier (`VerificationClassifier`)**: Actively inspects tool outputs (bash stdout/stderr, pytest assertions, compiler syntax errors, missing paths) to classify failure modes (`SYNTAX_ERROR`, `TEST_FAILURE`, `FILE_ERROR`, `RUNTIME_ERROR`) and immediately trigger targeted recovery actions (`AUTO_RETRY_SYNTAX_FIX`, `AUTO_RETRY_TEST_FIX`, etc.).
 5. **Interactive Textual TUI (`AdaptiveHarnessApp`)**: A full terminal IDE featuring live classifier telemetry gauges, probability bar charts, streaming agent thought logs, and interactive clarification modals.
@@ -103,7 +107,7 @@ The **Adaptive Agent Harness 2.0** solves this by embedding **pervasive machine 
 | :--- | :--- | :--- | :--- |
 | **`SkillClassifier`** | Developer prompt, code context | `code_edit`, `run_command`, `search_explore`, `testing`, `ask_clarification`, `general_reasoning` | Activates optimal tool subset and prompt framing |
 | **`AmbiguityClassifier`** | Intent distribution entropy $H(p)$, confidence margin $\Delta p$, destructive tokens (`rm`, `drop`, `reset --hard`) | Shannon entropy $H(p) = -\sum p \log_2 p$, Margin $p_1 - p_2$, Risk: `LOW`, `MEDIUM`, `HIGH` | Opens clarification for destructive actions or explicit decision ambiguity |
-| **`ComplexityRouter`** | Task scope, vocabulary depth, architectural cues | `FAST` (Gemini Flash), `STANDARD` (GPT-4o), `REASONING` (Claude 3.7 Sonnet) | Dynamic model selection minimizing cost and maximizing reasoning depth |
+| **`ComplexityRouter`** | Task scope, vocabulary depth, architectural cues | `FAST` (Gemini Flash Lite), `STANDARD` (GLM 5.3 Flash), `REASONING` (Claude Sonnet 4) | Dynamic model selection minimizing cost and maximizing reasoning depth |
 | **`VerificationClassifier`** | Execution exit codes, Python AST tracebacks, pytest failures, regex patterns | `SUCCESS`, `SYNTAX_ERROR`, `TEST_FAILURE`, `FILE_ERROR`, `RUNTIME_ERROR` | Auto-recovery routing (`AUTO_RETRY_SYNTAX_FIX`, `AUTO_RETRY_TEST_FIX`, etc.) |
 
 ---
@@ -133,8 +137,12 @@ adaptive-harness tui --key sk-or-v1-xxxxxxxxxxxxxxxxx
   - Live streaming of agent thoughts, tool execution invocations with argument inspection, real-time tool results, and verification classifications.
 - **Built-in Slash Commands**:
   - `/key <OPENROUTER_API_KEY>`: Save a private OpenRouter key; `/key status` and `/key clear` inspect or remove it.
-  - `/model <MODEL_ID>`: Switch active LLM (e.g. `anthropic/claude-sonnet-4`).
+  - `/model` or F4: Search the OpenRouter catalog; `/model <MODEL_ID>` switches directly.
   - `/tier <fast|standard|reasoning>`: Switch between optimized cost/capability tiers.
+  - `/mode <coding|research|science|security|auto>`: Select an operational mode.
+  - `/thinking <none|low|medium|deep|auto>`: Select the reasoning budget.
+  - `/safety <turbo|cautious>`: Choose the question frequency profile.
+  - `/sessions` or F5: Search and resume a saved session.
   - `/new`, `/reset`: Start a new session or clear the current session state.
   - `/theme`, `/history`, `/export markdown|json`: Preview colors, recall prompts, and export a transcript.
   - `/clear`: Clear only the visible terminal log.
