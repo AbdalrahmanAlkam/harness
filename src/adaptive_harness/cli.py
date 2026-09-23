@@ -173,6 +173,7 @@ def tui(
 @app.command()
 def dev(
     task: str = typer.Argument(..., help="Software engineering task to execute"),
+    offline: bool = typer.Option(False, "--offline", help="Use the offline mock engine without a network request"),
     api_key: Optional[str] = typer.Option(None, "--key", "-k", help="OpenRouter or OpenAI API key"),
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID"),
@@ -211,7 +212,12 @@ def dev(
         raise typer.BadParameter(str(exc)) from exc
 
     selected_model = (None if model and model.lower() == "auto" else model) or (MODEL_TIERS[tier] if tier in MODEL_TIERS else None)
-    client = LLMClient(api_key=api_key, base_url=base_url, default_model=selected_model)
+    from adaptive_harness.data.config import ConfigManager
+    import os
+    resolved_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+    if not resolved_key and not base_url and not os.environ.get("OPENROUTER_BASE_URL"):
+        resolved_key = ConfigManager().load().get("api_key")
+    client = LLMClient(api_key=resolved_key, base_url=base_url, default_model=selected_model, force_mock=offline)
     repo = ExperienceRepository(db_path)
     if not workspace.is_dir():
         raise typer.BadParameter(f"Workspace directory does not exist: {workspace}", param_hint="--workspace")
@@ -232,7 +238,7 @@ def dev(
             raise typer.BadParameter(str(exc), param_hint="--skill") from exc
 
     console.print(f"\n[bold cyan]=== Adaptive Developer Agent Task ===[/bold cyan]")
-    console.print(f"Task: [bold white]\"{task}\"[/bold white]")
+    console.print(f"Task: [bold white]\"{escape(task)}\"[/bold white]")
 
     last_agent_content = ""
     for event in agent.run_stream(task):

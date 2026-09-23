@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import re
 
 
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "adaptive-harness"
@@ -48,7 +49,7 @@ class ConfigManager:
             if not isinstance(value, dict):
                 raise ValueError("Configuration must be a JSON object")
             return {str(key): str(item) for key, item in value.items() if isinstance(item, str)}
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, UnicodeError) as exc:
             self.last_error = f"Could not read TUI configuration: {exc}"
             return {}
 
@@ -90,12 +91,14 @@ class PromptHistoryStore:
         try:
             os.chmod(self.path, 0o600)
             return [line for line in self.path.read_text(encoding="utf-8").splitlines() if line][-self.LIMIT:]
-        except OSError:
+        except (OSError, UnicodeError):
             return []
 
     def record(self, prompt: str) -> bool:
         value = prompt.strip().replace("\n", " ").replace("\r", " ")
         if not value or value.startswith("/"):
+            return False
+        if re.search(r"\bsk-(?:or-v1-)?[A-Za-z0-9_-]{12,}|(?:api[_-]?key|token)\s*[=:]\s*\S+", value, re.I):
             return False
         if self.entries and self.entries[-1] == value:
             return False

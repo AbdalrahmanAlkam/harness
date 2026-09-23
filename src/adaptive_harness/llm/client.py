@@ -45,6 +45,8 @@ class LLMClient:
             self._openai_client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
+                timeout=45.0,
+                max_retries=1,
                 default_headers={
                     "HTTP-Referer": "https://github.com/adaptive-agent-harness",
                     "X-Title": "Adaptive Agent Harness",
@@ -154,9 +156,14 @@ class LLMClient:
             )
 
         except Exception as e:
+            # Never fabricate successful work after a failed live request. The
+            # current task stops; subsequent requests can use the offline engine.
+            detail = str(e).replace(self.api_key, "[redacted]") if self.api_key else str(e)
+            self._openai_client = None
             return LLMResponse(
-                content=f"API call failed: {type(e).__name__}: {str(e)}",
+                content=f"API call failed: {type(e).__name__}: {detail}. Switched to Offline Mock Engine; reconnect with /key or retry from the CLI.",
                 tool_calls=[],
                 model=selected_model,
                 finish_reason="error",
+                usage={"prompt_tokens": 0, "completion_tokens": 0},
             )

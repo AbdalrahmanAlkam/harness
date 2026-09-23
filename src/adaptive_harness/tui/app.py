@@ -76,6 +76,10 @@ class AdaptiveHarnessApp(App):
     }
     #waiting-indicator.visible { display: block; }
     #waiting-indicator.pulse { color: $accent; }
+    Screen.compact #main-container, Screen.compact #status-line,
+    Screen.compact Header, Screen.compact #scroll-indicator,
+    Screen.compact #command-hints { display: none; }
+    Screen.compact #input-container { margin: 0 0 1 0; }
     """
 
     BINDINGS = [
@@ -269,6 +273,7 @@ class AdaptiveHarnessApp(App):
         self._apply_layout()
 
     def _apply_layout(self) -> None:
+        self.query_one("#main-container").screen.set_class(self.size.height < 12, "compact")
         matches = self.query("#telemetry")
         if matches:
             matches.first().display = self._show_telemetry and self.size.width >= 110
@@ -598,7 +603,7 @@ class AdaptiveHarnessApp(App):
     def on_input_changed(self, event: Input.Changed) -> None:
         value = event.value.strip().lower()
         hints = self.query_one("#command-hints", Static)
-        matches = [cmd for cmd in COMMANDS if cmd.startswith(value)][:10] if value.startswith("/") and " " not in value else []
+        matches = [cmd for cmd in COMMANDS if cmd.startswith(value)][:10] if value.startswith("/") and " " not in value and self.size.height >= 12 else []
         hints.update(Text("  ".join(matches), style="bold cyan"))
         hints.set_class(bool(matches), "visible")
         self.query_one("#input-container", Container).styles.height = 4 if matches else 3

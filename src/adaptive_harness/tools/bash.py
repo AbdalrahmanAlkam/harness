@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import subprocess
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+import re
+import shlex
 
 from adaptive_harness.tools.base import Tool, ToolResult
+from adaptive_harness.tools.process import run_process
 
 
 FORBIDDEN_PATTERNS: List[str] = [
@@ -45,6 +48,17 @@ class RunBashTool(Tool):
 
     def execute(self, command: str, timeout_seconds: int = 30, **kwargs: Any) -> ToolResult:
         cmd_strip = command.strip()
+        if not cmd_strip:
+            return ToolResult(success=False, output="", error="Command cannot be empty")
+        try:
+            words = shlex.split(cmd_strip)
+        except ValueError as exc:
+            return ToolResult(success=False, output="", error=f"Invalid shell quoting: {exc}")
+        if ("rm" in words and any(word in {"/", "/*", "--no-preserve-root"} for word in words)
+                and any(word.startswith("-") and ("r" in word or word == "--recursive") for word in words)):
+            return ToolResult(success=False, output="", error="Command blocked by safety filter: recursive root deletion")
+        if re.search(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&", cmd_strip):
+            return ToolResult(success=False, output="", error="Command blocked by safety filter: fork bomb")
 
         # Guard against dangerous patterns
         for pattern in FORBIDDEN_PATTERNS:
@@ -63,12 +77,10 @@ class RunBashTool(Tool):
             env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
 
         try:
-            res = subprocess.run(
+            res = run_process(
                 cmd_strip,
                 shell=True,
                 cwd=str(self.workspace_root),
-                capture_output=True,
-                text=True,
                 timeout=timeout_seconds,
                 env=env,
             )

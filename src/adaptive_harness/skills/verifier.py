@@ -24,7 +24,14 @@ class SkillVerifier:
     """Evaluate observed tool evidence; an LLM assertion alone never satisfies a check."""
 
     def verify(self, skills: Iterable[BaseSkill], observations: Iterable[Mapping]) -> tuple[SkillVerification, ...]:
-        records = tuple(observations)
+        # A later failed check invalidates earlier evidence from that tool.
+        latest = {}
+        for observation in observations:
+            latest[observation.get("name")] = observation
+            if observation.get("name") in {"edit_file", "write_file"} and observation.get("success"):
+                latest.pop("run_pytest", None)
+                latest.pop("run_bash", None)
+        records = tuple(latest.values())
         successful = {str(record.get("name")) for record in records if record.get("success")}
         def command_tokens(record: Mapping) -> list[str]:
             try:

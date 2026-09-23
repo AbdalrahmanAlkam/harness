@@ -65,7 +65,9 @@ class SkillRouter:
             return SkillSelection((), {}, 0.0, "none", "none", 0.0)
         lexical = {name: self._score(task, skill) for name, skill in catalog.items()}
         candidates = sorted(catalog, key=lambda name: lexical[name], reverse=True)[:26]
-        if max(lexical.values()) <= 0:
+        engine = getattr(backend, "engine", None) if backend is not None else None
+        semantic = getattr(backend, "name", None) == "semif" and engine is not None
+        if max(lexical.values()) <= 0 and not semantic:
             return SkillSelection((), {}, 0.0, "none", "local", (time.perf_counter() - start) * 1000)
         engine = getattr(backend, "engine", None) if backend is not None else None
         if getattr(backend, "name", None) == "semif" and engine is not None:
@@ -86,15 +88,16 @@ class SkillRouter:
         # 22 candidate descriptions. Neural decisions use their own probabilities.
         if source != "semif" and lexical[best] > 0:
             confidence = max(confidence, min(0.99, 0.70 + 0.06 * lexical[best]))
-        if confidence < self.threshold:
+        chain = (len(ranking) > 1 and probabilities[ranking[1]] >= 0.20 and
+                 probabilities[ranking[1]] >= probabilities[best] * 0.55 and
+                 probabilities[best] + probabilities[ranking[1]] >= self.threshold)
+        if confidence < self.threshold and not chain:
             return SkillSelection((), probabilities, confidence, "none", source,
                                   (time.perf_counter() - start) * 1000)
         selected = [catalog[best]]
         if len(ranking) > 1:
             second = ranking[1]
-            if (lexical.get(second, 0) > 0 and probabilities[second] >= 0.20 and
-                    probabilities[second] >= probabilities[best] * 0.55 and
-                    catalog[second].category != catalog[best].category):
+            if chain:
                 selected.append(catalog[second])
         return SkillSelection(tuple(selected), probabilities, confidence,
                               "auto", source, (time.perf_counter() - start) * 1000)

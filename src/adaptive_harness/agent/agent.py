@@ -24,7 +24,7 @@ from adaptive_harness.classifiers.thinking_classifier import (ThinkingClassifier
 from adaptive_harness.classifiers.skill_classifier import SKILL_CLASSES
 from adaptive_harness.data.storage import ExperienceRepository
 from adaptive_harness.llm.client import LLMClient
-from adaptive_harness.llm.mock_client import ToolCall
+from adaptive_harness.llm.mock_client import ToolCall, LLMResponse
 from adaptive_harness.models.domain import ExecutionAttempt, ExecutionTrace, VerificationResult
 from adaptive_harness.tools.base import Tool, ToolResult
 from adaptive_harness.tools.bash import RunBashTool
@@ -175,7 +175,11 @@ class DeveloperAgent:
                                    "prompt": hashlib.sha256(self.system_prompt.encode()).hexdigest(),
                                    "preferences": hashlib.sha256(preference_guidance.encode()).hexdigest()}, sort_keys=True)
         if self.repository is not None and _cacheable_read_request(user_input):
-            cached = self.repository.lookup_solution(user_input, str(self.workspace_root), settings_key)
+            try:
+                cached = self.repository.lookup_solution(user_input, str(self.workspace_root), settings_key)
+            except Exception as exc:
+                cached = None
+                yield AgentEvent("storage_error", {"error": f"Could not read solution cache: {exc}"})
             if cached:
                 self.messages.append({"role": "user", "content": user_input})
                 self.messages.append({"role": "assistant", "content": cached["answer"]})
@@ -342,19 +346,17 @@ class DeveloperAgent:
             },
         )
 
-        skill_selection = self.skill_router.route(original_input, self.skill_catalog.all(),
+        catalog = self.skill_catalog.all()
+        for missing_skill in set(self.active_skills) - set(catalog):
+            self.active_skills.pop(missing_skill)
+            yield AgentEvent("storage_error", {"error": f"Skill {missing_skill} is no longer installed; resuming automatic routing."})
+        skill_selection = self.skill_router.route(original_input, catalog,
             self.classifier_backend, tuple(self.active_skills))
         selected_skills = skill_selection.skills
         security_skill_active = any(skill.name == "security_audit_scanner"
                                     for skill in selected_skills)
         selected_tool_names = set().union(*(set(skill.tools) for skill in selected_skills)) if selected_skills else None
-        yield AgentEvent("specialized_skill", {
-            "skills": [{"name": skill.name, "title": skill.title, "category": skill.category,
-                        "icon": skill.icon} for skill in selected_skills],
-            "confidence": skill_selection.confidence, "selection": skill_selection.selection,
-            "backend": skill_selection.backend, "latency_ms": round(skill_selection.latency_ms, 2),
-            "tools": sorted(selected_tool_names or ()),
-        })
+
 
         # Add user message to history
         self.messages.append({"role": "user", "content": user_input})
@@ -377,6 +379,13 @@ class DeveloperAgent:
         if selected_tool_names is not None:
             domain_tool_names.intersection_update(selected_tool_names)
         tool_schemas = [t.to_openai_schema() for t in self.tools.values() if t.name in domain_tool_names]
+        yield AgentEvent("specialized_skill", {
+            "skills": [{"name": skill.name, "title": skill.title, "category": skill.category,
+                        "icon": skill.icon} for skill in selected_skills],
+            "confidence": skill_selection.confidence, "selection": skill_selection.selection,
+            "backend": skill_selection.backend, "latency_ms": round(skill_selection.latency_ms, 2),
+            "tools": sorted(domain_tool_names & set(self.tools)),
+        })
 
         # Agent execution loop (LLM call -> tool execution -> verification -> repeat if needed)
         step = 0
@@ -395,14 +404,16 @@ class DeveloperAgent:
             yield AgentEvent("agent_stage", {"stage": "thinking" if thinking_res.budget_tokens else "generating",
                                              "step": step, "model": selected_model,
                                              "thinking_tokens": thinking_res.budget_tokens})
-            llm_resp = self.llm_client.complete(
-                messages=self._request_messages(),
-                tools=tool_schemas,
-                model=selected_model,
-                tier=complexity_res.tier,
-                reasoning_effort=thinking_res.effort,
-                reasoning_budget_tokens=thinking_res.budget_tokens,
-            )
+            try:
+                llm_resp = self.llm_client.complete(
+                    messages=self._request_messages(), tools=tool_schemas,
+                    model=selected_model, tier=complexity_res.tier,
+                    reasoning_effort=thinking_res.effort,
+                    reasoning_budget_tokens=thinking_res.budget_tokens,
+                )
+            except Exception as exc:
+                llm_resp = LLMResponse(content=f"Model request failed ({type(exc).__name__}). Retry the task or check the connection.",
+                    finish_reason="error", usage={"prompt_tokens": 0, "completion_tokens": 0})
             for token_type in usage:
                 usage[token_type] += int((llm_resp.usage or {}).get(token_type, 0) or 0)
             cached_tokens += int((llm_resp.usage or {}).get("cached_tokens", 0) or 0)

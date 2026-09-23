@@ -64,7 +64,9 @@ class ExperienceRepository:
 
     @staticmethod
     def _task_key(task: str) -> str:
-        return " ".join(task.casefold().split())
+        words = task.split()
+        # Command wording is case-insensitive; Linux filenames are not.
+        return "v2:" + (" ".join(word.casefold() for word in words[:-1]) + " " + words[-1] if words else "")
 
     def lookup_solution(self, task: str, workspace: str, settings_key: str) -> dict | None:
         """Return a verified answer only while all recorded file inputs are unchanged."""
@@ -77,7 +79,7 @@ class ExperienceRepository:
             return None
         try:
             dependencies = json.loads(row["dependencies_json"])
-            if not dependencies:
+            if not isinstance(dependencies, dict) or not dependencies:
                 return None
             for relative_path, expected_hash in dependencies.items():
                 path = (root / relative_path).resolve()

@@ -10,6 +10,7 @@ import subprocess
 from typing import Any, Dict, Optional
 
 from adaptive_harness.tools.base import Tool, ToolResult, workspace_path
+from adaptive_harness.tools.process import run_process
 
 
 class RunPytestTool(Tool):
@@ -39,18 +40,17 @@ class RunPytestTool(Tool):
         import sys
 
         try:
-            target = workspace_path(self.workspace_root, test_path)
+            path_part, separator, node_id = test_path.partition("::")
+            target = str(workspace_path(self.workspace_root, path_part)) + (separator + node_id if separator else "")
             flags = shlex.split(extra_args) if extra_args else []
         except (ValueError, TypeError) as exc:
             return ToolResult(success=False, output="", error=str(exc))
         cmd = [sys.executable, "-m", "pytest", str(target), "-v", *flags]
 
         try:
-            res = subprocess.run(
+            res = run_process(
                 cmd,
                 cwd=str(self.workspace_root),
-                capture_output=True,
-                text=True,
                 timeout=60,
             )
 
@@ -81,6 +81,6 @@ class RunPytestTool(Tool):
                 },
             )
         except subprocess.TimeoutExpired:
-            return ToolResult(success=False, output="", error="Pytest run timed out after 60 seconds")
+            return ToolResult(success=False, output="", error="Pytest run timed out after 60 seconds", metadata={"timeout": True})
         except Exception as e:
             return ToolResult(success=False, output="", error=f"Failed to run pytest: {e}")
