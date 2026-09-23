@@ -1,0 +1,161 @@
+"""File operation tools: reading, writing, and surgical editing with unified diffs."""
+
+from __future__ import annotations
+
+import difflib
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from adaptive_harness.tools.base import Tool, ToolResult
+
+
+class ReadFileTool(Tool):
+    """Reads text from a local workspace file with optional line slice bounds."""
+
+    name = "read_file"
+    description = "Reads content from a file in the workspace with optional line slice bounds."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Relative or absolute path to the file."},
+            "start_line": {"type": "integer", "description": "1-based starting line number (optional)."},
+            "end_line": {"type": "integer", "description": "1-based ending line number (optional)."},
+        },
+        "required": ["path"],
+    }
+
+    def __init__(self, workspace_root: Optional[Path | str] = None):
+        self.workspace_root = Path(workspace_root or os.getcwd()).resolve()
+
+    def execute(
+        self,
+        path: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+        **kwargs: Any,
+    ) -> ToolResult:
+        file_path = (self.workspace_root / path).resolve()
+        if not file_path.exists():
+            return ToolResult(success=False, output="", error=f"File not found: {path}")
+        if not file_path.is_file():
+            return ToolResult(success=False, output="", error=f"Path is not a file: {path}")
+
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+            lines = content.splitlines(keepends=True)
+
+            start = max(1, start_line) if start_line is not None else 1
+            end = min(len(lines), end_line) if end_line is not None else len(lines)
+
+            selected_lines = lines[start - 1 : end]
+            numbered = [f"{i + start:4d} | {line}" for i, line in enumerate(selected_lines)]
+            output_str = "".join(numbered)
+
+            return ToolResult(
+                success=True,
+                output=output_str,
+                metadata={"total_lines": len(lines), "start_line": start, "end_line": end},
+            )
+        except Exception as e:
+            return ToolResult(success=False, output="", error=f"Failed to read file: {e}")
+
+
+class WriteFileTool(Tool):
+    """Creates or overwrites a file in the workspace."""
+
+    name = "write_file"
+    description = "Creates a new file or overwrites an existing file with the provided text."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Target relative file path."},
+            "content": {"type": "string", "description": "Text content to write."},
+        },
+        "required": ["path", "content"],
+    }
+
+    def __init__(self, workspace_root: Optional[Path | str] = None):
+        self.workspace_root = Path(workspace_root or os.getcwd()).resolve()
+
+    def execute(self, path: str, content: str, **kwargs: Any) -> ToolResult:
+        file_path = (self.workspace_root / path).resolve()
+        try:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(content, encoding="utf-8")
+            return ToolResult(
+                success=True,
+                output=f"Successfully wrote {len(content)} characters to `{path}`.",
+                metadata={"bytes_written": len(content.encode("utf-8"))},
+            )
+        except Exception as e:
+            return ToolResult(success=False, output="", error=f"Failed to write file: {e}")
+
+
+class EditFileTool(Tool):
+    """Replaces a targeted substring in an existing file and produces a diff."""
+
+    name = "edit_file"
+    description = "Surgically replaces an exact text block in an existing file with new text."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path to modify."},
+            "target_text": {"type": "string", "description": "Exact text substring to replace."},
+            "replacement_text": {"type": "string", "description": "Replacement text content."},
+        },
+        "required": ["path", "target_text", "replacement_text"],
+    }
+
+    def __init__(self, workspace_root: Optional[Path | str] = None):
+        self.workspace_root = Path(workspace_root or os.getcwd()).resolve()
+
+    def execute(
+        self,
+        path: str,
+        target_text: str,
+        replacement_text: str,
+        **kwargs: Any,
+    ) -> ToolResult:
+        file_path = (self.workspace_root / path).resolve()
+        if not file_path.exists():
+            return ToolResult(success=False, output="", error=f"File not found: {path}")
+
+        try:
+            original = file_path.read_text(encoding="utf-8")
+            if target_text not in original:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Target text was not found in `{path}`. Check exact whitespace and lines.",
+                )
+
+            # Check uniqueness
+            count = original.count(target_text)
+            if count > 1:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Target text matched {count} times in `{path}`. Provide a larger unique context block.",
+                )
+
+            updated = original.replace(target_text, replacement_text, 1)
+            file_path.write_text(updated, encoding="utf-8")
+
+            # Generate unified diff
+            diff = "".join(
+                difflib.unified_diff(
+                    original.splitlines(keepends=True),
+                    updated.splitlines(keepends=True),
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                )
+            )
+
+            return ToolResult(
+                success=True,
+                output=f"Successfully edited `{path}`.\n\nDiff:\n{diff}",
+                metadata={"diff": diff},
+            )
+        except Exception as e:
+            return ToolResult(success=False, output="", error=f"Failed to edit file: {e}")

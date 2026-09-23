@@ -1,0 +1,2 @@
+[console_scripts]
+adaptive-harness = adaptive_harness.cli:app
