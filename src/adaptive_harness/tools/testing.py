@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 from typing import Any, Dict, Optional
 
-from adaptive_harness.tools.base import Tool, ToolResult
+from adaptive_harness.tools.base import Tool, ToolResult, workspace_path
 
 
 class RunPytestTool(Tool):
@@ -37,14 +38,16 @@ class RunPytestTool(Tool):
     def execute(self, test_path: str = "tests/", extra_args: Optional[str] = None, **kwargs: Any) -> ToolResult:
         import sys
 
-        cmd = f"{sys.executable} -m pytest {test_path} -v"
-        if extra_args:
-            cmd = f"{cmd} {extra_args}"
+        try:
+            target = workspace_path(self.workspace_root, test_path)
+            flags = shlex.split(extra_args) if extra_args else []
+        except (ValueError, TypeError) as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+        cmd = [sys.executable, "-m", "pytest", str(target), "-v", *flags]
 
         try:
             res = subprocess.run(
                 cmd,
-                shell=True,
                 cwd=str(self.workspace_root),
                 capture_output=True,
                 text=True,

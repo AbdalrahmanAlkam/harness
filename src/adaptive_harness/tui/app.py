@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Optional
-from rich.markup import escape
+from rich.syntax import Syntax
+from rich.text import Text
+from rich.markdown import Markdown
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from adaptive_harness.agent.agent import AgentEvent, DeveloperAgent
+from adaptive_harness.agent.skills import SkillCatalog
+from adaptive_harness.classifiers.engine import create_backend
 from adaptive_harness.data.storage import ExperienceRepository
+from adaptive_harness.data.sessions import SessionStore
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
 from adaptive_harness.tui.widgets import ClarificationModal, ClassifierTelemetryWidget
 
@@ -40,15 +44,26 @@ class AdaptiveHarnessApp(App):
         background: $surface;
         padding: 0 1;
     }
+    #status-line { height: 1; background: $surface; color: $text; padding: 0 1; }
     #prompt-input {
         width: 100%;
     }
+    #waiting-indicator {
+        height: 1;
+        color: #fbbf24;
+        background: $surface;
+        display: none;
+        padding: 0 1;
+    }
+    #waiting-indicator.visible { display: block; }
+    #waiting-indicator.pulse { color: #22d3ee; }
     """
 
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+l", "clear_screen", "Clear Log"),
         ("f1", "show_help", "Help"),
+        ("f2", "toggle_telemetry", "Telemetry"),
     ]
 
     def __init__(
@@ -58,14 +73,23 @@ class AdaptiveHarnessApp(App):
         default_model: Optional[str] = None,
         db_path: Path | str = "output/experience.db",
         workspace_root: Optional[str] = None,
+        classifier_backend: str = "sklearn",
+        classifier_model: Optional[str] = None,
+        classifier_endpoint: Optional[str] = None,
+        session_id: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.api_key = api_key
         self.base_url = base_url
+        if default_model and default_model.lower() == "auto":
+            default_model = None
         self.default_model = default_model or MODEL_TIERS["standard"]
         self.db_path = db_path
-        self.workspace_root = workspace_root
+        self.workspace_root = str(Path(workspace_root or ".").expanduser().resolve())
+        if not Path(self.workspace_root).is_dir():
+            raise ValueError(f"Workspace directory does not exist: {self.workspace_root}")
+        self.classifier_endpoint = classifier_endpoint
 
         # LLM Client & Repo
         self.llm_client = LLMClient(
@@ -74,6 +98,18 @@ class AdaptiveHarnessApp(App):
             default_model=self.default_model,
         )
         self.repository = ExperienceRepository(self.db_path)
+        self.session_store = SessionStore(self.db_path)
+        self.session = self.session_store.load(session_id) if session_id else None
+        if session_id and self.session is None:
+            raise ValueError(f"Session not found: {session_id}")
+        if self.session is not None:
+            self.workspace_root = self.session.workspace
+        else:
+            self.session = self.session_store.create(self.workspace_root)
+        self.skill_catalog = SkillCatalog(self.workspace_root)
+        self._busy = False
+        self._show_telemetry = True
+        self._last_tool_output = ""
 
         # Developer Agent with interactive clarification hook
         self.agent = DeveloperAgent(
@@ -81,8 +117,11 @@ class AdaptiveHarnessApp(App):
             repository=self.repository,
             clarification_callback=self._request_interactive_clarification,
             workspace_root=self.workspace_root,
+            explicit_model=default_model,
+            classifier_backend=create_backend(classifier_backend, classifier_model, classifier_endpoint),
         )
-        self._current_clarification_future: Optional[asyncio.Future[str]] = None
+        if session_id:
+            self._restore_session()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -90,11 +129,14 @@ class AdaptiveHarnessApp(App):
             yield RichLog(id="chat-log", wrap=True, highlight=True, markup=True)
             yield ClassifierTelemetryWidget(id="telemetry")
 
+        yield Static(id="status-line")
+
         with Container(id="input-container"):
             yield Input(
                 placeholder="Ask agent to code, inspect, test, or run commands (/help for commands)...",
                 id="prompt-input",
             )
+        yield Static("⚡ Agent waiting on your clarification", id="waiting-indicator")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -110,9 +152,59 @@ class AdaptiveHarnessApp(App):
             log.write("[yellow]Notice: No OPENROUTER_API_KEY detected. Running in offline simulated mode.[/yellow]")
             log.write("[dim]Type '/key <YOUR_KEY>' to connect your OpenRouter account at any time.[/dim]\n")
         else:
-            log.write(f"[green]Connected to OpenRouter using {self.agent.llm_client.default_model}[/green]\n")
+            log.write(Text(f"Connected to OpenRouter using {self.agent.llm_client.default_model}\n", style="green"))
 
         self.query_one("#prompt-input", Input).focus()
+        self._refresh_status()
+        self._apply_layout()
+        self.set_interval(0.7, self._pulse_waiting)
+
+    def _pulse_waiting(self) -> None:
+        indicator = self.query_one("#waiting-indicator", Static)
+        if indicator.has_class("visible"):
+            indicator.toggle_class("pulse")
+        else:
+            indicator.remove_class("pulse")
+
+    def on_resize(self, event) -> None:
+        self._apply_layout()
+
+    def _apply_layout(self) -> None:
+        matches = self.query("#telemetry")
+        if matches:
+            matches.first().display = self._show_telemetry and self.size.width >= 85
+
+    def _refresh_status(self) -> None:
+        model = self.agent.explicit_model or "auto"
+        skills = ", ".join(self.agent.active_skills) or "none"
+        self.sub_title = f"Model: {model} | Classifier: {self.agent.classifier_backend.name} | {'OFFLINE MOCK' if self.agent.llm_client.is_mock else 'LIVE'}"
+        self.query_one("#status-line", Static).update(Text(
+            f"{self.workspace_root}  ·  Session {self.session.id}  ·  Model {model}  ·  Skills {skills}", style="bold cyan"))
+
+    def _save_session(self) -> None:
+        self.session.workspace = self.workspace_root
+        self.session.messages = self.agent.messages
+        self.session.model = self.agent.explicit_model
+        self.session.skills = list(self.agent.active_skills)
+        self.session_store.save(self.session)
+
+    def _restore_session(self) -> None:
+        if self.session.messages:
+            self.agent.messages = self.session.messages
+        self.agent.explicit_model = self.session.model
+        if self.session.model:
+            self.agent.llm_client.default_model = self.session.model
+        self.agent.set_workspace(self.session.workspace)
+        self.skill_catalog = SkillCatalog(self.session.workspace)
+        for name in self.session.skills or []:
+            try:
+                self.agent.active_skills[name] = self.skill_catalog.read(name)
+            except (OSError, ValueError):
+                pass
+
+    def on_unmount(self) -> None:
+        self._save_session()
+        self.session_store.close()
 
     def _request_interactive_clarification(
         self,
@@ -126,8 +218,10 @@ class AdaptiveHarnessApp(App):
         fut: concurrent.futures.Future[str] = concurrent.futures.Future()
 
         def show_modal():
+            self.query_one("#waiting-indicator", Static).add_class("visible")
             def on_dismiss(ans: Optional[str]):
-                fut.set_result(ans or (options[0] if options else "Proceed"))
+                self.query_one("#waiting-indicator", Static).remove_class("visible")
+                fut.set_result(ans or "Action cancelled by user")
 
             modal = ClarificationModal(question=question, options=options, context=context)
             self.push_screen(modal, callback=on_dismiss)
@@ -140,12 +234,24 @@ class AdaptiveHarnessApp(App):
         log = self.query_one("#chat-log", RichLog)
         log.clear()
 
+    def action_toggle_telemetry(self) -> None:
+        self._show_telemetry = not self._show_telemetry
+        self.query_one("#telemetry", ClassifierTelemetryWidget).display = self._show_telemetry
+
     def action_show_help(self) -> None:
         log = self.query_one("#chat-log", RichLog)
         log.write("[bold yellow]Available Commands:[/bold yellow]")
         log.write("  /key <API_KEY>         - Set OpenRouter API key")
         log.write("  /model <MODEL_ID>      - Switch active LLM model")
-        log.write("  /tier <fast|std|deep>  - Switch model tier")
+        log.write("  /tier <fast|standard|reasoning> - Force model tier")
+        log.write("  /classifier <backend> [model] - Switch classifier engine")
+        log.write("  /workspace [path]      - Show or change working directory")
+        log.write("  /sessions              - List saved sessions")
+        log.write("  /session new [title] | load <id> | save")
+        log.write("  /skills                - List installed skills")
+        log.write("  /skill <name|off>      - Toggle skill guidance")
+        log.write("  /output                - Show the last full tool result")
+        log.write("  F2                    - Show or hide telemetry")
         log.write("  /clear                 - Clear chat history")
         log.write("  /exit                  - Exit application")
 
@@ -162,10 +268,17 @@ class AdaptiveHarnessApp(App):
             self._handle_slash_command(text)
             return
 
+        if self._busy:
+            self.query_one("#chat-log", RichLog).write(Text("Agent is still working. Wait for this task to finish.", style="yellow"))
+            return
+
         log = self.query_one("#chat-log", RichLog)
-        log.write(f"\n[bold white]Developer >[/bold white] [bold]{text}[/bold]")
+        log.write(Text("\nDeveloper > " + text, style="bold white"))
+        if self.session.title == "New session":
+            self.session.title = text[:72]
 
         # Launch agent execution in non-blocking worker thread
+        self._busy = True
         self.execute_agent_task(text)
 
     def _handle_slash_command(self, cmd_text: str) -> None:
@@ -184,65 +297,201 @@ class AdaptiveHarnessApp(App):
             if not arg:
                 log.write("[red]Usage: /key <OPENROUTER_API_KEY>[/red]")
                 return
-            self.agent.llm_client = LLMClient(api_key=arg, default_model=self.agent.llm_client.default_model)
+            self.agent.llm_client = LLMClient(api_key=arg, base_url=self.base_url,
+                                              default_model=self.agent.llm_client.default_model)
             log.write("[green]✓ OpenRouter API key updated![/green]")
-            self.sub_title = f"Model: {self.agent.llm_client.default_model} | Mode: LIVE (OpenRouter)"
+            self._refresh_status()
         elif cmd == "/model":
             if not arg:
-                log.write(f"[yellow]Current model: {self.agent.llm_client.default_model}[/yellow]")
+                log.write(Text(f"Current model: {self.agent.explicit_model or 'auto'}", style="yellow"))
                 return
-            self.agent.llm_client.default_model = arg
-            log.write(f"[green]✓ Switched model to {arg}[/green]")
+            self.agent.explicit_model = None if arg.lower() == "auto" else arg
+            if self.agent.explicit_model:
+                self.agent.llm_client.default_model = arg
+            log.write(Text(f"✓ Model selection: {arg}", style="green"))
             self.sub_title = f"Model: {arg} | Mode: {'LIVE' if not self.agent.llm_client.is_mock else 'MOCK'}"
+            self._refresh_status()
         elif cmd == "/tier":
             if arg in MODEL_TIERS:
                 target_model = MODEL_TIERS[arg]
                 self.agent.llm_client.default_model = target_model
+                self.agent.explicit_model = target_model
                 log.write(f"[green]✓ Switched to {arg.upper()} tier ({target_model})[/green]")
+                self._refresh_status()
             else:
                 log.write(f"[red]Invalid tier. Choose from: {', '.join(MODEL_TIERS.keys())}[/red]")
+        elif cmd == "/classifier":
+            args = arg.split(maxsplit=1)
+            if not args:
+                log.write(Text(f"Classifier: {self.agent.classifier_backend.name} {self.agent.classifier_backend.model}"))
+                return
+            try:
+                backend = create_backend(args[0], args[1] if len(args) > 1 else None, self.classifier_endpoint)
+            except (ValueError, RuntimeError, OSError) as exc:
+                log.write(Text(str(exc), style="red"))
+                return
+            self.agent.classifier_backend = backend
+            log.write(Text(f"✓ Classifier: {backend.name} {backend.model}", style="green"))
+            self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+                classifier_engine=backend.name, classifier_model=backend.model)
+            self._refresh_status()
+        elif cmd == "/workspace":
+            if not arg:
+                log.write(Text(f"Workspace: {self.workspace_root}", style="cyan"))
+                return
+            if self._busy:
+                log.write(Text("Wait for the current task before changing workspace.", style="yellow"))
+                return
+            try:
+                self.agent.set_workspace(arg)
+            except ValueError as exc:
+                log.write(Text(str(exc), style="red"))
+                return
+            self.workspace_root = str(self.agent.workspace_root)
+            self.skill_catalog = SkillCatalog(self.workspace_root)
+            self.agent.active_skills.clear()
+            self._save_session()
+            self._refresh_status()
+            log.write(Text(f"Workspace: {self.workspace_root}", style="green"))
+        elif cmd == "/sessions":
+            for saved in self.session_store.list():
+                log.write(Text(f"{saved.id}  {saved.title}  ·  {saved.workspace}", style="cyan" if saved.id == self.session.id else "white"))
+        elif cmd == "/session":
+            if self._busy:
+                log.write(Text("Wait for the current task before switching sessions.", style="yellow"))
+                return
+            action, _, value = arg.partition(" ")
+            if action == "new":
+                self._save_session()
+                self.session = self.session_store.create(self.workspace_root, value.strip() or "New session")
+                self.agent.messages = [{"role": "system", "content": self.agent.system_prompt}]
+                self.agent.active_skills.clear()
+                self.agent.explicit_model = None
+                log.clear()
+                log.write(Text(f"New session {self.session.id}", style="green"))
+            elif action == "load" and value.strip():
+                saved = self.session_store.load(value.strip())
+                if saved is None:
+                    log.write(Text(f"Session not found: {value.strip()}", style="red"))
+                    return
+                self._save_session()
+                self.session = saved
+                self.workspace_root = saved.workspace
+                self._restore_session()
+                log.clear()
+                log.write(Text(f"Loaded session {saved.id}: {saved.title} ({len(saved.messages)} messages)", style="green"))
+            elif action == "save":
+                self._save_session()
+                log.write(Text(f"Saved session {self.session.id}", style="green"))
+            else:
+                log.write(Text("Use /session new [title], /session load <id>, or /session save", style="yellow"))
+            self._refresh_status()
+        elif cmd == "/skills":
+            skills = self.skill_catalog.discover()
+            if not skills:
+                log.write(Text("No skills found in .harness/skills or ~/.config/adaptive-harness/skills", style="yellow"))
+            for name, path in skills.items():
+                marker = "●" if name in self.agent.active_skills else "○"
+                log.write(Text(f"{marker} {name}  {path}", style="cyan"))
+        elif cmd == "/skill":
+            if not arg:
+                log.write(Text("Use /skills to list and /skill <name> to toggle.", style="yellow"))
+                return
+            if arg == "off":
+                self.agent.active_skills.clear()
+            elif arg in self.agent.active_skills:
+                del self.agent.active_skills[arg]
+            else:
+                try:
+                    self.agent.active_skills[arg] = self.skill_catalog.read(arg)
+                except (ValueError, OSError) as exc:
+                    log.write(Text(str(exc), style="red"))
+                    return
+            self._save_session()
+            self._refresh_status()
+            log.write(Text(f"Active skills: {', '.join(self.agent.active_skills) or 'none'}", style="green"))
+        elif cmd == "/output":
+            if self._last_tool_output:
+                log.write(Text(self._last_tool_output, style="white"))
+            else:
+                log.write(Text("No tool result yet.", style="yellow"))
         else:
-            log.write(f"[red]Unknown command: {cmd}. Type /help for options.[/red]")
+            log.write(Text(f"Unknown command: {cmd}. Type /help for options.", style="red"))
 
     @work(thread=True)
     def execute_agent_task(self, task_text: str) -> None:
         """Worker thread executing the agent task and streaming events back to the UI."""
+        try:
+            for event in self.agent.run_stream(task_text):
+                self.call_from_thread(self._render_event, event)
+        except Exception as exc:
+            self.call_from_thread(self._render_error, f"Agent error: {type(exc).__name__}: {exc}")
+        finally:
+            self.call_from_thread(self._finish_task)
+
+    def _finish_task(self) -> None:
+        self._busy = False
+        self._save_session()
+        self._refresh_status()
+        self.query_one("#prompt-input", Input).focus()
+
+    def _render_error(self, message: str) -> None:
+        self.query_one("#chat-log", RichLog).write(Text(message, style="bold red"))
+
+    def _render_event(self, event: AgentEvent) -> None:
         telemetry = self.query_one("#telemetry", ClassifierTelemetryWidget)
         log = self.query_one("#chat-log", RichLog)
+        et = event.event_type
+        p = event.payload
 
-        for event in self.agent.run_stream(task_text):
-            et = event.event_type
-            p = event.payload
-
-            if et == "skill_classification":
+        if et == "skill_classification":
                 telemetry.update_telemetry(
                     probabilities=p["probabilities"],
                     primary_skill=p["primary_skill"],
+                    classifier_engine=p["backend"], classifier_model=p["classifier_model"],
+                    classifier_latency_ms=p["latency_ms"],
                 )
-            elif et == "ambiguity_assessment":
+        elif et == "ambiguity_assessment":
                 telemetry.update_telemetry(
                     entropy=p["entropy"],
                     margin=p["confidence_margin"],
                     risk_level=p["risk_level"],
                 )
-            elif et == "model_routing":
+        elif et == "domain_mode":
+                telemetry.update_telemetry(domain_mode=p["mode"])
+        elif et == "thinking_budget":
+                telemetry.update_telemetry(thinking_level=p["level"], thinking_tokens=p["tokens"],
+                                           classifier_latency_ms=p["classifier_total_ms"])
+        elif et == "model_routing":
                 telemetry.update_telemetry(
                     tier=p["tier"],
                     model=p["model"],
+                    selection=p["selection"],
                 )
-            elif et == "thought":
-                log.write(f"\n[bold magenta]Agent ({p.get('model', 'thought')}):[/bold magenta] {escape(p['content'])}")
-            elif et == "tool_call":
-                log.write(
-                    f"  [bold yellow]⚡ Tool Call:[/bold yellow] [cyan]{p['name']}[/cyan] [dim]args={escape(str(p['arguments']))}[/dim]"
-                )
-            elif et == "tool_result":
+        elif et == "classifier_error":
+                log.write(Text(f"Classifier {p['backend']} failed: {p['error']}; using sklearn", style="yellow"))
+        elif et == "llm_error":
+                log.write(Text(p["message"], style="bold red"))
+        elif et == "thought":
+                log.write(Text(f"\nAgent ({p.get('model', 'thought')}):", style="bold magenta"))
+                log.write(Markdown(p["content"]))
+        elif et == "tool_call":
+                log.write(Text(f"⚡ Tool Call: {p['name']} args={p['arguments']}", style="yellow"))
+        elif et == "tool_result":
                 status_color = "green" if p["success"] else "red"
-                log.write(
-                    f"  [{status_color}]Result ({p['time_ms']} ms):[/{status_color}] {escape(p['output'][:300])}"
-                )
-            elif et == "verification":
-                badge_color = "green" if p["status"] == "SUCCESS" else "red bold"
-                log.write(f"  [dim]Verification Classifier: [{badge_color}]{p['status']}[/{badge_color}] -> Action: {p['action']}[/dim]")
-            elif et == "response":
-                log.write(f"\n[bold green]✓ Task Completed in {p['total_time_ms']} ms ({p['steps']} steps)[/bold green]\n")
+                log.write(Text(f"Result ({p['time_ms']} ms) · {p['name']}", style=status_color))
+                output = p["output"] or p.get("error") or "(empty)"
+                self._last_tool_output = output
+                if "Diff:\n" in output or output.startswith("@@"):
+                    diff = output.split("Diff:\n", 1)[-1]
+                    log.write(Syntax(diff, "diff", theme="monokai", line_numbers=False))
+                elif len(output) > 800:
+                    log.write(Text(output[:800] + f"\n… {len(output)-800} more characters. Use /output to expand.", style="white"))
+                else:
+                    log.write(Text(output, style="white"))
+        elif et == "verification":
+                log.write(Text(f"Verification: {p['status']} → {p['action']}", style="green" if p["status"] == "SUCCESS" else "red"))
+        elif et == "response":
+                status = "✓ Task completed" if p["success"] else "Task stopped before completion"
+                log.write(Text(f"\n{status} in {p['total_time_ms']} ms ({p['steps']} steps)\n",
+                               style="bold green" if p["success"] else "bold yellow"))

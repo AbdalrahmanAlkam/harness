@@ -1,5 +1,27 @@
 # Adaptive Agent Harness 2.0
 
+## Current developer agent setup
+
+Install the project into its virtual environment, then run `adaptive-harness dev "git status"` or `adaptive-harness tui`. With no API key or custom task-model endpoint, completions use the offline mock client. Set `OPENROUTER_API_KEY` or pass `--key` for live completions. `--base-url` points the task model at an OpenAI-compatible local server; the classifier backend is configured separately.
+
+Model selection is automatic by default. The complexity router selects fast, standard, or reasoning for each task. `--model MODEL_ID` or `--tier fast|standard|reasoning` fixes the model for every step. In the TUI, `/model MODEL_ID` and `/tier NAME` do the same; `/model auto` restores automatic routing. A forced model appears as `FORCED` in telemetry.
+
+Choose a working directory with `--workspace PATH` or `/workspace PATH`. Conversations save automatically to the configured SQLite database. Use `/sessions` to list them, `/session new [title]` to start fresh, `/session load ID` to resume, or `--session ID` at launch. Put optional `SKILL.md` files under `.harness/skills/NAME/` in the workspace or `~/.config/adaptive-harness/skills/NAME/`; `/skills` lists them and `/skill NAME` toggles one. `dev --skill NAME` enables a skill for a headless task.
+
+The default classifier is local TF-IDF and logistic regression. Select another engine with `--classifier-backend sklearn|ollama|onnx|openrouter` and `--classifier-model MODEL`. The TUI equivalent is `/classifier BACKEND [MODEL]`. `--classifier-endpoint URL` sets a custom HTTP endpoint for Ollama or OpenRouter classification. If a classifier request fails, the agent reports the error and uses sklearn for that task.
+
+For a local SLM, start Ollama and pull a small model, such as `ollama pull qwen2.5:1.5b`, then run:
+
+```bash
+adaptive-harness tui --classifier-backend ollama --classifier-model qwen2.5:1.5b
+```
+
+The Ollama backend calls the local `/api/generate` endpoint with JSON output. For llama.cpp or another local OpenAI-compatible server, select `local-slm` and set `--classifier-endpoint` to its `/v1/chat/completions` URL. The ONNX backend requires `onnxruntime` and `transformers` installed separately and a local model directory containing `model.onnx` and tokenizer files. It scores task and label embeddings by cosine similarity. The OpenRouter classifier uses `OPENROUTER_API_KEY` and a separate, configurable classifier model; it consumes API tokens.
+
+Each task also receives a domain mode (coding, research, science, or audit) and a thinking level (none, low, medium, deep). The selected classifier backend predicts all three heads: skill, domain, and thinking. The domain changes agent guidance and tools offered to the model; audit is read oriented, research can save notes, and science has a restricted arithmetic checker. Set `BRAVE_SEARCH_API_KEY` to enable web search with source URLs in research mode. Python file writes receive automatic AST validation, with syntax errors fed into the verification and recovery loop. The thinking level sets a token estimate in telemetry and sends OpenRouter reasoning effort for supported reasoning models. These are routing signals, not guarantees of a specific token count. The telemetry panel shows the active classifier, its observed latency, domain, thinking level, entropy, margin, skill probabilities, and model selection.
+
+Clarification opens for detected destructive operations or a genuinely missing task target. Numeric keys 1–9 select options, arrows navigate, Enter confirms, Tab reaches the custom instruction field, and Escape cancels. Long text wraps in a scrollable card, and empty custom input cannot approve an action. Entropy and requests for the agent's design judgment do not pause the task. F2 toggles the telemetry panel on wide terminals; narrow terminals hide it automatically. `/output` shows the last full tool result.
+
 > **An Autonomous AI Developer Agent Harness powered by OpenRouter LLMs and Pervasive ML Classifiers everywhere — featuring real-time intent routing, middle-of-development clarification dialogs, multi-tier complexity routing, active output verification, and an interactive Terminal User Interface (TUI).**
 
 ---
@@ -11,7 +33,7 @@ Modern AI developer agents often suffer from two major extremes: either blindly 
 The **Adaptive Agent Harness 2.0** solves this by embedding **pervasive machine learning classifiers everywhere** throughout the agentic lifecycle:
 
 1. **Skill & Intent Classifier (`SkillClassifier`)**: Rapidly routes developer tasks into specialized tool pipelines (`code_edit`, `run_command`, `search_explore`, `testing`, `ask_clarification`, `general_reasoning`) with full probability distributions.
-2. **Ambiguity & Risk Classifier (`AmbiguityClassifier`)**: Quantifies task uncertainty via Shannon entropy $H(p)$, confidence margin, and destructive risk filters. When uncertainty or high risk is detected, it **halts development to ask the user clarifying questions in the middle of development** before executing potentially costly or irreversible operations.
+2. **Ambiguity & Risk Classifier (`AmbiguityClassifier`)**: Quantifies task uncertainty via Shannon entropy $H(p)$, confidence margin, and destructive risk filters. Destructive actions and explicit decision ambiguity trigger clarification; entropy alone remains telemetry.
 3. **Cognitive Complexity & Model Tier Router (`ComplexityRouter`)**: Dynamically routes requests across LLM model tiers:
    - **Fast Tier** (e.g. `google/gemini-2.0-flash-001`): rapid queries, file reads, git status, typo fixes.
    - **Standard Tier** (e.g. `openai/gpt-4o`): core coding, refactoring, unit test authoring.
@@ -76,7 +98,7 @@ The **Adaptive Agent Harness 2.0** solves this by embedding **pervasive machine 
 | Classifier | What It Analyzes | Key Metrics / Classes | Action Triggered |
 | :--- | :--- | :--- | :--- |
 | **`SkillClassifier`** | Developer prompt, code context | `code_edit`, `run_command`, `search_explore`, `testing`, `ask_clarification`, `general_reasoning` | Activates optimal tool subset and prompt framing |
-| **`AmbiguityClassifier`** | Intent distribution entropy $H(p)$, confidence margin $\Delta p$, destructive tokens (`rm`, `drop`, `reset --hard`) | Shannon entropy $H(p) = -\sum p \log_2 p$, Margin $p_1 - p_2$, Risk: `LOW`, `MEDIUM`, `HIGH` | **Halts execution and opens interactive modal** to query user before proceeding |
+| **`AmbiguityClassifier`** | Intent distribution entropy $H(p)$, confidence margin $\Delta p$, destructive tokens (`rm`, `drop`, `reset --hard`) | Shannon entropy $H(p) = -\sum p \log_2 p$, Margin $p_1 - p_2$, Risk: `LOW`, `MEDIUM`, `HIGH` | Opens clarification for destructive actions or explicit decision ambiguity |
 | **`ComplexityRouter`** | Task scope, vocabulary depth, architectural cues | `FAST` (Gemini Flash), `STANDARD` (GPT-4o), `REASONING` (Claude 3.7 Sonnet) | Dynamic model selection minimizing cost and maximizing reasoning depth |
 | **`VerificationClassifier`** | Execution exit codes, Python AST tracebacks, pytest failures, regex patterns | `SUCCESS`, `SYNTAX_ERROR`, `TEST_FAILURE`, `FILE_ERROR`, `RUNTIME_ERROR` | Auto-recovery routing (`AUTO_RETRY_SYNTAX_FIX`, `AUTO_RETRY_TEST_FIX`, etc.) |
 
@@ -102,7 +124,7 @@ adaptive-harness tui --key sk-or-v1-xxxxxxxxxxxxxxxxx
   - Color-coded **Risk Level** badge (`LOW`, `MEDIUM`, `HIGH`).
   - Animated ASCII probability bars for all developer skill classes.
 - **Middle-of-Development Clarification Modal**:
-  - Whenever ambiguity or risk is flagged, the agent pauses and pops up an interactive modal dialog with selectable multiple-choice options or custom write-in input.
+  - Destructive operations or requests with no identifiable target open an interactive modal with selectable options or custom input.
 - **Rich Streaming Agent Log**:
   - Live streaming of agent thoughts, tool execution invocations with argument inspection, real-time tool results, and verification classifications.
 - **Built-in Slash Commands**:

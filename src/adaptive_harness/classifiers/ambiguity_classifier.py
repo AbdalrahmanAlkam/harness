@@ -94,26 +94,19 @@ class AmbiguityClassifier:
                 "Abort operation",
                 "Dry-run / show preview first",
             ]
+        elif re.fullmatch(r"(?:please\s+)?(?:fix|change|implement|do|improve|update)\s+(?:it|this|that)(?:\s+please)?[.!?]?", text_lower):
+            should_ask = True
+            risk_level = "medium"
+            reason = "The request has no identifiable task target."
+            suggested_q = "What should I work on? Please name the file, feature, or problem."
+            suggested_opts = []
         elif skill_result.primary_skill == "ask_clarification" or has_ambiguity_phrase:
-            should_ask = True
-            risk_level = "medium"
-            reason = "User prompt contains inherent ambiguity or explicitly solicits design selection."
-            suggested_q = "How would you prefer to proceed with this task?"
-            if "either" in text_lower or " or " in text_lower:
-                suggested_opts = ["Option A (Standard approach)", "Option B (Alternative approach)", "Explain trade-offs first"]
-            else:
-                suggested_opts = ["Proceed with recommended plan", "Clarify requirements in detail", "Run tests first"]
+            reason = "User requested a design judgment; agent should evaluate the options and proceed."
         elif entropy > self.entropy_threshold and margin < self.margin_threshold:
-            should_ask = True
+            # Uncertain routing is telemetry, not a reason to interrupt the developer.
+            should_ask = False
             risk_level = "medium"
-            reason = f"High intent distribution entropy (H={entropy:.2f} bits, margin={margin:.2f}); intent is underspecified."
-            top_skills = [s for s, _ in ranked[:2]]
-            suggested_q = f"Your request could involve {' or '.join(top_skills)}. What is your primary objective?"
-            suggested_opts = [
-                f"Perform {top_skills[0]}",
-                f"Perform {top_skills[1]}",
-                "Inspect workspace first",
-            ]
+            reason = f"Uncertain intent routing (H={entropy:.2f} bits, margin={margin:.2f}); proceed and verify."
 
         return AmbiguityAssessment(
             should_ask_question=should_ask,

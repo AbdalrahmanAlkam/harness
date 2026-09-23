@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional
 
-from adaptive_harness.tools.base import Tool, ToolResult
+from adaptive_harness.tools.base import Tool, ToolResult, workspace_path
 
 
 class ListDirectoryTool(Tool):
@@ -26,7 +26,10 @@ class ListDirectoryTool(Tool):
         self.workspace_root = Path(workspace_root or os.getcwd()).resolve()
 
     def execute(self, path: str = ".", **kwargs: Any) -> ToolResult:
-        dir_path = (self.workspace_root / path).resolve()
+        try:
+            dir_path = workspace_path(self.workspace_root, path)
+        except ValueError as exc:
+            return ToolResult(success=False, output="", error=str(exc))
         if not dir_path.exists():
             return ToolResult(success=False, output="", error=f"Directory not found: {path}")
         if not dir_path.is_dir():
@@ -80,6 +83,7 @@ class SearchFilesTool(Tool):
                     continue
                 p = Path(root) / f
                 try:
+                    workspace_path(self.workspace_root, str(p.relative_to(self.workspace_root)))
                     text = p.read_text(encoding="utf-8", errors="ignore")
                     for i, line in enumerate(text.splitlines(), start=1):
                         if regex.search(line):

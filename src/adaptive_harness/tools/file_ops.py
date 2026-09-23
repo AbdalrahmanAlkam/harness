@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from adaptive_harness.tools.base import Tool, ToolResult
+from adaptive_harness.tools.base import Tool, ToolResult, workspace_path
 
 
 class ReadFileTool(Tool):
@@ -35,7 +35,10 @@ class ReadFileTool(Tool):
         end_line: Optional[int] = None,
         **kwargs: Any,
     ) -> ToolResult:
-        file_path = (self.workspace_root / path).resolve()
+        try:
+            file_path = workspace_path(self.workspace_root, path)
+        except ValueError as exc:
+            return ToolResult(success=False, output="", error=str(exc))
         if not file_path.exists():
             return ToolResult(success=False, output="", error=f"File not found: {path}")
         if not file_path.is_file():
@@ -79,7 +82,10 @@ class WriteFileTool(Tool):
         self.workspace_root = Path(workspace_root or os.getcwd()).resolve()
 
     def execute(self, path: str, content: str, **kwargs: Any) -> ToolResult:
-        file_path = (self.workspace_root / path).resolve()
+        try:
+            file_path = workspace_path(self.workspace_root, path)
+        except ValueError as exc:
+            return ToolResult(success=False, output="", error=str(exc))
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
@@ -117,7 +123,10 @@ class EditFileTool(Tool):
         replacement_text: str,
         **kwargs: Any,
     ) -> ToolResult:
-        file_path = (self.workspace_root / path).resolve()
+        try:
+            file_path = workspace_path(self.workspace_root, path)
+        except ValueError as exc:
+            return ToolResult(success=False, output="", error=str(exc))
         if not file_path.exists():
             return ToolResult(success=False, output="", error=f"File not found: {path}")
 

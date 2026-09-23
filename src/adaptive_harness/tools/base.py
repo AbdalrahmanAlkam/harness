@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 
@@ -38,3 +39,11 @@ class Tool(ABC):
                 "parameters": self.parameters,
             },
         }
+
+
+def workspace_path(root: Path, value: str) -> Path:
+    """Resolve a file path inside the selected workspace, including symlinks."""
+    candidate = (root / value).resolve()
+    if not candidate.is_relative_to(root.resolve()):
+        raise ValueError(f"Path is outside the workspace: {value}")
+    return candidate

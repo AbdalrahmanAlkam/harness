@@ -30,8 +30,9 @@ class LLMClient:
         default_model: Optional[str] = None,
         force_mock: bool = False,
     ):
-        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
         self.base_url = base_url or os.environ.get("OPENROUTER_BASE_URL") or DEFAULT_OPENROUTER_BASE_URL
+        self.api_key = api_key or ("local" if base_url and base_url != DEFAULT_OPENROUTER_BASE_URL else
+                                   os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"))
         self.default_model = default_model or MODEL_TIERS["standard"]
         self.force_mock = force_mock
         self.mock_client = MockLLMClient(default_model=self.default_model)
@@ -62,6 +63,7 @@ class LLMClient:
         model: Optional[str] = None,
         tier: Optional[str] = None,
         temperature: float = 0.2,
+        reasoning_effort: Optional[str] = None,
     ) -> LLMResponse:
         """Executes a chat completion call with automatic model selection and tool handling."""
         selected_model = model or (self.get_model_for_tier(tier) if tier else self.default_model)
@@ -78,6 +80,10 @@ class LLMClient:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        if reasoning_effort and self.base_url.rstrip("/").startswith("https://openrouter.ai") and any(
+            marker in selected_model.lower() for marker in ("claude-3.7", "deepseek-r1", "o3-mini", "reasoning")
+        ):
+            kwargs["extra_body"] = {"reasoning": {"effort": reasoning_effort}}
 
         try:
             assert self._openai_client is not None
@@ -114,9 +120,8 @@ class LLMClient:
             )
 
         except Exception as e:
-            # Fallback gracefully with error notice
             return LLMResponse(
-                content=f"[API Call Error: {type(e).__name__}: {str(e)}]\nFalling back to simulated completion.",
+                content=f"API call failed: {type(e).__name__}: {str(e)}",
                 tool_calls=[],
                 model=selected_model,
                 finish_reason="error",

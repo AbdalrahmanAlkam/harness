@@ -7,3 +7,12 @@ __pycache__/
 dist/
 build/
 .DS_Store
+.mypy_cache/
+.ruff_cache/
+
+venv/
+
+output/*.db
+
+.env
+.env.*

@@ -105,17 +105,37 @@ def run(
 @app.command()
 def tui(
     api_key: Optional[str] = typer.Option(None, "--key", "-k", help="OpenRouter or OpenAI API key"),
+    base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID (e.g. anthropic/claude-3.7-sonnet)"),
+    tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
+    classifier_backend: str = typer.Option("sklearn", "--classifier-backend", help="sklearn, ollama, onnx, openrouter"),
+    classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
+    classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Local or OpenRouter classifier endpoint"),
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w", help="Working directory for agent tools"),
+    session: Optional[str] = typer.Option(None, "--session", help="Resume an existing TUI session ID"),
     db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Path to experience database"),
 ):
     """Launches the interactive Textual TUI development environment with pervasive classifiers."""
     from adaptive_harness.tui.app import AdaptiveHarnessApp
+    from adaptive_harness.llm.client import MODEL_TIERS
 
-    tui_app = AdaptiveHarnessApp(
-        api_key=api_key,
-        default_model=model,
-        db_path=db_path,
-    )
+    if tier and tier not in MODEL_TIERS:
+        raise typer.BadParameter("Choose fast, standard, or reasoning", param_hint="--tier")
+
+    try:
+        tui_app = AdaptiveHarnessApp(
+            api_key=api_key,
+            base_url=base_url,
+            default_model=(None if model and model.lower() == "auto" else model) or (MODEL_TIERS[tier] if tier in MODEL_TIERS else None),
+            classifier_backend=classifier_backend,
+            classifier_model=classifier_model,
+            classifier_endpoint=classifier_endpoint,
+            workspace_root=str(workspace),
+            session_id=session,
+            db_path=db_path,
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     tui_app.run()
 
 
@@ -123,16 +143,43 @@ def tui(
 def dev(
     task: str = typer.Argument(..., help="Software engineering task to execute"),
     api_key: Optional[str] = typer.Option(None, "--key", "-k", help="OpenRouter or OpenAI API key"),
+    base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID"),
+    tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
+    classifier_backend: str = typer.Option("sklearn", "--classifier-backend", help="sklearn, ollama, onnx, openrouter"),
+    classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
+    classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Classifier endpoint"),
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w", help="Working directory for agent tools"),
+    skill: Optional[list[str]] = typer.Option(None, "--skill", help="Enable a named workspace or user skill"),
     db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Path to experience database"),
 ):
     """Runs a developer task through the DeveloperAgent with pervasive classification and verification."""
     from adaptive_harness.agent.agent import DeveloperAgent
     from adaptive_harness.llm.client import LLMClient
+    from adaptive_harness.llm.client import MODEL_TIERS
+    from adaptive_harness.classifiers.engine import create_backend
+    from adaptive_harness.agent.skills import SkillCatalog
 
-    client = LLMClient(api_key=api_key, default_model=model)
+    if tier and tier not in MODEL_TIERS:
+        raise typer.BadParameter("Choose fast, standard, or reasoning", param_hint="--tier")
+
+    selected_model = (None if model and model.lower() == "auto" else model) or (MODEL_TIERS[tier] if tier in MODEL_TIERS else None)
+    client = LLMClient(api_key=api_key, base_url=base_url, default_model=selected_model)
     repo = ExperienceRepository(db_path)
-    agent = DeveloperAgent(llm_client=client, repository=repo)
+    if not workspace.is_dir():
+        raise typer.BadParameter(f"Workspace directory does not exist: {workspace}", param_hint="--workspace")
+    try:
+        backend = create_backend(classifier_backend, classifier_model, classifier_endpoint)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--classifier-backend") from exc
+    agent = DeveloperAgent(llm_client=client, repository=repo, workspace_root=str(workspace), explicit_model=selected_model,
+                           classifier_backend=backend)
+    catalog = SkillCatalog(workspace)
+    for name in skill or []:
+        try:
+            agent.active_skills[name] = catalog.read(name)
+        except (ValueError, OSError) as exc:
+            raise typer.BadParameter(str(exc), param_hint="--skill") from exc
 
     console.print(f"\n[bold cyan]=== Adaptive Developer Agent Task ===[/bold cyan]")
     console.print(f"Task: [bold white]\"{task}\"[/bold white]")
@@ -147,6 +194,8 @@ def dev(
             console.print(f"  [{color}]Ambiguity & Risk:[/{color}] H={p['entropy']:.2f} bits | Risk={p['risk_level'].upper()} | Ask={p['should_ask_question']}")
         elif et == "model_routing":
             console.print(f"  [magenta]Model Tier:[/magenta] [{p['tier'].upper()}] -> {p['model']}")
+        elif et == "llm_error":
+            console.print(f"[red]Model error: {escape(p['message'])}[/red]")
         elif et == "thought":
             console.print(f"\n[bold magenta]Agent Thought:[/bold magenta] {escape(p['content'])}")
         elif et == "tool_call":
@@ -158,7 +207,9 @@ def dev(
             badge_col = "green" if p["status"] == "SUCCESS" else "red bold"
             console.print(f"  [dim]Verification Classifier: [{badge_col}]{p['status']}[/{badge_col}] -> Action: {p['action']}[/dim]")
         elif et == "response":
-            console.print(f"\n[bold green]✓ Completed in {p['total_time_ms']} ms ({p['steps']} steps)[/bold green]\n")
+            status = "✓ Completed" if p.get("success", True) else "Stopped before completion"
+            color = "green" if p.get("success", True) else "yellow"
+            console.print(f"\n[bold {color}]{status} in {p['total_time_ms']} ms ({p['steps']} steps)[/bold {color}]\n")
 
 
 @app.command()

@@ -1,0 +1,15 @@
+# Developer agent walkthrough
+
+Run `adaptive-harness tui --workspace /path/to/project` for the interactive agent. Enter a task at the prompt. The right panel shows the skill distribution, entropy and margin, total classifier latency, domain mode, thinking budget, and model selection. Press F2 to toggle it. Tool calls and results appear in the chat log; diffs use syntax coloring, and `/output` shows the complete last tool result. When a risky operation needs clarification, select an option with 1–9 or type an instruction. Escape cancels the task. The card wraps long text and scrolls on small terminals.
+
+For a headless run, use `adaptive-harness dev "inspect the tests"`. Add `--model anthropic/claude-3.7-sonnet` to force a specific model, or `--tier fast` to force a tier. Leave both out for automatic model routing. In the TUI, `/model auto` returns to automatic routing after a forced selection.
+
+To use a local OpenAI-compatible server for the main task model, pass `--base-url http://localhost:8080/v1 --model YOUR_LOCAL_MODEL`. This is independent of `--classifier-backend`, which controls the smaller decision engine.
+
+To route skill classification through Ollama locally, install Ollama, run `ollama pull qwen2.5:1.5b`, and launch `adaptive-harness tui --classifier-backend ollama --classifier-model qwen2.5:1.5b`. The default endpoint is `http://localhost:11434/api/generate`; use `--classifier-endpoint` for another server. `/classifier sklearn` switches back instantly. Other supported engines are `openrouter` (requires `OPENROUTER_API_KEY`) and `onnx` (requires a local ONNX model and optional Python packages `onnxruntime` and `transformers`).
+
+Domain modes adapt the system instruction to coding, research, scientific analysis, or security audit. Thinking levels range from none to deep and control the effort hint sent to supported OpenRouter reasoning models. They are estimates derived from the task text; inspect the verification events and final output before relying on agent results.
+
+Use `/workspace /path/to/project` to switch projects between tasks. `/sessions` lists saved conversations, `/session new [title]` starts one, and `/session load ID` resumes one. A session saves automatically after a task. `adaptive-harness tui --session ID` resumes it on launch. To add a reusable skill, create `.harness/skills/NAME/SKILL.md` in the workspace, run `/skills`, then `/skill NAME`. The selected skill guidance is saved with the session; `/skill off` clears the selection.
+
+The tool suite has local file search, bash, pytest, and restricted arithmetic. Set `BRAVE_SEARCH_API_KEY` to enable web search with source URLs in research mode. The domain mode changes prompts and available tools, while verification reports checks that actually ran. The arithmetic tool checks expressions but does not replace symbolic proof or numerical convergence testing. See [the implementation brief](docs/implementation-prompt.md) for the broader product requirements and acceptance criteria.
