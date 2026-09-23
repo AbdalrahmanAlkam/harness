@@ -22,6 +22,9 @@ class VerificationClassifier:
 
     def evaluate(self, tool_name: str, tool_result: ToolResult,
                  semantic_status: Optional[str] = None) -> VerificationAssessment:
+        if tool_name == "verify_equation" and tool_result.metadata.get("substitution_verified") is False:
+            return VerificationAssessment("MATH_MISMATCH", True, "RECHECK_DERIVATION",
+                                          "Exact SymPy substitution did not satisfy the equation.")
         if tool_result.success:
             return VerificationAssessment(
                 status="SUCCESS",

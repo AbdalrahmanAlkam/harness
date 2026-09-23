@@ -211,6 +211,10 @@ class EquationStrategy(Strategy):
                 reason=f"Execution failed: {result.error or 'no result'}",
             )
 
+        exact = self._verify_with_sympy(result)
+        if exact is not None:
+            return exact
+
         val = result.value
         if "type" in val and val["type"] in ("infinite_solutions", "complex"):
             return VerificationResult(success=True, reason="Special solution verified")
@@ -253,3 +257,47 @@ class EquationStrategy(Strategy):
             confidence=1.0,
             details={"max_residual": max_residual},
         )
+
+    @staticmethod
+    def _verify_with_sympy(result: Result) -> VerificationResult | None:
+        """Compare rounded display roots to exact real roots and original domains."""
+        lhs_text = result.metadata.get("lhs")
+        rhs_text = result.metadata.get("rhs")
+        variable = result.metadata.get("var")
+        if not all(isinstance(value, str) and value for value in (lhs_text, rhs_text, variable)):
+            return None
+        try:
+            import sympy as sp
+            from adaptive_harness.tools.python_repl import _safe_sympy
+            symbol = sp.Symbol(variable)
+            names = {variable: symbol, "pi": sp.pi, "E": sp.E, "I": sp.I}
+            lhs, lhs_denoms = _safe_sympy(lhs_text, names)
+            rhs, rhs_denoms = _safe_sympy(rhs_text, names)
+            exact_roots = sp.solveset(sp.Eq(lhs, rhs), symbol, domain=sp.S.Reals)
+            if exact_roots == sp.S.Reals:
+                valid = result.value.get("type") == "infinite_solutions"
+                return VerificationResult(success=valid, reason="Symbolic identity verified" if valid else
+                                          "Expected infinitely many solutions")
+            if exact_roots == sp.S.EmptySet:
+                valid = result.value.get("type") == "complex" or not result.value.get("roots")
+                return VerificationResult(success=valid, reason="No real roots verified symbolically" if valid else
+                                          "Reported roots contradict the exact equation")
+            if not isinstance(exact_roots, sp.FiniteSet):
+                return None
+            valid_roots = [root for root in exact_roots
+                           if all(sp.simplify(denom.subs(symbol, root)) != 0
+                                  for denom in (*lhs_denoms, *rhs_denoms))]
+            reported = result.value.get("roots", [])
+            if len(valid_roots) != len(reported):
+                return VerificationResult(success=False, reason="Reported root count differs from exact solutions")
+            remaining = list(valid_roots)
+            for rounded in reported:
+                match = next((root for root in remaining if abs(complex(sp.N(root)) - complex(rounded)) <= 1e-5), None)
+                if match is None:
+                    return VerificationResult(success=False,
+                                              reason=f"Reported root {rounded} does not satisfy the exact symbolic equation")
+                remaining.remove(match)
+            return VerificationResult(success=True, reason=f"All {len(valid_roots)} roots matched exact SymPy solutions",
+                                      confidence=1.0, details={"exact_roots": [str(root) for root in valid_roots]})
+        except (ImportError, ValueError, TypeError, OverflowError, NotImplementedError):
+            return None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import difflib
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ class ReadFileTool(Tool):
             "path": {"type": "string", "description": "Relative or absolute path to the file."},
             "start_line": {"type": "integer", "description": "1-based starting line number (optional)."},
             "end_line": {"type": "integer", "description": "1-based ending line number (optional)."},
+            "symbol": {"type": "string", "description": "Python function, class, or Class.method to extract."},
         },
         "required": ["path"],
     }
@@ -33,6 +35,7 @@ class ReadFileTool(Tool):
         path: str,
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
+        symbol: Optional[str] = None,
         **kwargs: Any,
     ) -> ToolResult:
         try:
@@ -48,17 +51,42 @@ class ReadFileTool(Tool):
             content = file_path.read_text(encoding="utf-8", errors="replace")
             lines = content.splitlines(keepends=True)
 
+            if symbol:
+                if file_path.suffix != ".py":
+                    return ToolResult(success=False, output="", error="Symbol extraction requires a Python file")
+                try:
+                    tree = ast.parse(content, filename=str(file_path))
+                except SyntaxError as exc:
+                    return ToolResult(success=False, output="", error=f"SyntaxError: {exc.msg} at line {exc.lineno}")
+                node = tree
+                for part in symbol.split("."):
+                    node = next((child for child in getattr(node, "body", [])
+                                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                                 and child.name == part), None)
+                    if node is None:
+                        return ToolResult(success=False, output="", error=f"Symbol not found: {symbol}")
+                start_line, end_line = node.lineno, node.end_lineno
+                imports = [f"{item.lineno:4d} | {''.join(lines[item.lineno-1:item.end_lineno]).rstrip()}"
+                           for item in tree.body if isinstance(item, (ast.Import, ast.ImportFrom))]
+            else:
+                imports = []
+
+            if start_line is None and end_line is None and len(lines) > 200:
+                end_line = 120
+
             start = max(1, start_line) if start_line is not None else 1
             end = min(len(lines), end_line) if end_line is not None else len(lines)
 
             selected_lines = lines[start - 1 : end]
             numbered = [f"{i + start:4d} | {line}" for i, line in enumerate(selected_lines)]
-            output_str = "".join(numbered)
+            output_str = ("Imports:\n" + "\n".join(imports) + "\n\n" if imports else "") + "".join(numbered)
+            if not symbol and start == 1 and end < len(lines) and start_line is None:
+                output_str += f"\n… {len(lines)-end} lines omitted. Use symbol or start_line/end_line for a focused read."
 
             return ToolResult(
                 success=True,
                 output=output_str,
-                metadata={"total_lines": len(lines), "start_line": start, "end_line": end},
+                metadata={"total_lines": len(lines), "start_line": start, "end_line": end, "symbol": symbol},
             )
         except Exception as e:
             return ToolResult(success=False, output="", error=f"Failed to read file: {e}")
@@ -86,6 +114,9 @@ class WriteFileTool(Tool):
             file_path = workspace_path(self.workspace_root, path)
         except ValueError as exc:
             return ToolResult(success=False, output="", error=str(exc))
+        syntax_error = _python_syntax_error(file_path, content)
+        if syntax_error:
+            return ToolResult(success=False, output="", error=syntax_error)
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
@@ -149,6 +180,9 @@ class EditFileTool(Tool):
                 )
 
             updated = original.replace(target_text, replacement_text, 1)
+            syntax_error = _python_syntax_error(file_path, updated)
+            if syntax_error:
+                return ToolResult(success=False, output="", error=syntax_error)
             file_path.write_text(updated, encoding="utf-8")
 
             # Generate unified diff
@@ -168,3 +202,13 @@ class EditFileTool(Tool):
             )
         except Exception as e:
             return ToolResult(success=False, output="", error=f"Failed to edit file: {e}")
+
+
+def _python_syntax_error(path: Path, content: str) -> str | None:
+    if path.suffix != ".py":
+        return None
+    try:
+        ast.parse(content, filename=str(path))
+    except SyntaxError as exc:
+        return f"SyntaxError: {exc.msg} at line {exc.lineno}, column {exc.offset}"
+    return None

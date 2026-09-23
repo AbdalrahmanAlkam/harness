@@ -225,6 +225,7 @@ def dev(
     console.print(f"\n[bold cyan]=== Adaptive Developer Agent Task ===[/bold cyan]")
     console.print(f"Task: [bold white]\"{task}\"[/bold white]")
 
+    last_agent_content = ""
     for event in agent.run_stream(task):
         et = event.event_type
         p = event.payload
@@ -254,7 +255,12 @@ def dev(
         elif et == "storage_error":
             console.print(f"[yellow]{escape(p['error'])}[/yellow]")
         elif et == "thought":
+            last_agent_content = p["content"]
             console.print(f"\n[bold magenta]Agent:[/bold magenta] {escape(p['content'])}")
+        elif et == "memory_hit":
+            console.print("  [bold green]⚡ Verified memory answer reused (0 API tokens)[/bold green]")
+        elif et == "clarification_memory_hit":
+            console.print("  [cyan]Using a saved preference for this question.[/cyan]")
         elif et == "tool_call":
             console.print(f"  [bold yellow]Tool Call:[/bold yellow] [cyan]{p['name']}[/cyan] [dim]{escape(str(p['arguments']))}[/dim]")
         elif et == "tool_result":
@@ -264,6 +270,8 @@ def dev(
             badge_col = "green" if p["status"] == "SUCCESS" else "red bold"
             console.print(f"  [dim]Verification Classifier: [{badge_col}]{p['status']}[/{badge_col}] -> Action: {p['action']}[/dim]")
         elif et == "response":
+            if p.get("content") and p["content"] != last_agent_content:
+                console.print(f"\n[bold magenta]Agent:[/bold magenta] {escape(p['content'])}")
             status = "✓ Completed" if p.get("success", True) else "Stopped before completion"
             color = "green" if p.get("success", True) else "yellow"
             console.print(f"\n[bold {color}]{status} in {p['total_time_ms']} ms ({p['steps']} steps)[/bold {color}]\n")

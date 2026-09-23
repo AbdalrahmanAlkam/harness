@@ -111,7 +111,8 @@ def test_openrouter_reasoning_request_uses_effort_without_temperature():
                                model=MODEL_TIERS["reasoning"], reasoning_effort="high")
     assert response.content == "ok"
     assert captured["model"] == MODEL_TIERS["reasoning"]
-    assert captured["extra_body"] == {"reasoning": {"effort": "high"}}
+    assert captured["extra_body"] == {"reasoning": {"effort": "high"},
+                                      "cache_control": {"type": "ephemeral"}}
     assert "temperature" not in captured
 
 
@@ -128,14 +129,16 @@ def test_reasoning_budget_uses_supported_openrouter_parameters():
     messages = [{"role": "user", "content": "Analyze the proof"}]
     client.complete(messages, model="anthropic/claude-3.7-sonnet", reasoning_effort="high",
                     reasoning_budget_tokens=16000)
-    assert requests[-1]["extra_body"] == {"reasoning": {"max_tokens": 16000}}
+    assert requests[-1]["extra_body"] == {"reasoning": {"max_tokens": 16000},
+                                          "cache_control": {"type": "ephemeral"}}
     assert requests[-1]["max_completion_tokens"] > 16000
     assert "temperature" not in requests[-1]
     client.complete(messages, model="deepseek/deepseek-r1", reasoning_effort="medium",
                     reasoning_budget_tokens=4000)
     assert requests[-1]["extra_body"] == {"reasoning": {"effort": "medium"}}
     client.complete(messages, model="anthropic/claude-3.7-sonnet", reasoning_budget_tokens=0)
-    assert requests[-1]["extra_body"] == {"reasoning": {"enabled": False}}
+    assert requests[-1]["extra_body"] == {"reasoning": {"enabled": False},
+                                          "cache_control": {"type": "ephemeral"}}
     client.complete(messages, model=MODEL_TIERS["standard"], reasoning_effort="low",
                     reasoning_budget_tokens=1000)
     assert requests[-1]["extra_body"] == {"reasoning": {"effort": "low"}}

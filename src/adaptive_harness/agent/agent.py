@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import ast
+import hashlib
 import json
+import re
 import time
 from typing import Any, Callable, Dict, Generator, List, Optional
 from pathlib import Path
@@ -31,6 +32,9 @@ from adaptive_harness.tools.clarification import AskUserTool
 from adaptive_harness.tools.file_ops import EditFileTool, ReadFileTool, WriteFileTool
 from adaptive_harness.tools.testing import RunPytestTool
 from adaptive_harness.tools.science import CalculateTool, CheckConvergenceTool
+from adaptive_harness.tools.python_repl import RunPythonReplTool, VerifyEquationTool
+from adaptive_harness.agent.compaction import compact_tool_output, rank_search_results
+from adaptive_harness.data.preferences import ClarificationMemory
 from adaptive_harness.tools.research import WebSearchTool
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 
@@ -40,6 +44,13 @@ Inspect relevant evidence, use tools when needed, and distinguish verified resul
 For code changes, run appropriate checks and inspect failures before reporting success.
 Make routine decisions yourself; ask only when the task target is missing or an action is destructive.
 """
+
+
+def _cacheable_read_request(task: str) -> bool:
+    """Admit only self-contained read requests to the zero-token answer cache."""
+    return bool(re.fullmatch(
+        r"(?i)(?:please\s+)?(?:read|view|show|inspect)(?:\s+(?:file|the file))?\s+"
+        r"[\w./-]+\.(?:py|md|txt|json|toml)[.!]?", task.strip()))
 
 
 @dataclass
@@ -67,10 +78,12 @@ class DeveloperAgent:
         forced_mode: str | DomainMode | None = None,
         forced_thinking: str | ThinkingLevel | None = None,
         safety_profile: str = "turbo",
+        preferences_dir: str | Path | None = None,
     ):
         if safety_profile not in {"turbo", "cautious"}:
             raise ValueError("Safety profile must be turbo or cautious")
         self.safety_profile = safety_profile
+        self.clarification_memory = ClarificationMemory(preferences_dir)
         self.llm_client = llm_client or LLMClient()
         self.repository = repository
         self.clarification_callback = clarification_callback
@@ -103,6 +116,8 @@ class DeveloperAgent:
             RunPytestTool(workspace_root=workspace_root),
             CalculateTool(),
             CheckConvergenceTool(),
+            RunPythonReplTool(),
+            VerifyEquationTool(),
             AskUserTool(callback=self._handle_clarification),
         ]
         if WebSearchTool().api_key:
@@ -121,8 +136,16 @@ class DeveloperAgent:
                 tool.workspace_root = target
 
     def _handle_clarification(self, question: str, options: Optional[List[str]], context: Optional[str]) -> str:
+        remembered = self.clarification_memory.lookup(question, context)
+        if remembered:
+            return remembered
         if self.clarification_callback is not None:
-            return self.clarification_callback(question, options, context)
+            answer = self.clarification_callback(question, options, context)
+            try:
+                self.clarification_memory.remember(question, answer, context)
+            except OSError:
+                pass
+            return answer
         # Headless execution cannot obtain authorization for a destructive action.
         if not options or (context and "destructive" in context.lower()):
             return "Action cancelled by user"
@@ -137,6 +160,23 @@ class DeveloperAgent:
     def run_stream(self, user_input: str, max_steps: Optional[int] = None) -> Generator[AgentEvent, None, None]:
         """Executes a task through the agentic lifecycle, yielding real-time events for the TUI."""
         start_time = time.perf_counter()
+        original_input = user_input
+        preference_guidance = self.clarification_memory.guidance()
+        settings_key = json.dumps({"mode": self.forced_mode.value if self.forced_mode else "auto",
+                                   "thinking": self.forced_thinking.value if self.forced_thinking else "auto",
+                                   "model": self.explicit_model or "auto", "skills": sorted(self.active_skills),
+                                   "prompt": hashlib.sha256(self.system_prompt.encode()).hexdigest(),
+                                   "preferences": hashlib.sha256(preference_guidance.encode()).hexdigest()}, sort_keys=True)
+        if self.repository is not None and _cacheable_read_request(user_input):
+            cached = self.repository.lookup_solution(user_input, str(self.workspace_root), settings_key)
+            if cached:
+                self.messages.append({"role": "user", "content": user_input})
+                self.messages.append({"role": "assistant", "content": cached["answer"]})
+                yield AgentEvent("memory_hit", {"original_tokens": cached["original_tokens"]})
+                yield AgentEvent("response", {"content": cached["answer"], "total_time_ms":
+                    round((time.perf_counter() - start_time) * 1000, 2), "steps": 0,
+                    "success": True, "usage": {"prompt_tokens": 0, "completion_tokens": 0}})
+                return
 
         # 1. Skill classification
         semif_engine = getattr(self.classifier_backend, "engine", None)
@@ -183,31 +223,26 @@ class DeveloperAgent:
         # If high ambiguity or risk is detected, ask the user before calling LLM!
         authorized_destructive = False
         if ambiguity_res.should_ask_question and ambiguity_res.suggested_question:
-            yield AgentEvent(
-                event_type="clarification_needed",
-                payload={
+            remembered = self.clarification_memory.lookup(ambiguity_res.suggested_question, ambiguity_res.reason)
+            if remembered:
+                yield AgentEvent("clarification_memory_hit", {"question": ambiguity_res.suggested_question})
+                user_input = f"{user_input}\n[Known User Preference]: {remembered}"
+            else:
+                yield AgentEvent("clarification_needed", {
                     "question": ambiguity_res.suggested_question,
                     "options": ambiguity_res.suggested_options,
                     "reason": ambiguity_res.reason,
-                    "risk_level": ambiguity_res.risk_level,
-                },
-            )
-            # Invoke clarification handler (pauses for user input in TUI modal)
-            user_answer = self._handle_clarification(
-                ambiguity_res.suggested_question,
-                ambiguity_res.suggested_options,
-                ambiguity_res.reason,
-            )
-            if user_answer.lower().startswith(("abort", "action cancelled")):
-                yield AgentEvent("response", {"content": "Action cancelled by user.", "total_time_ms": round((time.perf_counter()-start_time)*1000, 2), "steps": 0, "success": False})
-                return
-            authorized_destructive = ambiguity_res.risk_level == "high" and user_answer.lower().startswith("proceed")
-            yield AgentEvent(
-                event_type="clarification_answered",
-                payload={"answer": user_answer},
-            )
-            # Enrich context with clarification
-            user_input = f"{user_input}\n[User Clarification]: {user_answer}"
+                    "risk_level": ambiguity_res.risk_level})
+                answer = self._handle_clarification(ambiguity_res.suggested_question,
+                                                    ambiguity_res.suggested_options, ambiguity_res.reason)
+                if answer.lower().startswith(("abort", "action cancelled")):
+                    yield AgentEvent("response", {"content": "Action cancelled by user.",
+                        "total_time_ms": round((time.perf_counter()-start_time)*1000, 2),
+                        "steps": 0, "success": False})
+                    return
+                authorized_destructive = ambiguity_res.risk_level == "high" and answer.lower().startswith("proceed")
+                yield AgentEvent("clarification_answered", {"answer": answer})
+                user_input = f"{user_input}\n[User Clarification]: {answer}"
 
         # 3. Model tier routing
         try:
@@ -305,11 +340,13 @@ class DeveloperAgent:
         skill_guidance = "\n".join(f"Selected skill {name}:\n{content}" for name, content in self.active_skills.items())
         self.messages[0] = {"role": "system", "content": self.system_prompt + "\nWorkspace: " + str(self.workspace_root)
                             + "\nOperating mode: " + domain_res.mode.value + ". " + DOMAIN_GUIDANCE[domain_res.mode]
+                            + "\nUse read_file(symbol=...) for focused Python code. For mathematics and science, run deterministic calculations and verify proposed roots before claiming exactness."
+                            + ("\nUser preferences:\n" + preference_guidance if preference_guidance else "")
                             + ("\n" + skill_guidance if skill_guidance else "")}
         domain_tool_names = {
             DomainMode.CODING: set(self.tools) - {"check_convergence"},
             DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "run_bash", "calculate", "ask_user"},
-            DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "ask_user"},
+            DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "ask_user"},
             DomainMode.AUDIT: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user"},
         }[domain_res.mode]
         if self.safety_profile == "turbo":
@@ -321,8 +358,11 @@ class DeveloperAgent:
         final_answer = ""
         completed = False
         execution_attempts: List[ExecutionAttempt] = []
+        cache_dependencies: dict[str, str] = {}
+        cache_eligible = _cacheable_read_request(original_input)
         unresolved_failures: set[str] = set()
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        cached_tokens = 0
 
         while step < max_steps:
             step += 1
@@ -339,6 +379,7 @@ class DeveloperAgent:
             )
             for token_type in usage:
                 usage[token_type] += int((llm_resp.usage or {}).get(token_type, 0) or 0)
+            cached_tokens += int((llm_resp.usage or {}).get("cached_tokens", 0) or 0)
             if llm_resp.finish_reason == "error":
                 yield AgentEvent("llm_error", {"message": llm_resp.content or "Unknown model error", "model": selected_model})
                 final_answer = llm_resp.content or "Model request failed"
@@ -401,12 +442,17 @@ class DeveloperAgent:
                         tool_res = ToolResult(success=False, output="", error=f"Tool error: {type(exc).__name__}: {exc}")
                 else:
                     tool_res = ToolResult(success=False, output="", error=f"Tool `{tc.name}` is unavailable in {domain_res.mode.value} mode")
-                if tool_res.success and tc.name in ("write_file", "edit_file") and str(tc.arguments.get("path", "")).endswith(".py"):
+                if tc.name != "read_file" or not tool_res.success:
+                    cache_eligible = False
+                elif tool_res.success:
                     try:
-                        source_path = (tool.workspace_root / tc.arguments["path"]).resolve()
-                        ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-                    except (SyntaxError, OSError) as exc:
-                        tool_res = ToolResult(success=False, output=tool_res.output, error=f"SyntaxError: Python AST validation failed: {exc}")
+                        path = (self.workspace_root / str(tc.arguments["path"])).resolve()
+                        if not path.is_relative_to(self.workspace_root) or not path.is_file():
+                            cache_eligible = False
+                        else:
+                            cache_dependencies[str(path.relative_to(self.workspace_root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    except (KeyError, OSError, ValueError):
+                        cache_eligible = False
                 if tool_res.success and domain_res.mode == DomainMode.RESEARCH and tc.name == "web_search":
                     urls = (tool_res.metadata.get("source_urls") or []) if tool_res.metadata else []
                     if not any(isinstance(url, str) and url.startswith(("https://", "http://")) for url in urls):
@@ -416,6 +462,14 @@ class DeveloperAgent:
                 shown_output = tool_res.output
                 if len(shown_output) > 20_000:
                     shown_output = shown_output[:20_000] + "\n… output truncated at 20,000 characters; request a narrower read."
+                model_output = tool_res.output
+                if tc.name == "search_files" and tool_res.success:
+                    model_output = rank_search_results(model_output, original_input,
+                        getattr(self.classifier_backend, "engine", None)
+                        if self.classifier_backend.name == "semif" else None)
+                model_output = compact_tool_output(tc.name, model_output)
+                model_error = compact_tool_output(tc.name, tool_res.error or "", limit=600)
+                estimated_saved = max(0, (len(tool_res.output) - len(model_output)) // 4)
 
                 yield AgentEvent(
                     event_type="tool_result",
@@ -423,8 +477,10 @@ class DeveloperAgent:
                         "name": tc.name,
                         "success": tool_res.success,
                         "output": shown_output,
-                        "error": tool_res.error,
+                        "error": (tool_res.error or "")[:4000] or None,
                         "time_ms": round(t_elapsed_ms, 2),
+                        "context_chars": len(model_output), "raw_chars": len(tool_res.output),
+                        "saved_tokens_estimate": estimated_saved,
                     },
                 )
 
@@ -432,14 +488,14 @@ class DeveloperAgent:
                 yield AgentEvent("agent_stage", {"stage": "verifying", "step": step, "tool": tc.name})
                 try:
                     verification_prediction = self.classifier_backend.classify(
-                        f"Tool: {tc.name}\nSuccess: {tool_res.success}\nError: {tool_res.error or ''}\nOutput: {shown_output}",
+                        f"Tool: {tc.name}\nSuccess: {tool_res.success}\nError: {model_error}\nOutput: {model_output}",
                         VERIFICATION_LABELS)
                 except Exception as exc:
                     yield AgentEvent("classifier_error", {"backend": self.classifier_backend.name,
                                                             "error": f"Verification: {exc}"})
                     self.classifier_backend = self.fallback_classifier
                     verification_prediction = self.fallback_classifier.classify(
-                        f"Tool: {tc.name}\nSuccess: {tool_res.success}\nError: {tool_res.error or ''}\nOutput: {shown_output}",
+                        f"Tool: {tc.name}\nSuccess: {tool_res.success}\nError: {model_error}\nOutput: {model_output}",
                         VERIFICATION_LABELS)
                     yield AgentEvent("classifier_fallback", {"backend": self.fallback_classifier.name,
                                                                "model": self.fallback_classifier.model})
@@ -480,12 +536,19 @@ class DeveloperAgent:
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "name": tc.name,
-                        "content": shown_output if tool_res.success else
-                                   f"ERROR: {tool_res.error or 'Tool failed'}\n{shown_output}",
+                        "content": model_output if tool_res.success else
+                                   f"ERROR: {model_error or 'Tool failed'}\n{model_output}",
                     }
                 )
 
         total_wall_ms = (time.perf_counter() - start_time) * 1000.0
+        if self.repository is not None and completed and cache_eligible and cache_dependencies and final_answer:
+            try:
+                self.repository.save_solution(original_input, str(self.workspace_root), settings_key,
+                                              final_answer, cache_dependencies,
+                                              usage["prompt_tokens"] + usage["completion_tokens"])
+            except Exception as exc:
+                yield AgentEvent("storage_error", {"error": f"Could not save solution cache: {exc}"})
 
         # Emit completion
         yield AgentEvent(
@@ -496,6 +559,7 @@ class DeveloperAgent:
                 "steps": step,
                 "success": completed,
                 "usage": usage,
+                "cached_tokens": cached_tokens,
             },
         )
 

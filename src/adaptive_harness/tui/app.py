@@ -170,6 +170,8 @@ class AdaptiveHarnessApp(App):
         self._quit_when_finished = False
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self._tokens_saved_estimate = 0
+        self._cached_tokens = 0
         self._has_focus = True
         self._bell_rung = False
 
@@ -180,6 +182,7 @@ class AdaptiveHarnessApp(App):
             clarification_callback=self._request_interactive_clarification,
             workspace_root=self.workspace_root,
             explicit_model=default_model,
+            preferences_dir=config_dir,
             forced_mode=initial_mode,
             forced_thinking=initial_thinking,
             safety_profile=safety or self._default_safety,
@@ -227,7 +230,10 @@ class AdaptiveHarnessApp(App):
             domain_selection="forced" if self.agent.forced_mode else "auto",
             thinking_level=self.agent.forced_thinking.value if self.agent.forced_thinking else "—",
             thinking_tokens=BUDGET_TOKENS[self.agent.forced_thinking] if self.agent.forced_thinking else 0,
-            thinking_selection="forced" if self.agent.forced_thinking else "auto")
+            thinking_selection="forced" if self.agent.forced_thinking else "auto",
+            tokens_saved_estimate=self._tokens_saved_estimate,
+            provider_cached_tokens=self._cached_tokens,
+            provider_prompt_tokens=self.prompt_tokens)
         log.write("[bold cyan]Welcome to Adaptive Agent Harness 2.0![/bold cyan]")
         log.write(
             "[dim]Autonomous coding agent with pervasive ML routing, active verification, and interactive clarification.[/dim]\n"
@@ -294,7 +300,9 @@ class AdaptiveHarnessApp(App):
                                  "thinking": self.agent.forced_thinking.value if self.agent.forced_thinking else "auto",
                                  "safety": self.agent.safety_profile,
                                  "prompt_tokens": str(self.prompt_tokens),
-                                 "completion_tokens": str(self.completion_tokens)}
+                                 "completion_tokens": str(self.completion_tokens),
+                                 "estimated_tokens_saved": str(self._tokens_saved_estimate),
+                                 "cached_tokens": str(self._cached_tokens)}
         self.session_store.save(self.session)
 
     def _restore_session(self, *, preserve_cli_overrides: bool = False) -> None:
@@ -321,9 +329,12 @@ class AdaptiveHarnessApp(App):
                                      else settings.get("safety", self._default_safety))
         if self.agent.safety_profile not in {"turbo", "cautious"}:
             self.agent.safety_profile = "turbo"
-        for field in ("prompt_tokens", "completion_tokens"):
+        for field, setting in (("prompt_tokens", "prompt_tokens"),
+                               ("completion_tokens", "completion_tokens"),
+                               ("_tokens_saved_estimate", "estimated_tokens_saved"),
+                               ("_cached_tokens", "cached_tokens")):
             try:
-                setattr(self, field, max(0, int(settings.get(field, "0"))))
+                setattr(self, field, max(0, int(settings.get(setting, "0"))))
             except (ValueError, TypeError):
                 setattr(self, field, 0)
         self.classifier_endpoint = settings.get("classifier_endpoint") or None
@@ -495,7 +506,10 @@ class AdaptiveHarnessApp(App):
             domain_selection="forced" if self.agent.forced_mode else "auto",
             thinking_level=self.agent.forced_thinking.value if self.agent.forced_thinking else "—",
             thinking_tokens=BUDGET_TOKENS[self.agent.forced_thinking] if self.agent.forced_thinking else 0,
-            thinking_selection="forced" if self.agent.forced_thinking else "auto")
+            thinking_selection="forced" if self.agent.forced_thinking else "auto",
+            tokens_saved_estimate=self._tokens_saved_estimate,
+            provider_cached_tokens=self._cached_tokens,
+            provider_prompt_tokens=self.prompt_tokens)
         log.clear()
         log.write(Text(f"Loaded session {saved.id}: {saved.title} ({len(saved.messages)} messages)", style="green"))
         self._render_session_messages(log)
@@ -560,6 +574,8 @@ class AdaptiveHarnessApp(App):
         self._last_tool_output = ""
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self._tokens_saved_estimate = 0
+        self._cached_tokens = 0
         self._activity = "Ready"
         telemetry = self.query_one("#telemetry", ClassifierTelemetryWidget)
         telemetry.reset_telemetry(classifier_engine=self.agent.classifier_backend.name,
@@ -653,6 +669,7 @@ class AdaptiveHarnessApp(App):
         self._busy = True
         self._activity = "Classifying task"
         self._last_agent_content = ""
+        self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(memory_resolution=False)
         self._refresh_status()
         self._bell_rung = False
         self.execute_agent_task(text)
@@ -1027,6 +1044,8 @@ class AdaptiveHarnessApp(App):
                 preview = arguments[:400] + ("… Use /output after completion." if len(arguments) > 400 else "")
                 log.write(Text(f"⚡ {p['name']}  {preview}", style="yellow"))
         elif et == "tool_result":
+                self._tokens_saved_estimate += p.get("saved_tokens_estimate", 0)
+                telemetry.update_telemetry(tokens_saved_estimate=self._tokens_saved_estimate)
                 status_color = "green" if p["success"] else "red"
                 log.write(Text(f"Result ({p['time_ms']} ms) · {p['name']}", style=status_color))
                 output = p["output"] or ""
@@ -1055,6 +1074,9 @@ class AdaptiveHarnessApp(App):
                 usage = p.get("usage") or {}
                 self.prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
                 self.completion_tokens += int(usage.get("completion_tokens", 0) or 0)
+                self._cached_tokens += int(p.get("cached_tokens", 0) or 0)
+                telemetry.update_telemetry(provider_cached_tokens=self._cached_tokens,
+                                           provider_prompt_tokens=self.prompt_tokens)
                 status = "✓ Task completed" if p["success"] else "Task stopped before completion"
                 log.write(Text(f"\n{status} in {p['total_time_ms']} ms ({p['steps']} steps)\n",
                                style="bold green" if p["success"] else "bold yellow"))
@@ -1062,3 +1084,12 @@ class AdaptiveHarnessApp(App):
                     self.bell()
                     self._bell_rung = True
                 self._refresh_status()
+        elif et == "memory_hit":
+                self._activity = "Verified memory · 0 API tokens"
+                telemetry.update_telemetry(probabilities={key: 0.0 for key in telemetry.probabilities},
+                    entropy=0.0, margin=0.0, risk_level="idle", tier="memory", model="Local verified cache",
+                    domain_mode="—", thinking_level="—", thinking_tokens=0, memory_resolution=True)
+                log.write(Text("⚡ Verified memory answer reused; no model request.", style="bold green"))
+                self._refresh_status()
+        elif et == "clarification_memory_hit":
+                log.write(Text("Using a saved preference for this question.", style="cyan"))

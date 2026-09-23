@@ -26,6 +26,12 @@ Thinking levels are `none` (0), `low` (about 1k), `medium` (about 4k), and `deep
 
 The default interaction profile is `turbo`: the agent proceeds through ordinary uncertainty without opening a question, while destructive operations and requests with no identifiable target still pause. Set `--safety cautious` or `/safety cautious` to allow semantic uncertainty to trigger a question; `/safety turbo` restores the default. The TUI status line pulses while classifying, waiting for a model response, running a tool, or verifying output. “Thinking / generating” denotes an in-flight non-streaming model request, not a live view of private reasoning tokens.
 
+Context reduction is automatic. `read_file` accepts `symbol="Class.method"` to return a Python AST slice and module imports; an unbounded read of a large file returns its first 120 lines and asks the agent to narrow the next read. Long tool outputs are cleaned of terminal controls, repeated lines are collapsed, and pytest failures retain assertions and traceback evidence before the next model call. Search results spanning many files are locally ranked to three representative files, using SemIf when active. The sidebar shows an **estimated** token reduction from compacted tool text and the provider's **reported** cached prompt tokens. Actual savings depend on the task and provider; no fixed percentage is assumed.
+
+Science mode exposes `run_python_repl` and `verify_equation`. The REPL preloads `math`, NumPy, SciPy, and SymPy inside a Bubblewrap sandbox with no network or workspace mount; it fails closed if Bubblewrap is unavailable. State resets per call. `verify_equation` uses a restricted expression grammar and exact SymPy substitution, including checks for invalid denominators. NumPy floating-point operations remain approximate. Python writes and edits are AST-checked *before* the file changes.
+
+Successful read-file tasks can be reused from SQLite without another model request when the prompt and settings match and every read source still has the same SHA-256 hash. The fast path does not reuse writes, shell commands, tests, or network results. Reusable non-destructive clarification answers are saved privately in `~/.config/adaptive-harness/preferences.json` and applied to the same question on later runs. Destructive approvals, one-time task targets, and credential questions are never remembered. OpenRouter Claude requests opt into automatic prompt caching; the displayed cache counter uses usage data actually returned by the provider. [OpenRouter documents the cache behavior and provider-routing trade-off](https://openrouter.ai/docs/guides/best-practices/prompt-caching).
+
 Clarification opens for detected destructive operations or a genuinely missing task target. Numeric keys 1–9 select options, arrows navigate, Enter confirms, Tab reaches the custom instruction field, and Escape cancels. Long text wraps in a scrollable card, and empty custom input cannot approve an action. Entropy and requests for the agent's design judgment do not pause the task. F2 opens a live theme preview; F3 toggles telemetry on wide terminals. `/output` shows the last tool result up to the 20,000-character output limit.
 
 The TUI stores `/key` credentials in `~/.config/adaptive-harness/config.json` with mode `0600`; key priority is `--key`, `OPENROUTER_API_KEY`, saved key, then offline mock. `/key status` shows the source and a masked value, and `/key clear` removes the saved key and switches the current TUI to mock mode. The prompt input recalls the last 500 task prompts with Up/Down, restoring an unfinished draft when you return to the bottom; slash commands are excluded from `prompt_history.txt`. `/new` or Ctrl+N starts a clean session, while `/reset` clears the current one. `/theme` previews built-in themes on hover or arrow focus; Enter saves and Escape restores the old theme. `/export markdown|json` writes the session transcript and tool calls/results to the workspace's `output/sessions/` folder. The header shows provider and token totals; scrolling up pins the chat log until you return to the bottom.
@@ -156,13 +162,15 @@ adaptive-harness tui --key sk-or-v1-xxxxxxxxxxxxxxxxx
 The agent is equipped with a workspace-scoped developer toolbelt (`src/adaptive_harness/tools/`):
 
 - **`RunBashTool` (`run_bash`)**: Executes workspace commands with timeouts, output capture, virtualenv path resolution, and dangerous command safety filtering (blocks `rm -rf /`, fork bombs, etc.).
-- **`ReadFileTool` (`read_file`)**: Reads workspace files with line numbering and optional `start_line` / `end_line` slicing.
-- **`WriteFileTool` (`write_file`)**: Writes new files or overwrites existing files, creating parent directories on demand.
-- **`EditFileTool` (`edit_file`)**: Surgically finds and replaces unique blocks of code in an existing file and produces unified diffs (`difflib`).
+- **`ReadFileTool` (`read_file`)**: Reads workspace files with line numbering, line bounds, or a Python `symbol` slice.
+- **`WriteFileTool` (`write_file`)**: Writes new files or overwrites existing files, checking Python syntax before changing them.
+- **`EditFileTool` (`edit_file`)**: Replaces unique code blocks, checks Python syntax before saving, and produces unified diffs.
 - **`ListDirectoryTool` (`list_directory`)**: Lists directory contents with sizes and folder indicators, filtering out hidden noise.
 - **`SearchFilesTool` (`search_files`)**: Recursive regex grep across workspace files with extension filtering.
 - **`RunPytestTool` (`run_pytest`)**: Executes pytest suites, parses structured passed/failed counts, and extracts failure stack traces.
 - **`AskUserTool` (`ask_user`)**: Prompts the developer in the middle of development with multiple-choice buttons or free-text answers.
+- **`RunPythonReplTool` (`run_python_repl`)**: Runs scientific Python inside a restricted Bubblewrap process with no network or workspace mount.
+- **`VerifyEquationTool` (`verify_equation`)**: Checks exact SymPy substitution and denominator validity for a proposed root.
 
 ---
 

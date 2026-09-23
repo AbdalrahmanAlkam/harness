@@ -107,6 +107,11 @@ class LLMClient:
                     kwargs["extra_body"] = {"reasoning": {"effort": reasoning_effort}}
                 kwargs.pop("temperature", None)
 
+        # OpenRouter advances Anthropic's cache breakpoint as the conversation grows.
+        # Other providers handle compatible prompt prefixes implicitly.
+        if is_openrouter and model_name.startswith("anthropic/claude"):
+            kwargs.setdefault("extra_body", {})["cache_control"] = {"type": "ephemeral"}
+
         try:
             assert self._openai_client is not None
             response = self._openai_client.chat.completions.create(**kwargs)
@@ -134,6 +139,11 @@ class LLMClient:
                 "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
                 "completion_tokens": response.usage.completion_tokens if response.usage else 0,
             }
+            if response.usage:
+                details = getattr(response.usage, "prompt_tokens_details", None)
+                usage_dict["cached_tokens"] = int(
+                    getattr(details, "cached_tokens", None) or
+                    getattr(response.usage, "cache_read_input_tokens", None) or 0)
 
             return LLMResponse(
                 content=msg.content,

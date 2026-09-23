@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,6 +56,51 @@ class ExperienceRepository:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_verified_strategy ON executions(verified_strategy);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_harness_success ON executions(harness_success);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON executions(created_at);")
+            conn.execute("""CREATE TABLE IF NOT EXISTS solution_cache (
+                task_key TEXT NOT NULL, workspace TEXT NOT NULL, settings_key TEXT NOT NULL,
+                answer TEXT NOT NULL, dependencies_json TEXT NOT NULL,
+                original_tokens INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (task_key, workspace, settings_key))""")
+
+    @staticmethod
+    def _task_key(task: str) -> str:
+        return " ".join(task.casefold().split())
+
+    def lookup_solution(self, task: str, workspace: str, settings_key: str) -> dict | None:
+        """Return a verified answer only while all recorded file inputs are unchanged."""
+        root = Path(workspace).resolve()
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT answer, dependencies_json, original_tokens FROM solution_cache "
+                               "WHERE task_key=? AND workspace=? AND settings_key=?",
+                               (self._task_key(task), str(root), settings_key)).fetchone()
+        if row is None:
+            return None
+        try:
+            dependencies = json.loads(row["dependencies_json"])
+            if not dependencies:
+                return None
+            for relative_path, expected_hash in dependencies.items():
+                path = (root / relative_path).resolve()
+                if not path.is_relative_to(root) or not path.is_file():
+                    return None
+                if hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
+                    return None
+            return {"answer": row["answer"], "original_tokens": row["original_tokens"]}
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def save_solution(self, task: str, workspace: str, settings_key: str, answer: str,
+                      dependencies: dict[str, str], original_tokens: int) -> None:
+        if not dependencies or not answer.strip():
+            return
+        with self._get_connection() as conn:
+            conn.execute("""INSERT INTO solution_cache
+                (task_key, workspace, settings_key, answer, dependencies_json, original_tokens)
+                VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(task_key, workspace, settings_key)
+                DO UPDATE SET answer=excluded.answer, dependencies_json=excluded.dependencies_json,
+                original_tokens=excluded.original_tokens, created_at=CURRENT_TIMESTAMP""",
+                (self._task_key(task), str(Path(workspace).resolve()), settings_key, answer,
+                 json.dumps(dependencies), max(0, original_tokens)))
 
     def record_trace(self, trace: ExecutionTrace) -> int:
         """Persists a complete execution trace to SQLite."""
@@ -179,3 +225,4 @@ class ExperienceRepository:
         """Wipes the database tables for testing or resetting."""
         with self._get_connection() as conn:
             conn.execute("DELETE FROM executions;")
+            conn.execute("DELETE FROM solution_cache;")

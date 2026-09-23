@@ -64,6 +64,10 @@ class ClassifierTelemetryWidget(Static):
         self.thinking_level: str = "—"
         self.thinking_tokens: int = 0
         self.thinking_selection: str = "auto"
+        self.tokens_saved_estimate = 0
+        self.provider_cached_tokens = 0
+        self.provider_prompt_tokens = 0
+        self.memory_resolution = False
 
     def reset_telemetry(self, *, classifier_engine: str | None = None,
                         classifier_model: str | None = None, model: str | None = None,
@@ -80,6 +84,10 @@ class ClassifierTelemetryWidget(Static):
         self.thinking_level = "—"
         self.thinking_tokens = 0
         self.thinking_selection = "auto"
+        self.tokens_saved_estimate = 0
+        self.provider_cached_tokens = 0
+        self.provider_prompt_tokens = 0
+        self.memory_resolution = False
         if classifier_engine is not None:
             self.classifier_engine = classifier_engine
         if classifier_model is not None:
@@ -108,6 +116,10 @@ class ClassifierTelemetryWidget(Static):
         thinking_level: Optional[str] = None,
         thinking_tokens: Optional[int] = None,
         thinking_selection: Optional[str] = None,
+        tokens_saved_estimate: Optional[int] = None,
+        provider_cached_tokens: Optional[int] = None,
+        provider_prompt_tokens: Optional[int] = None,
+        memory_resolution: Optional[bool] = None,
     ) -> None:
         if probabilities is not None:
             self.probabilities = probabilities
@@ -127,7 +139,11 @@ class ClassifierTelemetryWidget(Static):
                            ("classifier_model", classifier_model), ("classifier_latency_ms", classifier_latency_ms),
                            ("domain_mode", domain_mode), ("domain_selection", domain_selection),
                            ("thinking_level", thinking_level), ("thinking_tokens", thinking_tokens),
-                           ("thinking_selection", thinking_selection)):
+                           ("thinking_selection", thinking_selection),
+                           ("tokens_saved_estimate", tokens_saved_estimate),
+                           ("provider_cached_tokens", provider_cached_tokens),
+                           ("provider_prompt_tokens", provider_prompt_tokens),
+                           ("memory_resolution", memory_resolution)):
             if value is not None:
                 setattr(self, key, value)
 
@@ -160,6 +176,12 @@ class ClassifierTelemetryWidget(Static):
         status.append(f"H(p)  {self.entropy:.3f} bits   Margin  {self.margin*100:.1f}%\n", style="cyan")
         risk_style = "cyan" if self.risk_level == "idle" else "green" if self.risk_level == "low" else "yellow" if self.risk_level == "medium" else "bold red"
         status.append(f"Risk  {self.risk_level.upper()}", style=risk_style)
+        status.append(f"\nContext saved: ~{self.tokens_saved_estimate:,} tokens", style="bold green")
+        cache_pct = (self.provider_cached_tokens / self.provider_prompt_tokens * 100
+                     if self.provider_prompt_tokens else 0)
+        status.append(f"\nProvider cache: {self.provider_cached_tokens:,} tokens ({cache_pct:.0f}%)", style="cyan")
+        if self.memory_resolution:
+            status.append("\nResolution: ⚡ Verified memory (0 API tokens)", style="bold green")
 
         bars_table = Table(box=None, show_header=False, expand=False, padding=(0, 1))
         bars_table.add_column("Skill", width=21, no_wrap=True)
