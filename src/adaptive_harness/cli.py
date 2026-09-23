@@ -271,6 +271,8 @@ def dev(
             console.print(f"  [dim]◦ {escape(label)}[/dim]")
         elif et == "llm_error":
             console.print(f"[red]Model error: {escape(p['message'])}[/red]")
+        elif et == "llm_notice":
+            console.print(f"[yellow]{escape(p['message'])}[/yellow]")
         elif et == "storage_error":
             console.print(f"[yellow]{escape(p['error'])}[/yellow]")
         elif et == "thought":

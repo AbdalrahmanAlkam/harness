@@ -51,6 +51,40 @@ def test_live_failure_is_redacted_and_switches_offline():
     assert not response.tool_calls
 
 
+def test_reasoning_parameter_rejection_retries_same_model_without_thinking():
+    client = LLMClient(api_key="test-key")
+    requests = []
+    def create(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            error = ValueError("Unsupported reasoning effort parameter")
+            error.status_code = 400
+            raise error
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="answer", tool_calls=None),
+            finish_reason="stop")], usage=None, model=kwargs["model"])
+    client._openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    response = client.complete([{"role": "user", "content": "solve"}], model="anthropic/claude-3.7-sonnet",
+        reasoning_effort="high", reasoning_budget_tokens=16000)
+    assert response.content == "answer"
+    assert response.metadata["thinking_fallback"] is True
+    assert len(requests) == 2
+    assert requests[0]["model"] == requests[1]["model"] == "anthropic/claude-3.7-sonnet"
+    assert "reasoning" not in requests[1].get("extra_body", {})
+    assert requests[1]["temperature"] == 0.2
+
+
+@pytest.mark.anyio
+async def test_copy_shortcut_copies_latest_agent_output(tmp_path, monkeypatch):
+    app = AdaptiveHarnessApp(workspace_root=str(tmp_path), db_path=tmp_path / "ui.db", config_dir=tmp_path / "prefs")
+    copied = []
+    monkeypatch.setattr(app, "copy_to_clipboard", copied.append)
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        app._last_agent_content = "Useful answer with exact result."
+        app._handle_slash_command("/copy")
+        assert copied == ["Useful answer with exact result."]
+
+
 def test_semantic_routing_does_not_require_keyword_overlap_and_can_chain():
     def decide(context, options):
         return SimpleNamespace(probabilities={name: (0.48 if name == "refactor_clean_code" else

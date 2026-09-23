@@ -6,6 +6,8 @@ For a headless run, use `adaptive-harness dev "inspect the tests"`. Add `--model
 
 For a guaranteed no-network walkthrough, run `adaptive-harness dev --offline "check status"`. This uses the mock engine even if a live key is configured. For shell or test tools, timeouts terminate the full child process group, and captured stdout or stderr is capped at 200 KB.
 
+Copy an agent reply with `/copy` or Ctrl+Shift+C. Drag-select a passage in the chat log first to copy only that selection. If the provider rejects a thinking setting, the harness retries once with the same model and its default reasoning behavior.
+
 To use a local OpenAI-compatible server for the main task model, pass `--base-url http://localhost:8080/v1 --model YOUR_LOCAL_MODEL`. This is independent of `--classifier-backend`, which controls the smaller decision engine.
 
 For local semantic routing, install `pip install '.[semif]'` and download a checkpoint into the Hugging Face cache with `hf download Qwen/Qwen2.5-3B-Instruct`. Then use `adaptive-harness tui --classifier-engine semif --semif-model Qwen/Qwen2.5-3B-Instruct --semif-device auto`. SemIf evaluates its typed candidate branches directly from one next-token logit pass and does not generate classification text. The automatic engine choice selects SemIf only when its optional packages and checkpoint are already cached; otherwise it uses sklearn. Explicit SemIf selection also falls back to sklearn with a visible notice if weights cannot load. `--semif-4bit` enables CUDA quantization when bitsandbytes is installed, and `--semif-temperature` adjusts probability sharpness. In the TUI, `/classifier semif [model_path]` selects it and `/classifier sklearn` switches back.

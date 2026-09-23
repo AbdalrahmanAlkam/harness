@@ -20,6 +20,7 @@ class LLMResponse(BaseModel):
     model: str = "mock-developer-agent"
     finish_reason: str = "stop"
     usage: Dict[str, int] = Field(default_factory=lambda: {"prompt_tokens": 100, "completion_tokens": 50})
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class MockLLMClient:

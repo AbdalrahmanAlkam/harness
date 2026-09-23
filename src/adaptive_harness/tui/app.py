@@ -33,7 +33,7 @@ from adaptive_harness.tui.widgets import (ClarificationModal, ClassifierTelemetr
 
 COMMANDS = ("/key", "/model", "/models", "/tier", "/mode", "/thinking", "/safety", "/theme", "/classifier", "/new",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions",
-            "/session", "/skills", "/skill", "/output", "/export")
+            "/session", "/skills", "/skill", "/output", "/copy", "/export")
 
 
 class AdaptiveHarnessApp(App):
@@ -85,6 +85,7 @@ class AdaptiveHarnessApp(App):
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+l", "clear_screen", "Clear Log"),
+        ("ctrl+shift+c", "copy_output", "Copy Output"),
         ("ctrl+n", "new_session", "New Session"),
         ("f1", "show_help", "Help"),
         ("f2", "choose_theme", "Theme"),
@@ -403,6 +404,19 @@ class AdaptiveHarnessApp(App):
         log.clear()
         log._set_pinned(False)
 
+    def action_copy_output(self) -> None:
+        selected = self.screen.get_selected_text()
+        content = selected.strip() if selected and selected.strip() else self._last_agent_content
+        if not content:
+            self.query_one("#chat-log", RichLog).write(Text("No agent output to copy yet.", style="yellow"))
+            return
+        try:
+            self.copy_to_clipboard(content)
+            self.query_one("#chat-log", RichLog).write(Text("✓ Selected text copied." if selected else
+                "✓ Latest agent response copied. Select chat text with the mouse to copy a passage.", style="green"))
+        except Exception as exc:
+            self.query_one("#chat-log", RichLog).write(Text(f"Clipboard unavailable: {exc}", style="yellow"))
+
     def action_quit(self) -> None:
         if self._busy and not self._quit_when_finished:
             self._quit_when_finished = True
@@ -624,6 +638,8 @@ class AdaptiveHarnessApp(App):
         log.write("  /model [MODEL_ID]      - Browse models (F4) or set one directly")
         log.write("  /models                - Search live OpenRouter catalog")
         log.write("  /tier <fast|standard|reasoning> - Force model tier")
+        log.write("  /copy                   - Copy selected chat text or latest agent reply")
+        log.write("  Ctrl+Shift+C            - Copy selected chat text or latest agent reply")
         log.write("  /mode <coding|research|science|security|auto> - Set operational mode")
         log.write("  /thinking <none|low|medium|deep|auto> - Set reasoning budget")
         log.write("  /safety <turbo|cautious> - Control ordinary ambiguity prompts (default: turbo)")
@@ -905,6 +921,8 @@ class AdaptiveHarnessApp(App):
                 log.write(Text(self._last_tool_output))
             else:
                 log.write(Text("No tool result yet.", style="yellow"))
+        elif cmd == "/copy":
+            self.action_copy_output()
         else:
             log.write(Text(f"Unknown command: {cmd}. Type /help for options.", style="red"))
 
@@ -1048,6 +1066,8 @@ class AdaptiveHarnessApp(App):
                 self._refresh_status()
         elif et == "llm_error":
                 log.write(Text(p["message"], style="bold red"))
+        elif et == "llm_notice":
+                log.write(Text(p["message"], style="yellow"))
         elif et == "storage_error":
                 log.write(Text(p["error"], style="yellow"))
         elif et == "thought":
@@ -1082,6 +1102,7 @@ class AdaptiveHarnessApp(App):
                 log.write(Text(f"Verification: {p['status']} → {p['action']}", style="green" if p["status"] == "SUCCESS" else "red"))
         elif et == "response":
                 if p.get("content") and p["content"] != self._last_agent_content:
+                    self._last_agent_content = p["content"]
                     log.write(Text("\nAgent:", style="bold magenta"))
                     log.write(Markdown(p["content"]))
                 elif not p.get("content") and not p["success"]:

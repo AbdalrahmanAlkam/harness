@@ -116,7 +116,29 @@ class LLMClient:
 
         try:
             assert self._openai_client is not None
-            response = self._openai_client.chat.completions.create(**kwargs)
+            thinking_fallback = False
+            try:
+                response = self._openai_client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                detail = str(exc).lower()
+                status = getattr(exc, "status_code", None)
+                reasoning_rejected = status in {400, 422} and any(
+                    token in detail for token in ("reasoning", "max_tokens", "effort", "unsupported parameter"))
+                if not reasoning_rejected or "reasoning" not in kwargs.get("extra_body", {}):
+                    raise
+                # Keep the chosen model and request intact; retry once with the
+                # provider's default thinking behavior after a parameter rejection.
+                fallback_kwargs = dict(kwargs)
+                extra_body = dict(fallback_kwargs.get("extra_body") or {})
+                extra_body.pop("reasoning", None)
+                if extra_body:
+                    fallback_kwargs["extra_body"] = extra_body
+                else:
+                    fallback_kwargs.pop("extra_body", None)
+                fallback_kwargs.pop("max_completion_tokens", None)
+                fallback_kwargs["temperature"] = temperature
+                response = self._openai_client.chat.completions.create(**fallback_kwargs)
+                thinking_fallback = True
             choice = response.choices[0]
             msg = choice.message
 
@@ -153,6 +175,7 @@ class LLMClient:
                 model=response.model or selected_model,
                 finish_reason=choice.finish_reason or "stop",
                 usage=usage_dict,
+                metadata={"thinking_fallback": thinking_fallback},
             )
 
         except Exception as e:

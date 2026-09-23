@@ -417,6 +417,9 @@ class DeveloperAgent:
             for token_type in usage:
                 usage[token_type] += int((llm_resp.usage or {}).get(token_type, 0) or 0)
             cached_tokens += int((llm_resp.usage or {}).get("cached_tokens", 0) or 0)
+            if (llm_resp.metadata or {}).get("thinking_fallback"):
+                yield AgentEvent("llm_notice", {"message":
+                    "The provider rejected the requested thinking settings; this request was retried with its default reasoning behavior."})
             if llm_resp.finish_reason == "error":
                 yield AgentEvent("llm_error", {"message": llm_resp.content or "Unknown model error", "model": selected_model})
                 final_answer = llm_resp.content or "Model request failed"

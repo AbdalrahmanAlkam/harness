@@ -264,6 +264,8 @@ class HistoryInput(Input):
 class PinnedRichLog(RichLog):
     """A log that stops following output while the reader scrolls upward."""
 
+    ALLOW_SELECT = True
+
     class PinChanged(Message):
         def __init__(self, pinned: bool):
             super().__init__()
