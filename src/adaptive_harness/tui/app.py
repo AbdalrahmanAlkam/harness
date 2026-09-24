@@ -26,15 +26,17 @@ from adaptive_harness.classifiers.domain_classifier import parse_domain_mode
 from adaptive_harness.classifiers.thinking_classifier import parse_thinking_level, BUDGET_TOKENS
 from adaptive_harness.data.storage import ExperienceRepository
 from adaptive_harness.data.config import ConfigManager, PromptHistoryStore
+from adaptive_harness.data.credentials import CredentialsManager
 from adaptive_harness.data.sessions import SessionStore
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
+from adaptive_harness.llm.providers import PROVIDERS, PROVIDER_TIERS, provider_for_url
 from adaptive_harness.llm.catalog import CatalogModel, fetch_models
 from adaptive_harness.tui.widgets import (ClarificationModal, ClassifierTelemetryWidget,
     HistoryInput, PinnedRichLog, ThemePickerModal, QuickSelectModal, OutputViewerModal, THEME_CHOICES)
 from adaptive_harness.tui.formatting import format_model_markdown
 
 
-COMMANDS = ("/key", "/model", "/models", "/tier", "/mode", "/thinking", "/safety", "/theme", "/classifier", "/new",
+COMMANDS = ("/key", "/provider", "/model", "/models", "/tier", "/mode", "/thinking", "/safety", "/theme", "/classifier", "/new",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
             "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export")
 
@@ -100,6 +102,8 @@ class AdaptiveHarnessApp(App):
     def __init__(
         self,
         api_key: Optional[str] = None,
+        provider: Optional[str] = None,
+        backup_providers: tuple[str, ...] | None = None,
         base_url: Optional[str] = None,
         default_model: Optional[str] = None,
         db_path: Path | str = "output/experience.db",
@@ -107,6 +111,7 @@ class AdaptiveHarnessApp(App):
         classifier_backend: str = "auto",
         classifier_model: Optional[str] = None,
         classifier_endpoint: Optional[str] = None,
+        overseer_model: Optional[str] = None,
         semif_device: str = "auto",
         semif_4bit: bool = False,
         semif_temperature: float = 1.0,
@@ -120,22 +125,46 @@ class AdaptiveHarnessApp(App):
         super().__init__(**kwargs)
         self.config = ConfigManager(config_dir)
         saved_config = self.config.load()
+        self.credentials = CredentialsManager(config_dir)
+        try:
+            self.provider_keys = self.credentials.load()
+        except (OSError, ValueError, json.JSONDecodeError):
+            self.provider_keys = {}
+        legacy_config_key = saved_config.get("api_key") and "openrouter" not in self.provider_keys
+        if legacy_config_key:
+            # Existing users retain their one-time saved key after the move to
+            # dedicated per-provider credentials.
+            self.provider_keys["openrouter"] = saved_config["api_key"]
+        if provider is not None and provider not in PROVIDERS:
+            raise ValueError(f"Unknown provider: {provider}")
+        self.provider_name = provider or (provider_for_url(base_url) if base_url else
+                                          saved_config.get("provider", "openrouter"))
+        if self.provider_name not in PROVIDERS:
+            self.provider_name = "openrouter"
+        self.backup_providers = tuple(backup_providers or ())
+        if any(name not in PROVIDERS for name in self.backup_providers):
+            raise ValueError("Unknown backup provider")
         self.history_store = PromptHistoryStore(config_dir)
-        env_key = os.environ.get("OPENROUTER_API_KEY")
-        self.api_key = api_key or env_key or saved_config.get("api_key")
+        env_key = os.environ.get(PROVIDERS[self.provider_name].env_key or "")
+        self.api_key = api_key or env_key or self.provider_keys.get(self.provider_name)
+        if api_key:
+            self.provider_keys[self.provider_name] = api_key
         self.key_source = ("CLI flag" if api_key else "environment" if env_key else
-                           "saved configuration" if saved_config.get("api_key") else "offline")
+                           "saved configuration" if legacy_config_key else
+                           "saved credentials" if self.provider_keys.get(self.provider_name) else "offline")
         self.saved_theme = saved_config.get("theme", "textual-dark")
         self.base_url = base_url
         if default_model and default_model.lower() == "auto":
             default_model = None
         self._cli_model_override = default_model
+        self._cli_provider_override = provider
         self.default_model = default_model or MODEL_TIERS["standard"]
         self.db_path = db_path
         self.workspace_root = str(Path(workspace_root or ".").expanduser().resolve())
         if not Path(self.workspace_root).is_dir():
             raise ValueError(f"Workspace directory does not exist: {self.workspace_root}")
         self.classifier_endpoint = classifier_endpoint
+        self.overseer_model = overseer_model
         self.semif_device = semif_device
         self.semif_4bit = semif_4bit
         self.semif_temperature = semif_temperature
@@ -156,7 +185,10 @@ class AdaptiveHarnessApp(App):
             api_key=self.api_key,
             base_url=self.base_url,
             default_model=self.default_model,
-            force_mock=not bool(self.api_key) and not self._local_endpoint(),
+            provider=self.provider_name,
+            provider_keys=self.provider_keys,
+            backup_providers=tuple(name for name in self.backup_providers if name != self.provider_name),
+            force_mock=not bool(self.api_key) and self.provider_name != "local" and not self._local_endpoint(),
         )
         self.repository = ExperienceRepository(self.db_path)
         self.session_store = SessionStore(self.db_path)
@@ -201,6 +233,7 @@ class AdaptiveHarnessApp(App):
             classifier_backend=create_backend(classifier_backend, classifier_model, classifier_endpoint,
                 api_key=self.api_key, device=semif_device, load_in_4bit=semif_4bit,
                 temperature=semif_temperature),
+            overseer_backend=create_backend("onnx", overseer_model) if overseer_model else None,
         )
         if session_id:
             self._restore_session(preserve_cli_overrides=True)
@@ -287,17 +320,19 @@ class AdaptiveHarnessApp(App):
             matches.first().display = self._show_telemetry and self.size.width >= 110
 
     def _refresh_status(self) -> None:
-        model = self.agent.explicit_model or "auto"
         provider = ("🟡 Offline Mock Engine" if self.agent.llm_client.is_mock else
-                    "🟢 OpenRouter" if "openrouter.ai" in self.agent.llm_client.base_url else "🟢 Local/Custom")
+                    f"🟢 {self.agent.llm_client.provider.title()}")
         telemetry = self.query_one("#telemetry", ClassifierTelemetryWidget)
+        model = self.agent.explicit_model or telemetry.active_model or self.agent.llm_client.default_model
         mode = ("SECURITY" if telemetry.domain_mode == "audit" else
                 telemetry.domain_mode.upper() if telemetry.domain_mode != "—" else "AUTO")
         thinking = telemetry.thinking_level.upper() if telemetry.thinking_level != "—" else "AUTO"
         activity = ("● " if self._activity_pulse and self._busy else "◦ ") + self._activity
         token_total = self.prompt_tokens + self.completion_tokens
         cost_display = f"${self._reported_cost_usd:.6f}" if self._cost_reported else "cost n/a"
-        self.sub_title = f"{provider} ({model})  ·  {activity}  ·  {mode} / {thinking}  ·  Tokens:{token_total:,}  ·  {cost_display}"
+        context_label = (f" · Ctx:{telemetry.context_used // 1000}k/{telemetry.context_capacity // 1000}k"
+                         if telemetry.context_capacity else "")
+        self.sub_title = f"{provider} ({model})  ·  {activity}  ·  {mode} / {thinking}{context_label}  ·  Tokens:{token_total:,}  ·  {cost_display}"
         self.query_one("#status-line", Static).update(Text(
             f"{activity}  ·  {provider}  ·  {mode}/{thinking}  ·  Tokens {token_total:,}  ·  {cost_display}  ·  Session {self.session.id}  ·  {self.workspace_root}", style="bold cyan"))
 
@@ -307,6 +342,7 @@ class AdaptiveHarnessApp(App):
         self.session.model = self.agent.explicit_model
         self.session.skills = list(self.agent.active_skills)
         self.session.settings = {"classifier_backend": self.agent.classifier_backend.name,
+                                 "provider": self.agent.llm_client.provider,
                                  "classifier_model": self.agent.classifier_backend.model,
                                  "classifier_endpoint": self.classifier_endpoint or "",
                                  "semif_device": self.semif_device, "semif_4bit": str(self.semif_4bit),
@@ -326,6 +362,20 @@ class AdaptiveHarnessApp(App):
 
     def _restore_session(self, *, preserve_cli_overrides: bool = False) -> None:
         self._session_restore_warning = ""
+        settings = self.session.settings or {}
+        saved_provider = settings.get("provider", self.provider_name)
+        if preserve_cli_overrides and self._cli_provider_override:
+            saved_provider = self._cli_provider_override
+        if saved_provider in PROVIDERS and saved_provider != self.agent.llm_client.provider:
+            self.provider_name = saved_provider
+            env_name = PROVIDERS[saved_provider].env_key
+            self.api_key = os.environ.get(env_name or "") or self.provider_keys.get(saved_provider)
+            self.agent.llm_client = LLMClient(api_key=self.api_key, provider=saved_provider,
+                provider_keys=self.provider_keys,
+                backup_providers=tuple(name for name in self.backup_providers if name != saved_provider),
+                force_mock=not bool(self.api_key) and saved_provider != "local")
+            self.llm_client = self.agent.llm_client
+            self.base_url = self.llm_client.base_url
         self.agent.messages = self.session.messages or [{"role": "system", "content": self.agent.system_prompt}]
         self._last_agent_content = next((str(message.get("content")) for message in reversed(self.agent.messages)
             if message.get("role") == "assistant" and message.get("content") and not message.get("tool_calls")), "")
@@ -334,9 +384,8 @@ class AdaptiveHarnessApp(App):
         if self.agent.explicit_model:
             self.agent.llm_client.default_model = self.agent.explicit_model
         else:
-            self.agent.llm_client.default_model = MODEL_TIERS["standard"]
+            self.agent.llm_client.default_model = PROVIDERS[self.provider_name].default_model
         self.agent.set_workspace(self.session.workspace)
-        settings = self.session.settings or {}
         try:
             self.agent.forced_mode = (self._cli_mode_override if preserve_cli_overrides and self._cli_mode_override
                                       else parse_domain_mode(settings.get("mode", "auto")))
@@ -464,7 +513,7 @@ class AdaptiveHarnessApp(App):
     def _fetch_model_catalog(self, loop: asyncio.AbstractEventLoop) -> None:
         error = ""
         try:
-            models = fetch_models(self.api_key)
+            models = fetch_models(self.api_key) if self.provider_name == "openrouter" else []
         except Exception as exc:
             models = self._model_catalog
             error = f"Model catalog unavailable ({type(exc).__name__}); showing saved choices."
@@ -484,7 +533,9 @@ class AdaptiveHarnessApp(App):
             self._model_catalog = models
         choices = [("auto", "AUTO  ·  route by task complexity")]
         seen = {"auto"}
-        for model_id in [*MODEL_TIERS.values(), self.agent.explicit_model or ""]:
+        provider_models = ([*MODEL_TIERS.values()] if self.provider_name == "openrouter" else
+                           [self.llm_client.get_model_for_tier(tier) for tier in ("fast", "standard", "reasoning")])
+        for model_id in [*provider_models, self.agent.explicit_model or ""]:
             if model_id and model_id not in seen:
                 choices.append((model_id, f"★ {model_id}"))
                 seen.add(model_id)
@@ -496,7 +547,7 @@ class AdaptiveHarnessApp(App):
         def picked(model_id: str | None) -> None:
             if model_id is not None:
                 self._set_model(model_id)
-        self.push_screen(QuickSelectModal("Choose an OpenRouter model", choices,
+        self.push_screen(QuickSelectModal(f"Choose a {self.provider_name.title()} model", choices,
                                           current=self.agent.explicit_model or "auto"), callback=picked)
 
     def _set_model(self, model_id: str) -> None:
@@ -504,12 +555,32 @@ class AdaptiveHarnessApp(App):
         if self.agent.explicit_model:
             self.agent.llm_client.default_model = model_id
         else:
-            self.agent.llm_client.default_model = MODEL_TIERS["standard"]
+            self.agent.llm_client.default_model = PROVIDERS[self.provider_name].default_model
+        selected_catalog = next((item for item in self._model_catalog if item.id == model_id), None)
+        self.agent.context_window_override = selected_catalog.context_length if selected_catalog else None
         self.query_one("#chat-log", RichLog).write(Text(f"✓ Model: {model_id}", style="green"))
         self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
             model=self.agent.explicit_model or self.agent.llm_client.default_model,
             selection="forced" if self.agent.explicit_model else "auto")
         self._save_session()
+        self._refresh_status()
+
+    def _connect_provider(self, provider: str) -> None:
+        self.provider_name = provider
+        env_name = PROVIDERS[provider].env_key
+        self.api_key = (os.environ.get(env_name or "") or self.provider_keys.get(provider))
+        self.key_source = ("environment" if os.environ.get(env_name or "") else
+                           "saved credentials" if self.provider_keys.get(provider) else "offline")
+        selected_model = (self.agent.explicit_model if provider == self.agent.llm_client.provider else None)
+        self.agent.explicit_model = selected_model
+        self.agent.llm_client = LLMClient(api_key=self.api_key, provider=provider,
+            provider_keys=self.provider_keys,
+            default_model=selected_model or PROVIDERS[provider].default_model,
+            backup_providers=tuple(name for name in self.backup_providers if name != provider),
+            force_mock=not bool(self.api_key) and provider != "local")
+        self.llm_client = self.agent.llm_client
+        self.base_url = self.llm_client.base_url
+        self.config.update(provider=provider)
         self._refresh_status()
 
     def _set_safety(self, profile: str) -> None:
@@ -665,7 +736,8 @@ class AdaptiveHarnessApp(App):
     def action_show_help(self) -> None:
         log = self.query_one("#chat-log", RichLog)
         log.write("[bold yellow]Available Commands:[/bold yellow]")
-        log.write("  /key <API_KEY> | status | clear  - Manage private OpenRouter key")
+        log.write("  /provider <name>       - Switch OpenRouter, Anthropic, OpenAI, DeepSeek, Google, Groq, or local")
+        log.write("  /key <provider> <key>   - Save a private provider key; /key status or /key clear <provider>")
         log.write("  /model [MODEL_ID]      - Browse models (F4) or set one directly")
         log.write("  /models                - Search live OpenRouter catalog")
         log.write("  /tier <fast|standard|reasoning> - Force model tier")
@@ -735,7 +807,7 @@ class AdaptiveHarnessApp(App):
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        if self._busy and cmd in {"/key", "/model", "/models", "/tier", "/mode", "/thinking", "/safety", "/classifier", "/sessions",
+        if self._busy and cmd in {"/key", "/provider", "/model", "/models", "/tier", "/mode", "/thinking", "/safety", "/classifier", "/sessions",
                                   "/workspace", "/session", "/skill", "/new", "/reset", "/export"}:
             log.write(Text("Wait for the current task before changing settings or exiting.", style="yellow"))
             return
@@ -773,44 +845,55 @@ class AdaptiveHarnessApp(App):
             self._export_session(arg or "markdown")
         elif cmd == "/key":
             if not arg:
-                log.write(Text("Use /key <OPENROUTER_API_KEY>, /key status, or /key clear", style="yellow"))
+                log.write(Text("Use /key <provider> <key>, /key status, or /key clear <provider>.", style="yellow"))
                 return
             if arg.lower() == "status":
-                masked = (self.api_key[:8] + "••••••••" + self.api_key[-4:]
-                          if self.api_key and len(self.api_key) > 12 else
-                          "••••••••" if self.api_key else "none")
-                log.write(Text(f"API key source: {self.key_source} · {masked}", style="cyan"))
+                for name in PROVIDERS:
+                    if name == "local":
+                        continue
+                    key = (self.api_key if name == self.provider_name else self.provider_keys.get(name))
+                    masked = (key[:8] + "••••••••" + key[-4:] if key and len(key) > 12 else
+                              "••••••••" if key else "none")
+                    log.write(Text(f"{name}: {masked}" +
+                        (f" ({self.key_source})" if name == self.provider_name else ""), style="cyan"))
                 return
-            if arg.lower() == "clear":
+            if arg.lower().startswith("clear"):
+                target = arg.split(maxsplit=1)[1].lower() if len(arg.split(maxsplit=1)) > 1 else self.provider_name
                 try:
-                    self.config.clear_key()
-                except OSError as exc:
+                    self.credentials.clear(target)
+                    if target == "openrouter":
+                        self.config.clear_key()
+                except (OSError, ValueError) as exc:
                     log.write(Text(f"Could not clear saved key: {exc}", style="red"))
                     return
-                self.api_key = None
-                self.key_source = "offline"
-                self.agent.llm_client = LLMClient(api_key=None, base_url=self.base_url,
-                    default_model=self.agent.llm_client.default_model, force_mock=True)
-                self.llm_client = self.agent.llm_client
-                if self.agent.classifier_backend.name == "openrouter":
-                    self.agent.classifier_backend.api_key = None
-                log.write(Text("✓ Saved API key cleared; offline mock mode is active.", style="green"))
+                self.provider_keys.pop(target, None)
+                if target == self.provider_name:
+                    self._connect_provider(target)
+                log.write(Text(f"✓ Saved {target} key cleared.", style="green"))
                 self._refresh_status()
                 return
+            key_parts = arg.split(maxsplit=1)
+            target, key = (key_parts[0].lower(), key_parts[1]) if len(key_parts) == 2 else (self.provider_name, arg)
             try:
-                self.config.save_key(arg)
+                self.credentials.set(target, key)
             except (OSError, ValueError) as exc:
                 log.write(Text(f"Could not save API key: {exc}", style="red"))
                 return
-            self.api_key = arg
-            self.key_source = "saved configuration"
-            self.agent.llm_client = LLMClient(api_key=arg, base_url=self.base_url,
-                                              default_model=self.agent.llm_client.default_model)
-            self.llm_client = self.agent.llm_client
-            if self.agent.classifier_backend.name == "openrouter":
-                self.agent.classifier_backend.api_key = arg
-            log.write(Text("✓ API key securely saved for future sessions", style="green"))
+            self.provider_keys[target] = key
+            if target == self.provider_name:
+                self._connect_provider(target)
+            if target == "openrouter" and self.agent.classifier_backend.name == "openrouter":
+                self.agent.classifier_backend.api_key = key
+            log.write(Text(f"✓ {target} API key securely saved for future sessions", style="green"))
             self._refresh_status()
+        elif cmd == "/provider":
+            target = arg.lower()
+            if target not in PROVIDERS:
+                log.write(Text("Choose: " + ", ".join(PROVIDERS), style="yellow"))
+                return
+            self._connect_provider(target)
+            self._save_session()
+            log.write(Text(f"✓ Provider: {target} · {self.llm_client.default_model}", style="green"))
         elif cmd == "/model":
             if not arg:
                 self.action_choose_model()
@@ -820,7 +903,7 @@ class AdaptiveHarnessApp(App):
             self.action_choose_model()
         elif cmd == "/tier":
             if arg in MODEL_TIERS:
-                target_model = MODEL_TIERS[arg]
+                target_model = PROVIDER_TIERS.get(self.provider_name, MODEL_TIERS)[arg]
                 self.agent.llm_client.default_model = target_model
                 self.agent.explicit_model = target_model
                 log.write(f"[green]✓ Switched to {arg.upper()} tier ({target_model})[/green]")
@@ -1075,6 +1158,21 @@ class AdaptiveHarnessApp(App):
                     "verifying": f"Verifying {p.get('tool', '')}",
                 }.get(stage, stage)
                 self._refresh_status()
+        elif et == "context_status":
+                telemetry.update_telemetry(context_used=p["used_tokens"], context_capacity=p["capacity"],
+                    context_compacted=p["compacted_tokens"] if p["compacted"] else 0)
+                self._refresh_status()
+        elif et == "overseer":
+                telemetry.update_telemetry(overseer_state=p["state"],
+                    overseer_latency_ms=p.get("latency_ms", 0), overseer_tier=p.get("tier", "gate"))
+                if p.get("directive"):
+                    log.write(Text(f"⚠ Overseer: {p['state'].replace('_', ' ').title()} · strategy correction injected",
+                                   style="bold yellow"))
+        elif et == "provider_failover":
+                log.write(Text(f"Provider failover: {p['from']} → {p['to']} ({p['model']})", style="bold yellow"))
+                telemetry.update_telemetry(model=p["model"], selection="failover")
+                self.provider_name = p["to"]
+                self._refresh_status()
         elif et == "skill_classification":
                 telemetry.update_telemetry(
                     probabilities=p["probabilities"],
@@ -1108,6 +1206,9 @@ class AdaptiveHarnessApp(App):
                                            classifier_latency_ms=p["classifier_total_ms"])
                 self._refresh_status()
         elif et == "model_routing":
+                catalog_model = next((item for item in self._model_catalog if item.id == p["model"]), None)
+                self.agent.context_window_override = (catalog_model.context_length
+                    if catalog_model and catalog_model.context_length else None)
                 telemetry.update_telemetry(
                     tier=p["tier"],
                     model=p["model"],

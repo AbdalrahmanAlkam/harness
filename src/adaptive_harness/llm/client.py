@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Union
 from openai import OpenAI
 
 from adaptive_harness.llm.mock_client import LLMResponse, MockLLMClient, ToolCall
+from adaptive_harness.llm.providers import PROVIDERS, PROVIDER_TIERS, provider_for_url
 
 
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -30,29 +31,66 @@ class LLMClient:
         base_url: Optional[str] = None,
         default_model: Optional[str] = None,
         force_mock: bool = False,
+        provider: Optional[str] = None,
+        provider_keys: Optional[Dict[str, str]] = None,
+        backup_providers: tuple[str, ...] = (),
     ):
-        self.base_url = base_url or os.environ.get("OPENROUTER_BASE_URL") or DEFAULT_OPENROUTER_BASE_URL
+        if provider and provider not in PROVIDERS:
+            raise ValueError(f"Unknown provider: {provider}")
+        self.provider = provider or provider_for_url(base_url or os.environ.get("OPENROUTER_BASE_URL") or DEFAULT_OPENROUTER_BASE_URL)
+        self.provider_keys = dict(provider_keys or {})
+        self.backup_providers = tuple(name for name in backup_providers if name in PROVIDERS)
+        self.base_url = base_url or (PROVIDERS[self.provider].base_url if provider else
+                                     os.environ.get("OPENROUTER_BASE_URL") or DEFAULT_OPENROUTER_BASE_URL)
         endpoint_host = urlparse(self.base_url).hostname
         local_endpoint = endpoint_host in {"localhost", "127.0.0.1", "::1"}
-        self.api_key = api_key or ("local" if local_endpoint else
-                                   os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"))
-        self.default_model = default_model or MODEL_TIERS["standard"]
+        env_name = PROVIDERS[self.provider].env_key if self.provider in PROVIDERS else "OPENROUTER_API_KEY"
+        self.api_key = api_key or self.provider_keys.get(self.provider) or ("local" if local_endpoint else
+                                   os.environ.get(env_name or "") or
+                                   (os.environ.get("OPENAI_API_KEY") if self.provider == "openrouter" else None))
+        self.default_model = default_model or (PROVIDERS[self.provider].default_model if provider else MODEL_TIERS["standard"])
         self.force_mock = force_mock
         self._temporary_offline = False
         self.mock_client = MockLLMClient(default_model=self.default_model)
 
         self._openai_client: Optional[OpenAI] = None
+        self._make_client()
+
+    def _make_client(self) -> None:
+        self._openai_client = None
         if self.api_key and not self.force_mock:
+            headers = ({"HTTP-Referer": "https://github.com/adaptive-agent-harness",
+                        "X-Title": "Adaptive Agent Harness"} if self.provider == "openrouter" else
+                       {"x-goog-api-client": "adaptive-harness/0.1"} if self.provider == "google" else {})
             self._openai_client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
                 timeout=45.0,
                 max_retries=1,
-                default_headers={
-                    "HTTP-Referer": "https://github.com/adaptive-agent-harness",
-                    "X-Title": "Adaptive Agent Harness",
-                },
+                default_headers=headers,
             )
+
+    def switch_provider(self, provider: str, *, model: str | None = None,
+                        base_url: str | None = None) -> None:
+        if provider not in PROVIDERS:
+            raise ValueError(f"Unknown provider: {provider}")
+        self.provider = provider
+        self.base_url = base_url or PROVIDERS[provider].base_url
+        self.api_key = (self.provider_keys.get(provider) or
+                        ("local" if provider == "local" else os.environ.get(PROVIDERS[provider].env_key or "")))
+        self.default_model = model or PROVIDERS[provider].default_model
+        self._temporary_offline = False
+        self._make_client()
+
+    def set_provider_key(self, provider: str, key: str | None) -> None:
+        if provider not in PROVIDERS or provider == "local":
+            raise ValueError(f"Unknown key provider: {provider}")
+        if key:
+            self.provider_keys[provider] = key
+        else:
+            self.provider_keys.pop(provider, None)
+        if self.provider == provider:
+            self.switch_provider(provider, model=self.default_model)
 
     @property
     def is_mock(self) -> bool:
@@ -60,7 +98,7 @@ class LLMClient:
 
     def get_model_for_tier(self, tier: str) -> str:
         """Maps an abstract tier (fast, standard, reasoning) to a concrete model ID."""
-        return MODEL_TIERS.get(tier.lower(), self.default_model)
+        return PROVIDER_TIERS.get(self.provider, MODEL_TIERS).get(tier.lower(), self.default_model)
 
     def complete(
         self,
@@ -71,6 +109,7 @@ class LLMClient:
         temperature: float = 0.2,
         reasoning_effort: Optional[str] = None,
         reasoning_budget_tokens: Optional[int] = None,
+        _allow_failover: bool = True,
     ) -> LLMResponse:
         """Executes a chat completion call with automatic model selection and tool handling."""
         selected_model = model or (self.get_model_for_tier(tier) if tier else self.default_model)
@@ -92,7 +131,8 @@ class LLMClient:
             kwargs["tool_choice"] = "auto"
         model_name = selected_model.lower()
         is_openrouter = self.base_url.rstrip("/").startswith("https://openrouter.ai")
-        is_claude_reasoning = (model_name.startswith("anthropic/claude") and any(
+        is_claude_reasoning = ((model_name.startswith("anthropic/claude") or
+                               (self.provider == "anthropic" and model_name.startswith("claude"))) and any(
             marker in model_name for marker in ("claude-3.7", "claude-3-7", "claude-sonnet-4",
                                                  "claude-opus-4", "claude-haiku-4", "claude-4", "claude-5")))
         supports_reasoning = (is_claude_reasoning or
@@ -120,6 +160,16 @@ class LLMClient:
                 else:
                     kwargs["extra_body"] = {"reasoning": {"effort": reasoning_effort}}
                 kwargs.pop("temperature", None)
+
+        if self.provider == "openai" and model_name.startswith(("o1", "o3", "o4")):
+            kwargs.pop("temperature", None)
+            if reasoning_effort in {"low", "medium", "high"}:
+                kwargs["reasoning_effort"] = reasoning_effort
+        elif self.provider == "anthropic" and reasoning_budget_tokens and reasoning_effort and not legacy_thinking_history:
+            kwargs.pop("temperature", None)
+            kwargs.setdefault("extra_body", {})["thinking"] = {
+                "type": "enabled", "budget_tokens": max(1024, reasoning_budget_tokens)}
+            kwargs["max_completion_tokens"] = max(1024, reasoning_budget_tokens) + 2048
 
         # OpenRouter advances Anthropic's cache breakpoint as the conversation grows.
         # Other providers handle compatible prompt prefixes implicitly.
@@ -220,7 +270,7 @@ class LLMClient:
                 model=response.model or selected_model,
                 finish_reason=choice.finish_reason or "stop",
                 usage=usage_dict,
-                metadata={"thinking_fallback": thinking_fallback,
+                metadata={"provider": self.provider, "thinking_fallback": thinking_fallback,
                           "thinking_fallback_reason": "legacy_tool_history" if legacy_thinking_history else
                               "provider_rejected_thinking" if thinking_fallback else "",
                           "reasoning_details": self._serialize_reasoning_details(reasoning_details)},
@@ -240,12 +290,33 @@ class LLMClient:
                 hint = "The provider rejected this request; your saved key is unchanged."
             else:
                 hint = "The request failed; your saved key is unchanged and will be retried on the next task."
+            if _allow_failover and status in {429, 500, 502, 503, 504}:
+                primary_provider = self.provider
+                primary_model = self.default_model
+                primary_url = self.base_url
+                primary_key = self.api_key
+                for backup in self.backup_providers:
+                    if backup == self.provider or (backup != "local" and not
+                        (self.provider_keys.get(backup) or os.environ.get(PROVIDERS[backup].env_key or ""))):
+                        continue
+                    self.switch_provider(backup)
+                    fallback = self.complete(messages, tools, model=self.default_model,
+                        temperature=temperature, reasoning_effort=reasoning_effort,
+                        reasoning_budget_tokens=reasoning_budget_tokens, _allow_failover=False)
+                    if fallback.finish_reason != "error":
+                        fallback.metadata = {**(fallback.metadata or {}), "failed_over_from": primary_provider}
+                        return fallback
+                self.switch_provider(primary_provider, model=primary_model, base_url=primary_url)
+                self.api_key = primary_key
+                self._make_client()
+                self._temporary_offline = True
             return LLMResponse(
                 content=f"API call failed: {type(e).__name__}: {detail}. {hint} This task stopped without claiming success.",
                 tool_calls=[],
                 model=selected_model,
                 finish_reason="error",
                 usage={"prompt_tokens": 0, "completion_tokens": 0},
+                metadata={"provider": self.provider, "error_status": status},
             )
 
     @staticmethod

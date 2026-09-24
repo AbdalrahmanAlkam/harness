@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+import os
 import typer
 from rich.console import Console
 from rich.markup import escape
@@ -105,6 +106,8 @@ def run(
 @app.command()
 def tui(
     api_key: Optional[str] = typer.Option(None, "--key", "-k", help="OpenRouter or OpenAI API key"),
+    provider: Optional[str] = typer.Option(None, "--provider", help="openrouter, anthropic, openai, deepseek, google, groq, local"),
+    backup_provider: Optional[list[str]] = typer.Option(None, "--backup-provider", help="Fail over on 429/5xx; repeat in priority order"),
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID (e.g. anthropic/claude-sonnet-4)"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
@@ -114,6 +117,7 @@ def tui(
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Local or OpenRouter classifier endpoint"),
+    overseer_model: Optional[str] = typer.Option(None, "--overseer-model", help="Local ONNX embedding model directory for runtime oversight"),
     semif_model: Optional[str] = typer.Option(None, "--semif-model", help="Cached HuggingFace model ID or local checkpoint path"),
     semif_device: str = typer.Option("auto", "--semif-device", help="SemIf device: auto, cpu, cuda, or mps"),
     semif_4bit: bool = typer.Option(False, "--semif-4bit", help="Load SemIf in 4-bit on CUDA (requires bitsandbytes)"),
@@ -126,6 +130,7 @@ def tui(
     """Launches the interactive Textual TUI development environment with pervasive classifiers."""
     from adaptive_harness.tui.app import AdaptiveHarnessApp
     from adaptive_harness.llm.client import MODEL_TIERS
+    from adaptive_harness.llm.providers import PROVIDER_TIERS
     from adaptive_harness.classifiers.domain_classifier import parse_domain_mode
     from adaptive_harness.classifiers.thinking_classifier import parse_thinking_level
 
@@ -142,14 +147,18 @@ def tui(
     try:
         tui_app = AdaptiveHarnessApp(
             api_key=api_key,
+            provider=provider,
+            backup_providers=tuple(backup_provider or ()),
             base_url=base_url,
-            default_model=(None if model and model.lower() == "auto" else model) or (MODEL_TIERS[tier] if tier in MODEL_TIERS else None),
+            default_model=(None if model and model.lower() == "auto" else model) or
+                (PROVIDER_TIERS.get(provider or "openrouter", MODEL_TIERS)[tier] if tier in MODEL_TIERS else None),
             mode=mode,
             thinking=thinking,
             safety=safety,
             classifier_backend="semif" if semif_model else classifier_backend,
             classifier_model=semif_model or classifier_model,
             classifier_endpoint=classifier_endpoint,
+            overseer_model=overseer_model,
             semif_device=semif_device,
             semif_4bit=semif_4bit,
             semif_temperature=semif_temperature,
@@ -175,6 +184,8 @@ def dev(
     task: str = typer.Argument(..., help="Software engineering task to execute"),
     offline: bool = typer.Option(False, "--offline", help="Use the offline mock engine without a network request"),
     api_key: Optional[str] = typer.Option(None, "--key", "-k", help="OpenRouter or OpenAI API key"),
+    provider: Optional[str] = typer.Option(None, "--provider", help="openrouter, anthropic, openai, deepseek, google, groq, local"),
+    backup_provider: Optional[list[str]] = typer.Option(None, "--backup-provider", help="Fail over on 429/5xx; repeat in priority order"),
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
@@ -184,6 +195,7 @@ def dev(
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Classifier endpoint"),
+    overseer_model: Optional[str] = typer.Option(None, "--overseer-model", help="Local ONNX embedding model directory for runtime oversight"),
     semif_model: Optional[str] = typer.Option(None, "--semif-model", help="Cached HuggingFace model ID or local checkpoint path"),
     semif_device: str = typer.Option("auto", "--semif-device", help="SemIf device: auto, cpu, cuda, or mps"),
     semif_4bit: bool = typer.Option(False, "--semif-4bit", help="Load SemIf in 4-bit on CUDA (requires bitsandbytes)"),
@@ -196,6 +208,8 @@ def dev(
     from adaptive_harness.agent.agent import DeveloperAgent
     from adaptive_harness.llm.client import LLMClient
     from adaptive_harness.llm.client import MODEL_TIERS
+    from adaptive_harness.llm.providers import PROVIDERS, PROVIDER_TIERS, provider_for_url
+    from adaptive_harness.data.credentials import CredentialsManager
     from adaptive_harness.classifiers.engine import create_backend
     from adaptive_harness.agent.skills import SkillCatalog
     from adaptive_harness.classifiers.domain_classifier import parse_domain_mode
@@ -203,6 +217,13 @@ def dev(
 
     if tier and tier not in MODEL_TIERS:
         raise typer.BadParameter("Choose fast, standard, or reasoning", param_hint="--tier")
+    if provider is not None and provider not in PROVIDERS:
+        raise typer.BadParameter("Unknown provider", param_hint="--provider")
+    selected_provider = provider or provider_for_url(base_url or os.environ.get("OPENROUTER_BASE_URL", ""))
+    if selected_provider not in PROVIDERS:
+        selected_provider = "openrouter"
+    if any(name not in PROVIDERS for name in (backup_provider or [])):
+        raise typer.BadParameter("Unknown backup provider", param_hint="--backup-provider")
     if safety is not None and safety not in {"turbo", "balanced", "cautious", "strict"}:
         raise typer.BadParameter("Choose turbo, balanced, cautious, or strict", param_hint="--safety")
     try:
@@ -211,13 +232,22 @@ def dev(
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
-    selected_model = (None if model and model.lower() == "auto" else model) or (MODEL_TIERS[tier] if tier in MODEL_TIERS else None)
+    provider_tiers = PROVIDER_TIERS.get(selected_provider, MODEL_TIERS)
+    selected_model = (None if model and model.lower() == "auto" else model) or (provider_tiers[tier] if tier in MODEL_TIERS else None)
     from adaptive_harness.data.config import ConfigManager
-    import os
-    resolved_key = api_key or os.environ.get("OPENROUTER_API_KEY")
-    if not resolved_key and not base_url and not os.environ.get("OPENROUTER_BASE_URL"):
-        resolved_key = ConfigManager().load().get("api_key")
-    client = LLMClient(api_key=resolved_key, base_url=base_url, default_model=selected_model, force_mock=offline)
+    try:
+        saved_keys = CredentialsManager().load()
+    except (OSError, ValueError):
+        saved_keys = {}
+    if "openrouter" not in saved_keys:
+        legacy_key = ConfigManager().load().get("api_key")
+        if legacy_key:
+            saved_keys["openrouter"] = legacy_key
+    resolved_key = api_key or os.environ.get(PROVIDERS[selected_provider].env_key or "") or saved_keys.get(selected_provider)
+    client = LLMClient(api_key=resolved_key, base_url=base_url, default_model=selected_model,
+                       provider=selected_provider, provider_keys=saved_keys,
+                       backup_providers=tuple(name for name in (backup_provider or ()) if name != selected_provider),
+                       force_mock=offline)
     repo = ExperienceRepository(db_path)
     if not workspace.is_dir():
         raise typer.BadParameter(f"Workspace directory does not exist: {workspace}", param_hint="--workspace")
@@ -225,10 +255,12 @@ def dev(
         backend = create_backend("semif" if semif_model else classifier_backend,
             semif_model or classifier_model, classifier_endpoint, api_key=api_key, device=semif_device,
             load_in_4bit=semif_4bit, temperature=semif_temperature)
+        overseer_backend = create_backend("onnx", overseer_model) if overseer_model else None
     except (ValueError, RuntimeError, OSError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--classifier-backend") from exc
     agent = DeveloperAgent(llm_client=client, repository=repo, workspace_root=str(workspace), explicit_model=selected_model,
-                           classifier_backend=backend, forced_mode=selected_mode, forced_thinking=selected_thinking,
+                           classifier_backend=backend, overseer_backend=overseer_backend,
+                           forced_mode=selected_mode, forced_thinking=selected_thinking,
                            safety_profile=safety or "turbo")
     catalog = SkillCatalog(workspace)
     for name in skill or []:
@@ -265,10 +297,18 @@ def dev(
             console.print(f"  [yellow]Thinking:[/yellow] {p['level'].upper()} ({p['tokens']:,} token budget, {p['selection']})")
         elif et == "agent_stage":
             stage = p["stage"]
-            label = {"thinking": "Thinking / generating", "generating": "Generating",
+            label = {"thinking": "Thinking", "generating": "Generating",
                      "tool_running": f"Running {p.get('tool', '')}",
                      "verifying": f"Verifying {p.get('tool', '')}"}.get(stage, stage)
             console.print(f"  [dim]◦ {escape(label)}[/dim]")
+        elif et == "context_status" and p.get("compacted"):
+            console.print(f"  [cyan]Context compacted:[/cyan] ~{p['compacted_tokens']:,} tokens saved "
+                          f"({p['used_tokens']:,}/{p['capacity']:,})")
+        elif et == "overseer" and p.get("directive"):
+            console.print(f"  [yellow]Overseer: {escape(p['state'])} · correction injected[/yellow]")
+        elif et == "provider_failover":
+            console.print(f"  [yellow]Provider failover: {escape(p['from'])} → {escape(p['to'])} "
+                          f"({escape(p['model'])})[/yellow]")
         elif et == "llm_error":
             console.print(f"[red]Model error: {escape(p['message'])}[/red]")
         elif et == "llm_notice":

@@ -71,6 +71,12 @@ class ClassifierTelemetryWidget(Static):
         self.provider_cached_tokens = 0
         self.provider_prompt_tokens = 0
         self.memory_resolution = False
+        self.overseer_state = "HEALTHY_PROGRESS"
+        self.overseer_latency_ms = 0.0
+        self.overseer_tier = "gate"
+        self.context_used = 0
+        self.context_capacity = 0
+        self.context_compacted = 0
 
     def reset_telemetry(self, *, classifier_engine: str | None = None,
                         classifier_model: str | None = None, model: str | None = None,
@@ -94,6 +100,12 @@ class ClassifierTelemetryWidget(Static):
         self.provider_cached_tokens = 0
         self.provider_prompt_tokens = 0
         self.memory_resolution = False
+        self.overseer_state = "HEALTHY_PROGRESS"
+        self.overseer_latency_ms = 0.0
+        self.overseer_tier = "gate"
+        self.context_used = 0
+        self.context_capacity = 0
+        self.context_compacted = 0
         if classifier_engine is not None:
             self.classifier_engine = classifier_engine
         if classifier_model is not None:
@@ -129,6 +141,12 @@ class ClassifierTelemetryWidget(Static):
         provider_cached_tokens: Optional[int] = None,
         provider_prompt_tokens: Optional[int] = None,
         memory_resolution: Optional[bool] = None,
+        overseer_state: Optional[str] = None,
+        overseer_latency_ms: Optional[float] = None,
+        overseer_tier: Optional[str] = None,
+        context_used: Optional[int] = None,
+        context_capacity: Optional[int] = None,
+        context_compacted: Optional[int] = None,
     ) -> None:
         if probabilities is not None:
             self.probabilities = probabilities
@@ -162,6 +180,14 @@ class ClassifierTelemetryWidget(Static):
             if value is not None:
                 setattr(self, key, value)
 
+        for key, value in (("overseer_state", overseer_state),
+                           ("overseer_latency_ms", overseer_latency_ms),
+                           ("overseer_tier", overseer_tier), ("context_used", context_used),
+                           ("context_capacity", context_capacity),
+                           ("context_compacted", context_compacted)):
+            if value is not None:
+                setattr(self, key, value)
+
         self.refresh()
 
     def render(self) -> Panel:
@@ -177,6 +203,20 @@ class ClassifierTelemetryWidget(Static):
         status.append("Engine: ", style="bold cyan")
         status.append(f"{engine_name} ({model_name})\n", style=engine_color)
         status.append(f"Latency: {self.classifier_latency_ms:.2f} ms\n", style="cyan")
+        overseer_color = "bold green" if self.overseer_state == "HEALTHY_PROGRESS" else "bold yellow"
+        status.append("Overseer: ", style="bold cyan")
+        status.append(self.overseer_state.replace("_", " ") + "\n", style=overseer_color)
+        status.append(f"  {self.overseer_tier} · {self.overseer_latency_ms:.2f} ms\n", style="dim")
+        if self.context_capacity:
+            fraction = min(1.0, self.context_used / self.context_capacity)
+            bars = round(fraction * 10)
+            gauge_color = "bold yellow" if fraction >= 0.75 else "cyan"
+            status.append("Context: ", style="bold cyan")
+            status.append("█" * bars + "░" * (10 - bars), style=gauge_color)
+            status.append(f" {self.context_used // 1000}k/{self.context_capacity // 1000}k ({fraction:.0%})\n",
+                          style=gauge_color)
+            if self.context_compacted:
+                status.append(f"⚡ Compacted ~{self.context_compacted:,} tokens\n", style="bold green")
         domain_label = "SECURITY" if self.domain_mode == "audit" else self.domain_mode.upper()
         domain_color = {"coding": "bold cyan", "research": "bold magenta", "science": "bold green",
                         "audit": "bold red"}.get(self.domain_mode, "bold cyan")

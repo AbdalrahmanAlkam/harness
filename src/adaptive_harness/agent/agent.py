@@ -33,13 +33,15 @@ from adaptive_harness.tools.file_ops import EditFileTool, ReadFileTool, WriteFil
 from adaptive_harness.tools.testing import RunPytestTool
 from adaptive_harness.tools.science import CalculateTool, CheckConvergenceTool
 from adaptive_harness.tools.python_repl import RunPythonReplTool, VerifyEquationTool
-from adaptive_harness.agent.compaction import compact_tool_output, rank_search_results
+from adaptive_harness.agent.compaction import rank_search_results
 from adaptive_harness.data.preferences import ClarificationMemory
 from adaptive_harness.tools.research import WebSearchTool
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.skills.router import SkillRouter
 from adaptive_harness.skills.verifier import SkillVerifier
+from adaptive_harness.classifiers.runtime_overseer import RuntimeOverseer, OverseerState
+from adaptive_harness.agent.context_window import prepare_context
 
 
 DEFAULT_SYSTEM_PROMPT = """You are Adaptive Agent, an expert assistant for software engineering, research, science, and mathematics.
@@ -78,6 +80,7 @@ class DeveloperAgent:
         workspace_root: Optional[str] = None,
         explicit_model: Optional[str] = None,
         classifier_backend: Optional[BaseClassifierBackend] = None,
+        overseer_backend: Optional[BaseClassifierBackend] = None,
         forced_mode: str | DomainMode | None = None,
         forced_thinking: str | ThinkingLevel | None = None,
         safety_profile: str = "turbo",
@@ -100,6 +103,7 @@ class DeveloperAgent:
         self.forced_mode = parse_domain_mode(forced_mode)
         self.forced_thinking = parse_thinking_level(forced_thinking)
         self.classifier_backend = classifier_backend or SklearnBackend()
+        self.overseer_backend = overseer_backend
         self.fallback_classifier = SklearnBackend()
         self.domain_classifier = DomainClassifier()
         self.thinking_classifier = ThinkingClassifier()
@@ -161,10 +165,8 @@ class DeveloperAgent:
         return options[0]
 
     def _request_messages(self) -> List[Dict[str, Any]]:
-        """Keep recent complete turns in model context while preserving the full saved session."""
-        user_positions = [i for i, message in enumerate(self.messages) if message.get("role") == "user"]
-        start = user_positions[-20] if len(user_positions) > 20 else 1
-        return [self.messages[0], *self.messages[start:]]
+        """The saved conversation is verbatim; request compaction is conditional."""
+        return self.messages
 
     def run_stream(self, user_input: str, max_steps: Optional[int] = None) -> Generator[AgentEvent, None, None]:
         """Executes a task through the agentic lifecycle, yielding real-time events for the TUI."""
@@ -337,7 +339,8 @@ class DeveloperAgent:
                                                "classifier_total_ms": round(classification.latency_ms + tier_prediction.latency_ms
                                                                              + domain_prediction.latency_ms
                                                                              + thinking_prediction.latency_ms, 2)})
-        selected_model = self.explicit_model or complexity_res.recommended_model
+        selected_model = self.explicit_model or (self.llm_client.get_model_for_tier(complexity_res.tier)
+            if hasattr(self.llm_client, "get_model_for_tier") else complexity_res.recommended_model)
         selected_tier = (next((tier for tier, model in self.complexity_router.tier_models.items()
                                if model == selected_model), "manual") if self.explicit_model else complexity_res.tier)
         yield AgentEvent(
@@ -408,15 +411,22 @@ class DeveloperAgent:
         answer_parts: list[str] = []
         stop_reason = ""
         verification_followups = 0
+        overseer_backend = self.overseer_backend or (self.classifier_backend
+            if self.classifier_backend.name in {"onnx", "ollama", "local-slm"} else None)
+        overseer = RuntimeOverseer(original_input, overseer_backend)
+        context_limit = getattr(self, "context_window_override", None)
 
         while step < max_steps:
             step += 1
+            request_messages, context_info = prepare_context(self._request_messages(), selected_model,
+                tool_schemas, provider=getattr(self.llm_client, "provider", "openrouter"), limit=context_limit)
+            yield AgentEvent("context_status", context_info)
             yield AgentEvent("agent_stage", {"stage": "thinking" if thinking_res.budget_tokens else "generating",
                                              "step": step, "model": selected_model,
                                              "thinking_tokens": thinking_res.budget_tokens})
             try:
                 llm_resp = self.llm_client.complete(
-                    messages=self._request_messages(), tools=tool_schemas,
+                    messages=request_messages, tools=tool_schemas,
                     model=selected_model, tier=complexity_res.tier,
                     reasoning_effort=thinking_res.effort,
                     reasoning_budget_tokens=thinking_res.budget_tokens,
@@ -425,6 +435,10 @@ class DeveloperAgent:
                 llm_resp = LLMResponse(content=f"Model request failed ({type(exc).__name__}). Retry the task or check the connection.",
                     finish_reason="error", usage={"prompt_tokens": 0, "completion_tokens": 0})
             response_usage = llm_resp.usage or {}
+            if (llm_resp.metadata or {}).get("failed_over_from"):
+                selected_model = llm_resp.model or self.llm_client.default_model
+                yield AgentEvent("provider_failover", {"from": llm_resp.metadata["failed_over_from"],
+                    "to": self.llm_client.provider, "model": selected_model})
             for token_type in usage:
                 usage[token_type] += int(response_usage.get(token_type, 0) or 0)
             if not response_usage.get("total_tokens"):
@@ -478,6 +492,16 @@ class DeveloperAgent:
                         continue
                     stop_reason = "response_length_limit"
                     break
+                claim_problem = overseer.check_claim(final_answer)
+                if claim_problem and verification_followups < 2 and step < max_steps:
+                    yield AgentEvent("overseer", {"state": claim_problem.state.value,
+                        "confidence": claim_problem.confidence, "directive": claim_problem.directive,
+                        "latency_ms": claim_problem.latency_ms, "tier": claim_problem.tier})
+                    self.messages.append({"role": "system", "content": claim_problem.directive})
+                    verification_followups += 1
+                    answer_parts.clear()
+                    final_answer = ""
+                    continue
                 pending_checks = self.skill_verifier.verify(selected_skills, skill_observations)
                 missing_checks = [f"{check.skill}: {', '.join(check.missing)}"
                                   for check in pending_checks if not check.verified]
@@ -530,6 +554,7 @@ class DeveloperAgent:
             if (llm_resp.metadata or {}).get("reasoning_details"):
                 assistant_tool_message["reasoning_details"] = llm_resp.metadata["reasoning_details"]
             self.messages.append(assistant_tool_message)
+            pending_directives: list[str] = []
             for tc in llm_resp.tool_calls:
                 yield AgentEvent("agent_stage", {"stage": "tool_running", "step": step, "tool": tc.name})
                 yield AgentEvent(
@@ -575,8 +600,9 @@ class DeveloperAgent:
                     model_output = rank_search_results(model_output, original_input,
                         getattr(self.classifier_backend, "engine", None)
                         if self.classifier_backend.name == "semif" else None)
-                model_output = compact_tool_output(tc.name, model_output)
-                model_error = compact_tool_output(tc.name, tool_res.error or "", limit=600)
+                # Preserve tool evidence until the context gauge crosses its
+                # threshold; prepare_context compacts only the request copy.
+                model_error = (tool_res.error or "")[:600]
                 estimated_saved = max(0, (len(tool_res.output) - len(model_output)) // 4)
 
                 yield AgentEvent(
@@ -650,6 +676,37 @@ class DeveloperAgent:
                                    f"ERROR: {model_error or 'Tool failed'}\n{model_output}",
                     }
                 )
+
+                decision = overseer.observe(tc.name, tc.arguments, success=tool_res.success,
+                    error=tool_res.error or "", output=tool_res.output, model_text=llm_resp.content or "")
+                yield AgentEvent("overseer", {"state": decision.state.value,
+                    "confidence": decision.confidence, "directive": decision.directive,
+                    "latency_ms": round(decision.latency_ms, 2), "tier": decision.tier})
+                if decision.directive:
+                    pending_directives.append(decision.directive)
+                    if decision.state in {OverseerState.LOOPING_DETECTED, OverseerState.PROGRESS_STALLED} and \
+                            overseer.consecutive_interventions >= 2:
+                        question = (f"The agent remains {decision.state.value.lower().replace('_', ' ')} "
+                                    f"after two interventions. Last action: {tc.name} {tc.arguments}.")
+                        yield AgentEvent("clarification_needed", {"question": question,
+                            "options": ["Try a different approach", "Stop and report the impasse"],
+                            "reason": "Runtime overseer detected repeated failure", "risk_level": "medium"})
+                        if self.clarification_callback is None:
+                            final_answer = question
+                            stop_reason = "overseer_impasse"
+                            break
+                        answer = self._handle_clarification(question,
+                            ["Try a different approach", "Stop and report the impasse"],
+                            "Runtime overseer detected repeated failure", remember=False)
+                        if answer.lower().startswith("stop"):
+                            final_answer = question
+                            stop_reason = "overseer_impasse"
+                            break
+                        overseer.consecutive_interventions = 0
+            for directive in pending_directives:
+                self.messages.append({"role": "system", "content": directive})
+            if stop_reason == "overseer_impasse":
+                break
 
         skill_checks = self.skill_verifier.verify(selected_skills, skill_observations)
         for skill_check in skill_checks:

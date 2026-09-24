@@ -61,6 +61,11 @@ SEMIF_DESCRIPTIONS = {
     "test_failure": "Unit test assertions failed or pytest reported test failures.",
     "file_error": "File or directory path was not found or does not exist.",
     "runtime_error": "Uncaught exception, crash, or non-zero exit status.",
+    "HEALTHY_PROGRESS": "The agent is making verified progress with distinct useful tool actions.",
+    "LOOPING_DETECTED": "The agent repeats the same command or edit and cycles without a new strategy.",
+    "HALLUCINATION_DETECTED": "The agent claims files, symbols, or passing checks despite contrary tool evidence.",
+    "PROGRESS_STALLED": "Several attempts fail with the same errors and no improvement.",
+    "SEMANTIC_DRIFT": "The agent edits unrelated files or moves away from the user's original objective.",
 }
 
 
@@ -283,7 +288,8 @@ class OnnxBackend(BaseClassifierBackend):
         import numpy as np
         start = time.perf_counter()
         query = self._embed(text)
-        scores = np.array([float(query @ self._embed(label.replace("_", " "))) for label in labels])
+        scores = np.array([float(query @ self._embed(SEMIF_DESCRIPTIONS.get(label, label.replace("_", " "))))
+                           for label in labels])
         exps = np.exp((scores - scores.max()) * 10)
         probs = dict(zip(labels, (exps / exps.sum()).tolist()))
         return Classification(max(probs, key=probs.get), probs, (time.perf_counter()-start)*1000)
