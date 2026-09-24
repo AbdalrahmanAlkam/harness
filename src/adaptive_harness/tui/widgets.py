@@ -277,6 +277,22 @@ class HistoryInput(Input):
         self._draft = ""
 
     def on_key(self, event: events.Key) -> None:
+        if self.value.startswith("/") and getattr(self.app, "command_palette_visible", False):
+            if event.key in {"up", "down"}:
+                self.app.move_command_selection(-1 if event.key == "up" else 1)
+                event.prevent_default()
+                event.stop()
+                return
+            if event.key in {"tab", "enter"}:
+                self.app.complete_selected_command()
+                event.prevent_default()
+                event.stop()
+                return
+            if event.key == "escape":
+                self.app.dismiss_command_palette()
+                event.prevent_default()
+                event.stop()
+                return
         if event.key == "up" and self.history:
             if self._history_index is None:
                 self._draft = self.value
@@ -299,6 +315,51 @@ class HistoryInput(Input):
             event.stop()
         elif self._history_index is not None and (event.character or event.key in {"backspace", "delete"}):
             self.reset_navigation()
+
+
+class CommandPalette(Static):
+    """Non-focus-stealing command choices shown directly above the prompt."""
+
+    DEFAULT_CSS = """
+    CommandPalette {
+        display: none;
+        dock: bottom;
+        layer: overlay;
+        width: 76;
+        max-width: 94%;
+        height: auto;
+        max-height: 13;
+        margin: 0 0 0 1;
+        padding: 0 1;
+        border: round $accent;
+        background: $surface;
+        color: $text;
+    }
+    CommandPalette.visible { display: block; }
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.choices: list[tuple[str, str]] = []
+        self.selected_index = 0
+
+    def set_choices(self, choices: list[tuple[str, str]], selected_index: int = 0) -> None:
+        self.choices = choices
+        self.selected_index = max(0, min(selected_index, len(choices) - 1)) if choices else 0
+        self.set_class(bool(choices), "visible")
+        self.refresh()
+
+    def render(self) -> Text:
+        output = Text()
+        output.append(f"⌘ Commands · {len(self.choices)} matches  ", style="bold cyan")
+        output.append("↑↓ select · Tab/Enter complete · Esc close\n", style="dim")
+        start = min(max(0, self.selected_index - 7), max(0, len(self.choices) - 8))
+        for index, (command, description) in enumerate(self.choices[start:start + 8], start):
+            active = index == self.selected_index
+            output.append("❯ " if active else "  ", style="bold magenta" if active else "dim")
+            output.append(f"{command:<18}", style="bold white on dark_cyan" if active else "bold cyan")
+            output.append(description + "\n", style="white" if active else "dim")
+        return output
 
 
 class PinnedRichLog(RichLog):

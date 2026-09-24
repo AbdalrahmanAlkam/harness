@@ -32,13 +32,56 @@ from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
 from adaptive_harness.llm.providers import PROVIDERS, PROVIDER_TIERS, provider_for_url
 from adaptive_harness.llm.catalog import CatalogModel, fetch_models
 from adaptive_harness.tui.widgets import (ClarificationModal, ClassifierTelemetryWidget,
-    HistoryInput, PinnedRichLog, ThemePickerModal, QuickSelectModal, OutputViewerModal, THEME_CHOICES)
+    HistoryInput, PinnedRichLog, ThemePickerModal, QuickSelectModal, OutputViewerModal,
+    CommandPalette, THEME_CHOICES)
 from adaptive_harness.tui.formatting import format_model_markdown
 
 
-COMMANDS = ("/key", "/provider", "/model", "/models", "/tier", "/mode", "/thinking", "/safety", "/theme", "/classifier", "/new",
+COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/safety", "/classifier", "/new",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
             "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export")
+
+COMMAND_DESCRIPTIONS = {
+    "/provider": "Switch task model provider",
+    "/key": "Manage private provider API keys",
+    "/model": "Choose a model or restore auto routing",
+    "/models": "Search available models",
+    "/tier": "Force fast, standard, or reasoning",
+    "/mode": "Choose coding, research, science, or security",
+    "/thinking": "Set reasoning budget",
+    "/safety": "Choose interaction profile",
+    "/theme": "Preview and save a terminal theme",
+    "/classifier": "Switch local classification engine",
+    "/new": "Start a new session",
+    "/reset": "Clear current session state",
+    "/clear": "Clear the chat log",
+    "/history": "Show earlier prompts",
+    "/help": "Show commands and shortcuts",
+    "/exit": "Close the TUI",
+    "/workspace": "Choose a working directory",
+    "/sessions": "Browse saved sessions",
+    "/session": "Load or save a session",
+    "/usage": "Show token usage and cost",
+    "/skills": "Browse installed skills",
+    "/skill": "Force or disable a skill",
+    "/output": "Select or copy the latest agent response",
+    "/tool-output": "Inspect the latest tool result",
+    "/copy": "Copy selected chat text",
+    "/export": "Export this session",
+}
+
+
+def matching_commands(value: str) -> list[tuple[str, str]]:
+    """Prefer prefix matches, then ordered-subsequence matches for discovery."""
+    if not value.startswith("/") or " " in value:
+        return []
+    needle = value[1:].casefold()
+    def fuzzy(command: str) -> bool:
+        letters = iter(command[1:].casefold())
+        return all(any(letter == candidate for candidate in letters) for letter in needle)
+    matched = [command for command in COMMANDS if command[1:].startswith(needle)]
+    matched.extend(command for command in COMMANDS if command not in matched and fuzzy(command))
+    return [(command, COMMAND_DESCRIPTIONS[command]) for command in matched]
 
 
 class AdaptiveHarnessApp(App):
@@ -68,8 +111,6 @@ class AdaptiveHarnessApp(App):
     #prompt-input {
         width: 100%;
     }
-    #command-hints { height: 1; color: $accent; display: none; }
-    #command-hints.visible { display: block; }
     #scroll-indicator { height: 1; color: $warning; background: $surface; display: none; padding: 0 1; }
     #scroll-indicator.visible { display: block; }
     #waiting-indicator {
@@ -82,8 +123,7 @@ class AdaptiveHarnessApp(App):
     #waiting-indicator.visible { display: block; }
     #waiting-indicator.pulse { color: $accent; }
     Screen.compact #main-container, Screen.compact #status-line,
-    Screen.compact Header, Screen.compact #scroll-indicator,
-    Screen.compact #command-hints { display: none; }
+    Screen.compact Header, Screen.compact #scroll-indicator { margin: 0; }
     Screen.compact #input-container { margin: 0 0 1 0; }
     """
 
@@ -179,6 +219,7 @@ class AdaptiveHarnessApp(App):
         self._model_catalog: list[CatalogModel] = []
         self._activity = "Ready"
         self._activity_pulse = False
+        self._palette_dismissed_value: str | None = None
 
         # LLM Client & Repo
         self.llm_client = LLMClient(
@@ -248,6 +289,7 @@ class AdaptiveHarnessApp(App):
         with Horizontal(id="main-container"):
             yield PinnedRichLog(id="chat-log", min_width=1, wrap=True, highlight=True, markup=True)
             yield ClassifierTelemetryWidget(id="telemetry")
+            yield CommandPalette(id="command-palette")
 
         yield Static(id="status-line")
         yield Static("[Pinned: Scroll to bottom ↓]", id="scroll-indicator")
@@ -257,7 +299,6 @@ class AdaptiveHarnessApp(App):
                 placeholder="Ask agent to code, inspect, test, or run commands (/help for commands)...",
                 id="prompt-input", history=self.history_store.entries,
             )
-            yield Static(id="command-hints")
         yield Static("⚡ Agent waiting on your clarification", id="waiting-indicator")
         yield Footer()
 
@@ -717,12 +758,37 @@ class AdaptiveHarnessApp(App):
         self._refresh_status()
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        value = event.value.strip().lower()
-        hints = self.query_one("#command-hints", Static)
-        matches = [cmd for cmd in COMMANDS if cmd.startswith(value)][:10] if value.startswith("/") and " " not in value and self.size.height >= 12 else []
-        hints.update(Text("  ".join(matches), style="bold cyan"))
-        hints.set_class(bool(matches), "visible")
-        self.query_one("#input-container", Container).styles.height = 4 if matches else 3
+        if event.input.id != "prompt-input":
+            return
+        if event.value != self._palette_dismissed_value:
+            self._palette_dismissed_value = None
+        choices = (matching_commands(event.value) if self._palette_dismissed_value is None
+                   and self.size.height >= 12 else [])
+        self.query_one("#command-palette", CommandPalette).set_choices(choices)
+
+    @property
+    def command_palette_visible(self) -> bool:
+        return self.query_one("#command-palette", CommandPalette).has_class("visible")
+
+    def move_command_selection(self, delta: int) -> None:
+        palette = self.query_one("#command-palette", CommandPalette)
+        if palette.choices:
+            palette.set_choices(palette.choices, (palette.selected_index + delta) % len(palette.choices))
+
+    def complete_selected_command(self) -> None:
+        palette = self.query_one("#command-palette", CommandPalette)
+        if not palette.choices:
+            return
+        command = palette.choices[palette.selected_index][0]
+        prompt = self.query_one("#prompt-input", HistoryInput)
+        prompt.value = command + " "
+        prompt.cursor_position = len(prompt.value)
+        palette.set_choices([])
+
+    def dismiss_command_palette(self) -> None:
+        prompt = self.query_one("#prompt-input", HistoryInput)
+        self._palette_dismissed_value = prompt.value
+        self.query_one("#command-palette", CommandPalette).set_choices([])
 
     def on_pinned_rich_log_pin_changed(self, event: PinnedRichLog.PinChanged) -> None:
         self.query_one("#scroll-indicator", Static).set_class(event.pinned, "visible")
@@ -765,6 +831,12 @@ class AdaptiveHarnessApp(App):
         log.write("  /exit                  - Exit application")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "prompt-input":
+            return
+        if self.command_palette_visible:
+            self.complete_selected_command()
+            event.stop()
+            return
         text = event.value.strip()
         if not text:
             return
@@ -1256,10 +1328,14 @@ class AdaptiveHarnessApp(App):
                 if "Diff:\n" in output or output.startswith("@@"):
                     diff = output.split("Diff:\n", 1)[-1]
                     log.write(Syntax(diff, "diff", theme="monokai", line_numbers=False))
-                elif len(output) > 800:
-                    log.write(Text(output[:800] + f"\n… {len(output)-800} more characters. Use /tool-output to expand."))
                 else:
-                    log.write(Text(output))
+                    visible_output = format_model_markdown(output, plain=True) if (
+                        "$$" in output or r"\[" in output or r"\(" in output or r"\frac" in output
+                    ) else output
+                    if len(visible_output) > 800:
+                        log.write(Text(visible_output[:800] + f"\n… {len(visible_output)-800} more characters. Use /tool-output to expand."))
+                    else:
+                        log.write(Text(visible_output))
                 if p.get("time_ms", 0) >= 5000 and not self._has_focus and not self._bell_rung:
                     self.bell()
                     self._bell_rung = True

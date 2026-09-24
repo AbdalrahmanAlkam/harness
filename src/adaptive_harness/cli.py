@@ -8,7 +8,11 @@ import os
 import typer
 from rich.console import Console
 from rich.markup import escape
+from rich.markdown import Markdown
 from rich.prompt import Prompt
+from rich.text import Text
+
+from adaptive_harness.tui.formatting import format_model_markdown
 
 from adaptive_harness.dashboard.report import (
     print_ablation_table,
@@ -317,7 +321,8 @@ def dev(
             console.print(f"[yellow]{escape(p['error'])}[/yellow]")
         elif et == "thought":
             last_agent_content = p["content"]
-            console.print(f"\n[bold magenta]Agent:[/bold magenta] {escape(p['content'])}")
+            console.print("\n[bold magenta]Agent:[/bold magenta]")
+            console.print(Markdown(format_model_markdown(p["content"])))
         elif et == "memory_hit":
             console.print("  [bold green]⚡ Verified memory answer reused (0 API tokens)[/bold green]")
         elif et == "clarification_memory_hit":
@@ -326,13 +331,15 @@ def dev(
             console.print(f"  [bold yellow]Tool Call:[/bold yellow] [cyan]{p['name']}[/cyan] [dim]{escape(str(p['arguments']))}[/dim]")
         elif et == "tool_result":
             status_col = "green" if p["success"] else "red"
-            console.print(f"  [{status_col}]Tool Result ({p['time_ms']} ms):[/{status_col}] {escape(p['output'][:200])}")
+            console.print(f"  [{status_col}]Tool Result ({p['time_ms']} ms):[/{status_col}]")
+            console.print(Text(format_model_markdown(p['output'][:200], plain=True)))
         elif et == "verification":
             badge_col = "green" if p["status"] == "SUCCESS" else "red bold"
             console.print(f"  [dim]Verification Classifier: [{badge_col}]{p['status']}[/{badge_col}] -> Action: {p['action']}[/dim]")
         elif et == "response":
             if p.get("content") and p["content"] != last_agent_content:
-                console.print(f"\n[bold magenta]Agent:[/bold magenta] {escape(p['content'])}")
+                console.print("\n[bold magenta]Agent:[/bold magenta]")
+                console.print(Markdown(format_model_markdown(p["content"])))
             status = "✓ Completed" if p.get("success", True) else "Stopped before completion"
             color = "green" if p.get("success", True) else "yellow"
             console.print(f"\n[bold {color}]{status} in {p['total_time_ms']} ms ({p['steps']} steps)[/bold {color}]\n")
