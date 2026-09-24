@@ -33,6 +33,7 @@ from adaptive_harness.tools.file_ops import EditFileTool, ReadFileTool, WriteFil
 from adaptive_harness.tools.testing import RunPytestTool
 from adaptive_harness.tools.science import CalculateTool, CheckConvergenceTool
 from adaptive_harness.tools.python_repl import RunPythonReplTool, VerifyEquationTool
+from adaptive_harness.tools.plotting import PlotTerminalTool
 from adaptive_harness.agent.compaction import rank_search_results
 from adaptive_harness.data.preferences import ClarificationMemory
 from adaptive_harness.tools.research import WebSearchTool
@@ -127,6 +128,7 @@ class DeveloperAgent:
             CalculateTool(),
             CheckConvergenceTool(),
             RunPythonReplTool(),
+            PlotTerminalTool(),
             VerifyEquationTool(),
             AskUserTool(callback=self._handle_clarification),
         ]
@@ -372,13 +374,13 @@ class DeveloperAgent:
             for skill in selected_skills)
         self.messages[0] = {"role": "system", "content": self.system_prompt + "\nWorkspace: " + str(self.workspace_root)
                             + "\nOperating mode: " + domain_res.mode.value + ". " + DOMAIN_GUIDANCE[domain_res.mode]
-                            + "\nUse read_file(symbol=...) for focused Python code. For mathematics and science, run deterministic calculations and verify proposed roots before claiming exactness."
+                            + "\nUse read_file(symbol=...) for focused Python code. For mathematics and science, run deterministic calculations and verify proposed roots before claiming exactness. Use plot_terminal for useful visual comparisons."
                             + ("\nUser preferences:\n" + preference_guidance if preference_guidance else "")
                             + ("\n" + skill_guidance if skill_guidance else "")}
         domain_tool_names = {
             DomainMode.CODING: set(self.tools) - {"check_convergence"},
-            DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "run_bash", "calculate", "ask_user"},
-            DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "ask_user"},
+            DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "run_bash", "calculate", "plot_terminal", "ask_user"},
+            DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "plot_terminal", "ask_user"},
             DomainMode.AUDIT: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user"},
         }[domain_res.mode]
         if self.safety_profile == "turbo":
@@ -615,6 +617,7 @@ class DeveloperAgent:
                         "time_ms": round(t_elapsed_ms, 2),
                         "context_chars": len(model_output), "raw_chars": len(tool_res.output),
                         "saved_tokens_estimate": estimated_saved,
+                        "chart": bool((tool_res.metadata or {}).get("chart")) or tc.name == "plot_terminal",
                     },
                 )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import re
 import resource
 import shutil
 import subprocess
@@ -15,6 +16,12 @@ from adaptive_harness.tools.base import Tool, ToolResult
 
 RUNNER = '''import ast, math, numpy as np, scipy, sympy as sp, sys
 scope = {"math": math, "np": np, "numpy": np, "scipy": scipy, "sp": sp, "sympy": sp}
+try:
+    import plotext as plt
+except ImportError:
+    pass
+else:
+    scope.update({"plt": plt, "plotext": plt})
 source = sys.stdin.read()
 tree = ast.parse(source, filename="<repl>")
 last = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
@@ -25,11 +32,15 @@ if last is not None:
         print(repr(value))
 '''
 
+_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+
 
 class RunPythonReplTool(Tool):
     name = "run_python_repl"
     description = ("Run short scientific Python in a network-isolated, read-only Bubblewrap sandbox. "
-                   "math, numpy as np, scipy, and sympy as sp are preloaded. State resets on each call.")
+                   "math, numpy as np, scipy, and sympy as sp are preloaded; optional plotext is plt "
+                   "(call plt.plotsize(70, 18), plt.plot(...), then plt.show() for a text chart). "
+                   "State resets on each call.")
     parameters = {"type": "object", "properties": {
         "code": {"type": "string", "description": "Python code; final expression is printed."},
     }, "required": ["code"]}
@@ -71,7 +82,9 @@ class RunPythonReplTool(Tool):
             return ToolResult(success=False, output="", error="Python sandbox timed out after 8 seconds")
         except OSError as exc:
             return ToolResult(success=False, output="", error=f"Python sandbox failed: {exc}")
-        output = result.stdout[:8000].strip()
+        # plotext emits ANSI colors and sometimes cursor controls. RichLog receives
+        # plain text, so preserve the chart glyphs while removing terminal escapes.
+        output = _ANSI.sub("", result.stdout).replace("\r", "").strip()[:8000]
         error = result.stderr[-4000:].strip()
         return ToolResult(success=result.returncode == 0, output=output,
                           error=error if result.returncode else None,

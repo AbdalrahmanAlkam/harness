@@ -23,6 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+plotting = ["plotext>=5.2.8,<6"]
 onnx = ["onnxruntime>=1.17.0", "transformers>=4.39.0"]
 semif = ["torch>=2.2", "transformers>=4.45", "accelerate>=0.34"]
 semif-4bit = ["torch>=2.2", "transformers>=4.45", "accelerate>=0.34", "bitsandbytes>=0.43"]

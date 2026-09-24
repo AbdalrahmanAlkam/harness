@@ -32,7 +32,7 @@ def _skill(name, title, category, trigger, instructions, tools, invariants, icon
 _INSPECT = "read_file search_files list_directory"
 _EDIT = _INSPECT + " edit_file write_file"
 _CODE = _EDIT + " run_pytest run_bash"
-_SCIENCE = _INSPECT + " calculate run_python_repl verify_equation check_convergence"
+_SCIENCE = _INSPECT + " calculate run_python_repl verify_equation check_convergence plot_terminal"
 
 
 BUILTIN_SKILLS: tuple[BaseSkill, ...] = (
@@ -98,7 +98,7 @@ BUILTIN_SKILLS: tuple[BaseSkill, ...] = (
     _skill("comparative_benchmarking", "Comparative Benchmarking", "Research & Synthesis",
         "Benchmark algorithms or systems across throughput, latency, memory, and reproducible comparisons.",
         "Use the same workload and environment for every candidate. Include warm-up, repetitions, dispersion, input sizes, and units; show a compact table and call out measurement limitations.",
-        _INSPECT + " run_bash run_python_repl calculate", "execution_checked", "🏁"),
+        _INSPECT + " run_bash run_python_repl calculate plot_terminal", "execution_checked", "🏁"),
     _skill("technical_rfc_author", "Technical RFC Author", "Research & Synthesis",
         "Write engineering RFCs, proposals, design trade-offs, rollout plans, and rollback plans.",
         "Inspect current constraints and stakeholders. Present goals, alternatives, interfaces, risks, rollout, rollback, and open questions; ground repository-specific claims in inspected evidence.",

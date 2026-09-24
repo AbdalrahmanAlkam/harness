@@ -10,7 +10,7 @@ from adaptive_harness.skills.registry import BUILTIN_BY_NAME, BaseSkill
 _SAFE_DEFAULT_TOOLS = ("read_file", "search_files", "list_directory")
 _KNOWN_TOOLS = frozenset({"read_file", "search_files", "list_directory", "edit_file", "write_file",
                           "run_pytest", "run_bash", "calculate", "run_python_repl", "verify_equation",
-                          "check_convergence", "web_search"})
+                          "check_convergence", "plot_terminal", "web_search"})
 _KNOWN_INVARIANTS = frozenset({"edit_validated", "tests_green", "evidence_checked", "git_checked",
                                "symbolic_checked", "numerical_checked", "sources_checked",
                                "execution_checked", "dependency_checked"})

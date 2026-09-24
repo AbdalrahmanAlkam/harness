@@ -8,6 +8,7 @@ import concurrent.futures
 from datetime import datetime
 import json
 import os
+import re
 import threading
 from typing import Optional
 from rich.syntax import Syntax
@@ -20,6 +21,7 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from adaptive_harness.agent.agent import AgentEvent, DeveloperAgent
+from adaptive_harness.agent.swarm import DeveloperAgentWorker, SwarmCoordinator
 from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.classifiers.engine import create_backend
 from adaptive_harness.classifiers.domain_classifier import parse_domain_mode
@@ -29,17 +31,20 @@ from adaptive_harness.data.config import ConfigManager, PromptHistoryStore
 from adaptive_harness.data.credentials import CredentialsManager
 from adaptive_harness.data.sessions import SessionStore
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
+from adaptive_harness.classifiers.thinking_classifier import ThinkingLevel
 from adaptive_harness.llm.providers import PROVIDERS, PROVIDER_TIERS, provider_for_url
 from adaptive_harness.llm.catalog import CatalogModel, fetch_models
 from adaptive_harness.tui.widgets import (ClarificationModal, ClassifierTelemetryWidget,
     HistoryInput, PinnedRichLog, ThemePickerModal, QuickSelectModal, OutputViewerModal,
-    CommandPalette, THEME_CHOICES)
+    CommandPalette, DiffReviewModal, THEME_CHOICES)
 from adaptive_harness.tui.formatting import format_model_markdown
+from adaptive_harness.workspace.worktree import WorktreeManager, WorktreeTask, WorktreeError
 
 
 COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/safety", "/classifier", "/new",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
-            "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export")
+            "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export",
+            "/diff", "/isolation", "/swarm")
 
 COMMAND_DESCRIPTIONS = {
     "/provider": "Switch task model provider",
@@ -68,6 +73,9 @@ COMMAND_DESCRIPTIONS = {
     "/tool-output": "Inspect the latest tool result",
     "/copy": "Copy selected chat text",
     "/export": "Export this session",
+    "/diff": "Review isolated changes",
+    "/isolation": "Set worktree isolation: auto, on, off",
+    "/swarm": "Set multi-agent mode: auto, on, off",
 }
 
 
@@ -134,9 +142,10 @@ class AdaptiveHarnessApp(App):
         ("ctrl+n", "new_session", "New Session"),
         ("f1", "show_help", "Help"),
         ("f2", "choose_theme", "Theme"),
-        ("f3", "toggle_telemetry", "Telemetry"),
+        ("f3", "review_diff", "Diff Review"),
         ("f4", "choose_model", "Models"),
         ("f5", "choose_session", "Sessions"),
+        ("f6", "toggle_telemetry", "Telemetry"),
     ]
 
     def __init__(
@@ -220,6 +229,11 @@ class AdaptiveHarnessApp(App):
         self._activity = "Ready"
         self._activity_pulse = False
         self._palette_dismissed_value: str | None = None
+        self.isolation_mode = "auto"
+        self.swarm_mode = "auto"
+        self._review_manager: WorktreeManager | None = None
+        self._review_task: WorktreeTask | None = None
+        self._review_patch = ""
 
         # LLM Client & Repo
         self.llm_client = LLMClient(
@@ -542,6 +556,39 @@ class AdaptiveHarnessApp(App):
         self._show_telemetry = not self._show_telemetry
         self._apply_layout()
 
+    def action_review_diff(self) -> None:
+        if self._busy:
+            return
+        if not self._review_task or not self._review_patch:
+            self.query_one("#chat-log", RichLog).write(Text("No isolated changes are awaiting review.", style="dim"))
+            return
+        if not isinstance(self.screen, DiffReviewModal):
+            self.push_screen(DiffReviewModal(self._review_patch, self._review_task.id),
+                             callback=self._handle_review_decision)
+
+    def _handle_review_decision(self, decision: str | None) -> None:
+        manager, task = self._review_manager, self._review_task
+        if not manager or not task or decision not in {"merge", "discard"}:
+            return
+        log = self.query_one("#chat-log", RichLog)
+        try:
+            result = manager.apply(task) if decision == "merge" else (manager.abort(task) or "Isolated changes discarded")
+        except WorktreeError as exc:
+            log.write(Text(f"Review could not complete: {exc}. The worktree remains available; press F3 to retry.", style="bold red"))
+            return
+        self._review_manager = None
+        self._review_task = None
+        self._review_patch = ""
+        self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(workspace_isolation="Direct workspace")
+        log.write(Text(result, style="bold green" if decision == "merge" else "yellow"))
+
+    def on_unmount(self) -> None:
+        if self._review_manager and self._review_task:
+            try:
+                self._review_manager.abort(self._review_task)
+            except WorktreeError:
+                pass
+
     def action_choose_model(self) -> None:
         if self._busy:
             return
@@ -826,7 +873,8 @@ class AdaptiveHarnessApp(App):
         log.write("  /theme [name]          - Preview and save terminal theme (F2)")
         log.write("  /history               - Show recent prompts; Up/Down recalls prompts")
         log.write("  /export [markdown|json] - Save the session to output/sessions/")
-        log.write("  F3                    - Show or hide telemetry")
+        log.write("  F3                    - Review isolated changes")
+        log.write("  F6                    - Show or hide telemetry")
         log.write("  /clear                 - Clear chat history")
         log.write("  /exit                  - Exit application")
 
@@ -839,6 +887,10 @@ class AdaptiveHarnessApp(App):
             return
         text = event.value.strip()
         if not text:
+            return
+        if self._review_task and text not in {"/diff", "/help", "/exit"}:
+            self.query_one("#chat-log", RichLog).write(Text(
+                "Review the isolated changes with F3 or /diff before starting another task.", style="yellow"))
             return
 
         input_widget = self.query_one("#prompt-input", HistoryInput)
@@ -880,12 +932,20 @@ class AdaptiveHarnessApp(App):
         arg = parts[1].strip() if len(parts) > 1 else ""
 
         if self._busy and cmd in {"/key", "/provider", "/model", "/models", "/tier", "/mode", "/thinking", "/safety", "/classifier", "/sessions",
-                                  "/workspace", "/session", "/skill", "/new", "/reset", "/export"}:
+                                  "/workspace", "/session", "/skill", "/new", "/reset", "/export", "/isolation", "/swarm"}:
             log.write(Text("Wait for the current task before changing settings or exiting.", style="yellow"))
             return
 
         if cmd in ("/exit", "/quit"):
             self.action_quit()
+        elif cmd == "/diff":
+            self.action_review_diff()
+        elif cmd in {"/isolation", "/swarm"}:
+            if arg not in {"auto", "on", "off"}:
+                log.write(Text(f"Usage: {cmd} auto|on|off", style="yellow"))
+            else:
+                setattr(self, "isolation_mode" if cmd == "/isolation" else "swarm_mode", arg)
+                log.write(Text(f"{cmd[1:].title()} mode: {arg}", style="green"))
         elif cmd == "/clear":
             self.action_clear_screen()
         elif cmd == "/help":
@@ -1181,19 +1241,117 @@ class AdaptiveHarnessApp(App):
     def _show_usage(self) -> None:
         self.query_one("#chat-log", RichLog).write(Text("Session usage · " + self._usage_summary(), style="bold cyan"))
 
+    def _should_isolate(self, task: str) -> bool:
+        if self.swarm_mode == "on" or self.isolation_mode == "on":
+            return True
+        if self.isolation_mode == "off":
+            return False
+        level = self.agent.forced_thinking or self.agent.thinking_classifier.classify(task).level
+        editing = bool(re.search(r"\b(edit|implement|fix|refactor|add|write|change|modify|build|upgrade|migrate|create)\b",
+                                 task, flags=re.I))
+        return editing and level in {ThinkingLevel.MEDIUM, ThinkingLevel.DEEP, ThinkingLevel.EXTREME}
+
+    def _should_swarm(self, task: str) -> bool:
+        if self.swarm_mode == "off":
+            return False
+        if self.swarm_mode == "on":
+            return True
+        level = self.agent.forced_thinking or self.agent.thinking_classifier.classify(task).level
+        return level in {ThinkingLevel.DEEP, ThinkingLevel.EXTREME} and self._should_isolate(task)
+
+    def _swarm_client(self) -> LLMClient:
+        source = self.agent.llm_client
+        return LLMClient(api_key=source.api_key, base_url=source.base_url,
+                         default_model=self.agent.explicit_model or source.default_model,
+                         force_mock=source.force_mock, provider=source.provider,
+                         provider_keys=source.provider_keys,
+                         backup_providers=source.backup_providers)
+
+    def _worktree_started(self, task: WorktreeTask) -> None:
+        self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+            workspace_isolation=f"Isolated task-{task.id}")
+        self.query_one("#chat-log", RichLog).write(Text(
+            f"⚑ Working in isolated Git worktree task-{task.id}; main checkout stays untouched until review.",
+            style="bold cyan"))
+
+    def _swarm_status_changed(self, status: dict[str, str]) -> None:
+        self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(swarm_status=status)
+
+    def _swarm_completed(self, report, task_text: str) -> None:
+        log = self.query_one("#chat-log", RichLog)
+        self.agent.messages.append({"role": "user", "content": task_text})
+        summary = "\n".join(f"{result.role.value.title()} ({result.phase.value}): {result.summary}"
+                            for result in report.results)
+        self.agent.messages.append({"role": "assistant", "content": summary})
+        for result in report.results:
+            log.write(Text(f"{result.role.value.title()} · {result.phase.value}: "
+                           f"{'✓' if result.success else '✗'} {result.summary[:400]}",
+                           style="green" if result.success else "red"))
+        log.write(Text("Swarm verification passed" if report.success else
+                       "Swarm stopped without verified completion", style="bold green" if report.success else "bold yellow"))
+
+    def _worktree_ready(self, manager: WorktreeManager, task: WorktreeTask, patch: str) -> None:
+        self._review_manager, self._review_task, self._review_patch = manager, task, patch
+        self.query_one("#chat-log", RichLog).write(Text(
+            f"Isolated task-{task.id} produced changes. Review with F3 or /diff before applying.", style="bold cyan"))
+        self.push_screen(DiffReviewModal(patch, task.id), callback=self._handle_review_decision)
+
+    def _worktree_finished_without_review(self) -> None:
+        self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+            workspace_isolation="Direct workspace", swarm_status={})
+
     @work(thread=True)
     def execute_agent_task(self, task_text: str) -> None:
         """Worker thread executing the agent task and streaming events back to the UI."""
+        manager: WorktreeManager | None = None
+        isolated: WorktreeTask | None = None
+        ready_for_review = False
         try:
-            for event in self.agent.run_stream(task_text):
-                self.call_from_thread(self._render_event, event)
+            if self._should_isolate(task_text):
+                try:
+                    manager = WorktreeManager(self.workspace_root)
+                    isolated = manager.create()
+                except WorktreeError as exc:
+                    if "not a git repository" not in str(exc).lower() or self.isolation_mode == "on" or self.swarm_mode == "on":
+                        raise
+                    manager = None
+                if isolated:
+                    self.agent.set_workspace(isolated.workspace)
+                    self.call_from_thread(self._worktree_started, isolated)
+            if self._should_swarm(task_text) and isolated:
+                coordinator = SwarmCoordinator(DeveloperAgentWorker(llm_client_factory=self._swarm_client),
+                    on_status=lambda status: self.call_from_thread(self._swarm_status_changed, dict(status)))
+                report = coordinator.run(task_text, isolated.workspace, isolated=True)
+                self.call_from_thread(self._swarm_completed, report, task_text)
+                success = report.success
+            else:
+                success = False
+                for event in self.agent.run_stream(task_text):
+                    if event.event_type == "response":
+                        success = bool(event.payload.get("success"))
+                    self.call_from_thread(self._render_event, event)
+            if manager and isolated:
+                patch = manager.patch(isolated)
+                if success and patch:
+                    ready_for_review = True
+                    self.call_from_thread(self._worktree_ready, manager, isolated, patch)
+                else:
+                    manager.abort(isolated)
+                    self.call_from_thread(self._worktree_finished_without_review)
         except Exception as exc:
+            if manager and isolated and not ready_for_review:
+                try:
+                    manager.abort(isolated)
+                except WorktreeError:
+                    pass
             if self.is_running:
                 try:
                     self.call_from_thread(self._render_error, f"Agent error: {type(exc).__name__}: {exc}")
                 except RuntimeError:
                     pass
         finally:
+            if isolated:
+                self.agent.set_workspace(self.workspace_root)
             try:
                 if self.is_running:
                     self.call_from_thread(self._finish_task)
@@ -1205,6 +1363,9 @@ class AdaptiveHarnessApp(App):
         self._activity = "Ready"
         self._save_session()
         self._refresh_status()
+        if self._review_task:
+            self._quit_when_finished = False
+            return
         if self._quit_when_finished:
             self.exit()
         else:
@@ -1328,6 +1489,8 @@ class AdaptiveHarnessApp(App):
                 if "Diff:\n" in output or output.startswith("@@"):
                     diff = output.split("Diff:\n", 1)[-1]
                     log.write(Syntax(diff, "diff", theme="monokai", line_numbers=False))
+                elif p.get("chart"):
+                    log.write(Text(output, style="bold cyan"))
                 else:
                     visible_output = format_model_markdown(output, plain=True) if (
                         "$$" in output or r"\[" in output or r"\(" in output or r"\frac" in output

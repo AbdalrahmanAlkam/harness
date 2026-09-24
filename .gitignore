@@ -16,3 +16,4 @@ output/*.db
 
 .env
 .env.*
+.harness/

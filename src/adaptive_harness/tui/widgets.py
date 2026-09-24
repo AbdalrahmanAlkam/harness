@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import shlex
 from rich.panel import Panel
 from rich.console import Group
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
+from rich.syntax import Syntax
 from adaptive_harness.llm.client import MODEL_TIERS
 from textual.app import ComposeResult
 from textual import events
@@ -77,6 +79,8 @@ class ClassifierTelemetryWidget(Static):
         self.context_used = 0
         self.context_capacity = 0
         self.context_compacted = 0
+        self.workspace_isolation = "Direct workspace"
+        self.swarm_status: dict[str, str] = {}
 
     def reset_telemetry(self, *, classifier_engine: str | None = None,
                         classifier_model: str | None = None, model: str | None = None,
@@ -106,6 +110,8 @@ class ClassifierTelemetryWidget(Static):
         self.context_used = 0
         self.context_capacity = 0
         self.context_compacted = 0
+        self.workspace_isolation = "Direct workspace"
+        self.swarm_status = {}
         if classifier_engine is not None:
             self.classifier_engine = classifier_engine
         if classifier_model is not None:
@@ -147,6 +153,8 @@ class ClassifierTelemetryWidget(Static):
         context_used: Optional[int] = None,
         context_capacity: Optional[int] = None,
         context_compacted: Optional[int] = None,
+        workspace_isolation: Optional[str] = None,
+        swarm_status: Optional[dict[str, str]] = None,
     ) -> None:
         if probabilities is not None:
             self.probabilities = probabilities
@@ -187,6 +195,10 @@ class ClassifierTelemetryWidget(Static):
                            ("context_compacted", context_compacted)):
             if value is not None:
                 setattr(self, key, value)
+        if workspace_isolation is not None:
+            self.workspace_isolation = workspace_isolation
+        if swarm_status is not None:
+            self.swarm_status = dict(swarm_status)
 
         self.refresh()
 
@@ -203,6 +215,13 @@ class ClassifierTelemetryWidget(Static):
         status.append("Engine: ", style="bold cyan")
         status.append(f"{engine_name} ({model_name})\n", style=engine_color)
         status.append(f"Latency: {self.classifier_latency_ms:.2f} ms\n", style="cyan")
+        status.append("Workspace: ", style="bold cyan")
+        status.append(self.workspace_isolation + "\n",
+                      style="bold green" if self.workspace_isolation != "Direct workspace" else "dim")
+        if self.swarm_status:
+            status.append("Swarm: ", style="bold cyan")
+            status.append(" · ".join(f"{name.split(':')[0]}:{value}" for name, value in self.swarm_status.items()
+                                     if value != "queued") + "\n", style="yellow")
         overseer_color = "bold green" if self.overseer_state == "HEALTHY_PROGRESS" else "bold yellow"
         status.append("Overseer: ", style="bold cyan")
         status.append(self.overseer_state.replace("_", " ") + "\n", style=overseer_color)
@@ -755,6 +774,85 @@ class ClarificationModal(ModalScreen[str]):
         val = event.value.strip()
         if val:
             self.dismiss(val)
+
+
+class DiffReviewModal(ModalScreen[str]):
+    """Review a complete isolated patch before explicitly applying or discarding it."""
+
+    DEFAULT_CSS = """
+    DiffReviewModal { align: center middle; background: rgba(0, 0, 0, 0.75); }
+    #diff-card { width: 95%; height: 92%; background: $surface; border: round $accent; padding: 1 2; }
+    #diff-title { height: 2; color: $accent; text-style: bold; text-align: center; }
+    #diff-summary { height: 2; color: $text; overflow-x: auto; }
+    #diff-body { height: 1fr; border: solid $primary; background: $background; }
+    #diff-help { height: 1; color: $text-muted; text-align: center; }
+    #diff-actions { height: 3; }
+    #diff-actions Button { width: 1fr; }
+    """
+    BINDINGS = [("escape", "discard", "Discard"), ("enter", "merge", "Merge")]
+
+    def __init__(self, patch: str, task_id: str):
+        super().__init__()
+        self.patch = patch
+        self.task_id = task_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="diff-card"):
+            yield Label(f"Review isolated changes · task-{self.task_id}", id="diff-title")
+            yield Static(Text(self._summary()), id="diff-summary")
+            yield RichLog(id="diff-body", wrap=False, highlight=False, markup=False)
+            yield Static("↑↓ scroll · Enter merge & apply · Esc discard", id="diff-help")
+            with Horizontal(id="diff-actions"):
+                yield Button("Merge & Apply", id="diff-merge", variant="success")
+                yield Button("Discard & Abort", id="diff-discard", variant="error")
+
+    def on_mount(self) -> None:
+        view = self.query_one("#diff-body", RichLog)
+        view.write(Syntax(self.patch, "diff", theme="monokai", line_numbers=False))
+        view.focus()
+
+    def _summary(self) -> str:
+        files: list[str] = []
+        name = ""
+        kind = "M"
+        added = removed = 0
+
+        def append_file() -> None:
+            if name:
+                files.append(f"{kind} {name} (+{added}, -{removed})")
+
+        for line in self.patch.splitlines():
+            if line.startswith("diff --git "):
+                append_file()
+                try:
+                    target = shlex.split(line)[-1]
+                except ValueError:
+                    target = line.rsplit(" ", 1)[-1]
+                name = target.partition("/")[2] or target
+                kind, added, removed = "M", 0, 0
+            elif line.startswith("new file mode "):
+                kind = "A"
+            elif line.startswith("deleted file mode "):
+                kind = "D"
+            elif line.startswith("+") and not line.startswith("+++"):
+                added += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                removed += 1
+        append_file()
+        return f"{len(files)} file(s): " + (" · ".join(files[:6]) + (" …" if len(files) > 6 else ""))
+
+    def action_merge(self) -> None:
+        self.dismiss("merge")
+
+    def action_discard(self) -> None:
+        self.dismiss("discard")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "diff-merge":
+            self.action_merge()
+        elif event.button.id == "diff-discard":
+            self.action_discard()
+        event.stop()
 
 
 class OutputViewerModal(ModalScreen[None]):
