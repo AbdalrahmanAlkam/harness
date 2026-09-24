@@ -92,7 +92,7 @@ def test_skill_verifier_uses_tool_evidence():
     assert not verifier.verify((skill,), ({"name": "run_pytest", "success": False},))[0].verified
 
 
-def test_agent_injects_only_selected_skill_and_narrows_tools(tmp_path: Path):
+def test_agent_injects_selected_skill_and_preserves_coding_tools(tmp_path: Path):
     requests = []
 
     class Client:
@@ -109,7 +109,7 @@ def test_agent_injects_only_selected_skill_and_narrows_tools(tmp_path: Path):
     assert "Map callers and tests before editing" not in request["messages"][0]["content"]
     assert "State responsibilities, data flow" in request["messages"][0]["content"]
     names = {tool["function"]["name"] for tool in request["tools"]}
-    assert "edit_file" not in names
+    assert {"edit_file", "write_file", "run_bash", "run_pytest"}.issubset(names)
     assert "read_file" in names
     assert any(event.event_type == "skill_verification" for event in events)
     assert next(event.payload for event in events if event.event_type == "response")["success"] is False

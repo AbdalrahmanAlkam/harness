@@ -85,6 +85,8 @@ def test_isolation_and_swarm_modes_select_complex_edits(repo: Path):
     app = AdaptiveHarnessApp(workspace_root=str(repo), db_path=repo.parent / "ui.db",
                              config_dir=repo.parent / "config")
     assert not app._should_isolate("read file app.py")
+    assert not app._should_isolate("Refactor the architecture across modules and add tests")
+    app.isolation_mode = "auto"
     assert app._should_isolate("Refactor the architecture across modules and add tests")
     assert app._should_swarm("Fix a concurrency deadlock and refactor the architecture")
     app.swarm_mode = "off"

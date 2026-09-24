@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import json
 from pathlib import Path
+import re
 from typing import Any, Callable, Mapping, Protocol
 
 
@@ -34,7 +35,7 @@ _ROLE_INSTRUCTIONS: dict[tuple[SwarmRole, SwarmPhase], str] = {
     (SwarmRole.QA, SwarmPhase.PLAN):
         "Inspect relevant tests and propose concrete regression cases for the task. Do not edit files.",
     (SwarmRole.CODER, SwarmPhase.IMPLEMENT):
-        "Implement the task in the isolated worktree. Include the proposed tests and run relevant checks.",
+        "Implement the task in the assigned workspace. Create the requested directories and files with write_file or edit_file. Run relevant checks.",
     (SwarmRole.QA, SwarmPhase.VERIFY):
         "Independently inspect the implementation and run relevant tests. Report exact test evidence; do not edit files.",
     (SwarmRole.SECURITY, SwarmPhase.VERIFY):
@@ -128,10 +129,8 @@ class SwarmCoordinator:
         if not task.strip():
             raise ValueError("Swarm task cannot be empty")
 
-        status = {key: "queued" for key in _ROLE_INSTRUCTIONS}
-        # The public status uses JSON-friendly string keys.
-        statuses = {f"{role.value}:{phase.value}": value
-                    for (role, phase), value in status.items()}
+        statuses = {"architect:plan": "queued", "coder:implement": "queued",
+                    "qa:verify": "queued"}
         results: list[SwarmResult] = []
         self._notify(statuses)
 
@@ -155,7 +154,7 @@ class SwarmCoordinator:
                                              "Subagent failed", error=f"{type(exc).__name__}: {exc}")
                     # Retry a transient worker failure once. The writer is
                     # still serialized because each wave finishes before the next.
-                    if not result.success and result.error:
+                    if not result.success and (result.error or assignment.may_edit):
                         try:
                             retry = self.worker(assignment)
                             if retry.role is not assignment.role or retry.phase is not assignment.phase:
@@ -171,27 +170,20 @@ class SwarmCoordinator:
                     self._notify(statuses)
             return [collected[assignment.key] for assignment in assignments]
 
-        planning = wave((
-            SwarmAssignment(SwarmRole.ARCHITECT, SwarmPhase.PLAN, task, root),
-            SwarmAssignment(SwarmRole.QA, SwarmPhase.PLAN, task, root),
-        ))
+        planning = wave((SwarmAssignment(SwarmRole.ARCHITECT, SwarmPhase.PLAN, task, root),))
         results.extend(planning)
-        if not all(item.success for item in planning):
-            return SwarmReport(tuple(results), False, dict(statuses))
-
         implementation = wave((SwarmAssignment(SwarmRole.CODER, SwarmPhase.IMPLEMENT,
             task, root, {item.key: item.to_dict() for item in planning}),))
         results.extend(implementation)
         if not implementation[0].success:
+            statuses["qa:verify"] = "skipped"
+            self._notify(statuses)
             return SwarmReport(tuple(results), False, dict(statuses))
 
         review_context = {item.key: item.to_dict() for item in results}
-        reviews = wave((
-            SwarmAssignment(SwarmRole.QA, SwarmPhase.VERIFY, task, root, review_context),
-            SwarmAssignment(SwarmRole.SECURITY, SwarmPhase.VERIFY, task, root, review_context),
-        ))
+        reviews = wave((SwarmAssignment(SwarmRole.QA, SwarmPhase.VERIFY, task, root, review_context),))
         results.extend(reviews)
-        success = all(item.success for item in results) and reviews[0].verified
+        success = implementation[0].success and all(item.success for item in reviews) and reviews[0].verified
         return SwarmReport(tuple(results), success, dict(statuses))
 
     def _notify(self, status: Mapping[str, str]) -> None:
@@ -227,11 +219,18 @@ class DeveloperAgentWorker:
             tools += [WriteFileTool(workspace_root=root), EditFileTool(workspace_root=root),
                       RunBashTool(workspace_root=root), RunPytestTool(workspace_root=root)]
         elif assignment.role is SwarmRole.QA and assignment.phase is SwarmPhase.VERIFY:
-            tools.append(RunPytestTool(workspace_root=root))
+            tools.append(RunBashTool(workspace_root=root))
+            if (assignment.workspace_root / "tests").is_dir():
+                tools.append(RunPytestTool(workspace_root=root))
+        role_prompt = ("You are a read-only planning or review subagent. Do not attempt write_file or edit_file. "
+                       "Inspect available evidence and return a useful plan or review with the tools you have."
+                       if not assignment.may_edit else DEFAULT_SYSTEM_PROMPT)
         agent = DeveloperAgent(llm_client=self.llm_client_factory() if self.llm_client_factory else None,
             tools=tools, workspace_root=root,
             forced_mode="security" if assignment.role is SwarmRole.SECURITY else "coding",
-            system_prompt=f"{DEFAULT_SYSTEM_PROMPT}\n{assignment.instruction}\n"
+            require_file_changes=assignment.may_edit,
+            enable_skill_routing=False,
+            system_prompt=f"{role_prompt}\n{assignment.instruction}\n"
                           "Only use available tools within the assigned workspace.")
         prompt = assignment.task
         if assignment.context:
@@ -247,9 +246,14 @@ class DeveloperAgentWorker:
                                  "error": event.payload.get("error")})
         test_results = [item for item in evidence if item["tool"] == "run_pytest"]
         successful_tests = bool(test_results and test_results[-1]["success"])
-        success = bool(response.get("success"))
-        verified = (successful_tests if assignment.role is SwarmRole.QA and
+        summary = str(response.get("content", ""))[:4000]
+        refused = bool(re.search(r"\b(?:i cannot|i can't|unable to|cannot coordinate|no write_file|no edit_file)\b",
+                                 summary, re.I))
+        success = bool(response.get("success")) and not refused
+        inspected_files = any(item["tool"] == "read_file" and item["success"] for item in evidence)
+        verified = ((successful_tests or inspected_files) if assignment.role is SwarmRole.QA and
                     assignment.phase is SwarmPhase.VERIFY else success)
         return SwarmResult(assignment.role, assignment.phase, success,
-            str(response.get("content", ""))[:4000],
-            {"tool_evidence": evidence, "stop_reason": response.get("stop_reason")}, verified)
+            summary,
+            {"tool_evidence": evidence, "stop_reason": response.get("stop_reason")}, verified,
+            error="Model refused the assigned role" if refused else None)

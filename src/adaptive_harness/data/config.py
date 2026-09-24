@@ -9,6 +9,9 @@ import re
 
 
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "adaptive-harness"
+DEFAULT_MODEL = "z-ai/glm-5.3-flash"
+DEFAULT_MODEL_SELECTION = "manual"
+DEFAULT_SWARM_MODE = "auto"
 
 
 def _private_write(path: Path, content: str) -> None:

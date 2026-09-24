@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 import re
 import time
 from typing import Any, Callable, Dict, Generator, List, Optional
@@ -23,7 +24,7 @@ from adaptive_harness.classifiers.thinking_classifier import (ThinkingClassifier
     ThinkingLevel, BUDGET_TOKENS, parse_thinking_level)
 from adaptive_harness.classifiers.skill_classifier import SKILL_CLASSES
 from adaptive_harness.data.storage import ExperienceRepository
-from adaptive_harness.llm.client import LLMClient
+from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
 from adaptive_harness.llm.mock_client import ToolCall, LLMResponse
 from adaptive_harness.models.domain import ExecutionAttempt, ExecutionTrace, VerificationResult
 from adaptive_harness.tools.base import Tool, ToolResult
@@ -90,21 +91,26 @@ class DeveloperAgent:
         safety_profile: str = "turbo",
         preferences_dir: str | Path | None = None,
         swarm_enabled: bool = False,
+        require_file_changes: bool | None = None,
+        enable_skill_routing: bool = True,
     ):
         if safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
             raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
         self.safety_profile = safety_profile
+        self.require_file_changes = require_file_changes
+        self.enable_skill_routing = enable_skill_routing
         self.clarification_memory = ClarificationMemory(preferences_dir)
         self.llm_client = llm_client or LLMClient()
         self.repository = repository
         self.clarification_callback = clarification_callback
         self.system_prompt = system_prompt
-        self.workspace_root = Path(workspace_root or ".").resolve()
+        self.workspace_root = Path(workspace_root or Path.cwd()).expanduser().resolve()
         self.active_skills: dict[str, str] = {}
         self.skill_catalog = SkillCatalog(self.workspace_root)
         self.skill_router = SkillRouter()
         self.skill_verifier = SkillVerifier()
-        self.explicit_model = explicit_model
+        self.explicit_model = (None if explicit_model == "auto" else
+                               explicit_model or getattr(self.llm_client, "default_model", MODEL_TIERS["standard"]))
         self.forced_mode = parse_domain_mode(forced_mode)
         self.forced_thinking = parse_thinking_level(forced_thinking)
         self.classifier_backend = classifier_backend or SklearnBackend()
@@ -197,6 +203,7 @@ class DeveloperAgent:
         """Executes a task through the agentic lifecycle, yielding real-time events for the TUI."""
         start_time = time.perf_counter()
         original_input = user_input
+        local_skill = self.skill_classifier.classify(user_input)
         preference_guidance = self.clarification_memory.guidance()
         settings_key = json.dumps({"mode": self.forced_mode.value if self.forced_mode else "auto",
                                    "thinking": self.forced_thinking.value if self.forced_thinking else "auto",
@@ -210,6 +217,19 @@ class DeveloperAgent:
                 cached = None
                 yield AgentEvent("storage_error", {"error": f"Could not read solution cache: {exc}"})
             if cached:
+                yield AgentEvent("skill_classification", {
+                    "primary_skill": local_skill.primary_skill,
+                    "confidence": local_skill.confidence,
+                    "probabilities": local_skill.probabilities,
+                    "backend": "sklearn", "classifier_model": "TF-IDF + Logistic Regression",
+                    "latency_ms": 0.0,
+                })
+                values = sorted(local_skill.probabilities.values(), reverse=True)
+                yield AgentEvent("ambiguity_assessment", {
+                    "entropy": -sum(value * math.log2(value) for value in values if value > 0),
+                    "confidence_margin": values[0] - values[1] if len(values) > 1 else 1.0,
+                    "risk_level": "low",
+                })
                 self.messages.append({"role": "user", "content": user_input})
                 self.messages.append({"role": "assistant", "content": cached["answer"]})
                 yield AgentEvent("memory_hit", {"original_tokens": cached["original_tokens"]})
@@ -384,7 +404,7 @@ class DeveloperAgent:
             payload={
                 "tier": selected_tier,
                 "model": selected_model,
-                "selection": "forced" if self.explicit_model else "auto",
+                "selection": "manual" if self.explicit_model else "auto",
                 "reasoning": complexity_res.reasoning,
             },
         )
@@ -395,7 +415,7 @@ class DeveloperAgent:
             yield AgentEvent("storage_error", {"error": f"Skill {missing_skill} is no longer installed; resuming automatic routing."})
         skill_selection = self.skill_router.route(original_input, catalog,
             self.classifier_backend, tuple(self.active_skills))
-        selected_skills = skill_selection.skills
+        selected_skills = skill_selection.skills if self.enable_skill_routing else ()
         security_skill_active = any(skill.name == "security_audit_scanner"
                                     for skill in selected_skills)
         selected_tool_names = set().union(*(set(skill.tools) for skill in selected_skills)) if selected_skills else None
@@ -403,7 +423,8 @@ class DeveloperAgent:
 
         # Add user message to history
         self.messages.append({"role": "user", "content": user_input})
-        mutation_required = requests_file_changes(original_input)
+        mutation_required = (requests_file_changes(original_input) if self.require_file_changes is None
+                             else self.require_file_changes)
         successful_mutations = 0
         skill_guidance = "\n".join(
             f"Active skill: {skill.title}. {skill.instructions} Completion checks: {', '.join(skill.invariants) or 'none'}."
@@ -437,6 +458,10 @@ class DeveloperAgent:
             domain_tool_names.discard("ask_user")
         if selected_tool_names is not None:
             domain_tool_names.intersection_update(selected_tool_names)
+        if domain_res.mode == DomainMode.CODING or (mutation_required and domain_res.mode != DomainMode.AUDIT):
+            # Skills add guidance; they must never remove the core coding tools.
+            domain_tool_names.update({"read_file", "list_directory", "search_files", "write_file",
+                                      "edit_file", "run_bash", "run_pytest"} & set(self.tools))
         if self.swarm_enabled and domain_res.mode != DomainMode.AUDIT:
             domain_tool_names.add("delegate_subagent")
         tool_schemas = [t.to_openai_schema() for t in self.tools.values() if t.name in domain_tool_names]

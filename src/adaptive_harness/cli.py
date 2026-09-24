@@ -141,7 +141,7 @@ def tui(
     semif_device: str = typer.Option("auto", "--semif-device", help="SemIf device: auto, cpu, cuda, or mps"),
     semif_4bit: bool = typer.Option(False, "--semif-4bit", help="Load SemIf in 4-bit on CUDA (requires bitsandbytes)"),
     semif_temperature: float = typer.Option(1.0, "--semif-temperature", min=0.01, help="SemIf probability temperature"),
-    workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w", help="Working directory for agent tools"),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w", help="Working directory for agent tools (default: launch directory)"),
     session: Optional[str] = typer.Option(None, "--session", help="Resume an existing TUI session ID"),
     skill: Optional[list[str]] = typer.Option(None, "--skill", help="Force a built-in or custom skill (repeatable)"),
     db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Path to experience database"),
@@ -169,8 +169,8 @@ def tui(
             provider=provider,
             backup_providers=tuple(backup_provider or ()),
             base_url=base_url,
-            default_model=(None if model and model.lower() == "auto" else model) or
-                (PROVIDER_TIERS.get(provider or "openrouter", MODEL_TIERS)[tier] if tier in MODEL_TIERS else None),
+            default_model=("auto" if model and model.lower() == "auto" else model or
+                (PROVIDER_TIERS.get(provider or "openrouter", MODEL_TIERS)[tier] if tier in MODEL_TIERS else None)),
             mode=mode,
             thinking=thinking,
             safety=safety,
@@ -181,7 +181,7 @@ def tui(
             semif_device=semif_device,
             semif_4bit=semif_4bit,
             semif_temperature=semif_temperature,
-            workspace_root=str(workspace),
+            workspace_root=str(Path(workspace or Path.cwd()).expanduser().resolve()),
             session_id=session,
             db_path=db_path,
         )
@@ -220,7 +220,7 @@ def dev(
     semif_device: str = typer.Option("auto", "--semif-device", help="SemIf device: auto, cpu, cuda, or mps"),
     semif_4bit: bool = typer.Option(False, "--semif-4bit", help="Load SemIf in 4-bit on CUDA (requires bitsandbytes)"),
     semif_temperature: float = typer.Option(1.0, "--semif-temperature", min=0.01, help="SemIf probability temperature"),
-    workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w", help="Working directory for agent tools"),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w", help="Working directory for agent tools (default: launch directory)"),
     skill: Optional[list[str]] = typer.Option(None, "--skill", help="Enable a named workspace or user skill"),
     db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Path to experience database"),
 ):
@@ -254,6 +254,7 @@ def dev(
 
     provider_tiers = PROVIDER_TIERS.get(selected_provider, MODEL_TIERS)
     selected_model = (None if model and model.lower() == "auto" else model) or (provider_tiers[tier] if tier in MODEL_TIERS else None)
+    workspace = Path(workspace or Path.cwd()).expanduser().resolve()
     from adaptive_harness.data.config import ConfigManager
     try:
         saved_keys = CredentialsManager().load()
@@ -278,7 +279,9 @@ def dev(
         overseer_backend = create_backend("onnx", overseer_model) if overseer_model else None
     except (ValueError, RuntimeError, OSError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--classifier-backend") from exc
-    agent = DeveloperAgent(llm_client=client, repository=repo, workspace_root=str(workspace), explicit_model=selected_model,
+    agent = DeveloperAgent(llm_client=client, repository=repo, workspace_root=str(workspace),
+                           explicit_model="auto" if model and model.lower() == "auto" else
+                                          selected_model or client.default_model,
                            classifier_backend=backend, overseer_backend=overseer_backend,
                            forced_mode=selected_mode, forced_thinking=selected_thinking,
                            safety_profile=safety or "turbo", swarm_enabled=swarm)

@@ -479,7 +479,7 @@ def test_model_selection_precedence(tmp_path: Path):
     events = list(agent.run_stream("git status", max_steps=1))
     route = next(e.payload for e in events if e.event_type == "model_routing")
     assert route["model"] == "custom/forced"
-    assert route["selection"] == "forced"
+    assert route["selection"] == "manual"
     assert next(e.payload for e in events if e.event_type == "thought")["model"] == "custom/forced"
     agent.explicit_model = None
     route = next(e.payload for e in agent.run_stream("git status", max_steps=1) if e.event_type == "model_routing")
@@ -526,7 +526,7 @@ def test_domain_and_thinking_overrides_control_agent(tmp_path: Path):
         return LLMResponse(content="done", model=kwargs["model"])
     client.complete = complete
     agent = DeveloperAgent(llm_client=client, workspace_root=str(tmp_path),
-                           forced_mode="security", forced_thinking="deep")
+                           forced_mode="security", forced_thinking="deep", explicit_model="auto")
     events = list(agent.run_stream("git status", max_steps=1))
     domain = next(item.payload for item in events if item.event_type == "domain_mode")
     thinking = next(item.payload for item in events if item.event_type == "thinking_budget")
@@ -573,7 +573,7 @@ def test_thinking_classification_adjusts_automatic_model_tier(tmp_path: Path):
         ("git status", "none", "reasoning", "fast"),
     ):
         agent = DeveloperAgent(llm_client=LLMClient(force_mock=True), workspace_root=str(tmp_path),
-                               classifier_backend=RoutedBackend(thinking, tier))
+                               classifier_backend=RoutedBackend(thinking, tier), explicit_model="auto")
         events = list(agent.run_stream(text, max_steps=1))
         route = next(item.payload for item in events if item.event_type == "model_routing")
         assert route["tier"] == expected

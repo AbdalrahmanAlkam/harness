@@ -7,6 +7,7 @@ import asyncio
 import concurrent.futures
 from datetime import datetime
 import json
+import math
 import os
 import re
 import threading
@@ -27,7 +28,8 @@ from adaptive_harness.classifiers.engine import create_backend
 from adaptive_harness.classifiers.domain_classifier import parse_domain_mode
 from adaptive_harness.classifiers.thinking_classifier import parse_thinking_level, BUDGET_TOKENS
 from adaptive_harness.data.storage import ExperienceRepository
-from adaptive_harness.data.config import ConfigManager, PromptHistoryStore
+from adaptive_harness.data.config import (ConfigManager, PromptHistoryStore,
+                                          DEFAULT_MODEL, DEFAULT_MODEL_SELECTION, DEFAULT_SWARM_MODE)
 from adaptive_harness.data.credentials import CredentialsManager
 from adaptive_harness.data.sessions import SessionStore
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
@@ -99,6 +101,17 @@ class AdaptiveHarnessApp(App):
     Screen {
         background: $background;
     }
+    ModalScreen { background: rgba(0, 0, 0, 0.75); color: #ffffff; }
+    OptionList, Select, ListView, Input {
+        background: #1e1e2e;
+        color: #ffffff;
+        border: solid #89b4fa;
+    }
+    OptionList > .option-list--option { color: #ffffff; padding: 0 1; }
+    OptionList > .option-list--option-highlighted {
+        background: #89b4fa; color: #11111b; text-style: bold;
+    }
+    OptionList > .option-list--option-hover { background: #313244; color: #ffffff; }
     #main-container {
         height: 1fr;
     }
@@ -204,13 +217,16 @@ class AdaptiveHarnessApp(App):
                            "saved credentials" if self.provider_keys.get(self.provider_name) else "offline")
         self.saved_theme = saved_config.get("theme", "textual-dark")
         self.base_url = base_url
-        if default_model and default_model.lower() == "auto":
+        requested_auto_model = bool(default_model and default_model.lower() == "auto")
+        if requested_auto_model:
             default_model = None
         self._cli_model_override = default_model
+        self._cli_model_auto_override = requested_auto_model
         self._cli_provider_override = provider
-        self.default_model = default_model or MODEL_TIERS["standard"]
+        self.default_model = default_model or (DEFAULT_MODEL if self.provider_name == "openrouter"
+                                               else PROVIDERS[self.provider_name].default_model)
         self.db_path = db_path
-        self.workspace_root = str(Path(workspace_root or ".").expanduser().resolve())
+        self.workspace_root = str(Path(workspace_root or Path.cwd()).expanduser().resolve())
         if not Path(self.workspace_root).is_dir():
             raise ValueError(f"Workspace directory does not exist: {self.workspace_root}")
         self.classifier_endpoint = classifier_endpoint
@@ -230,8 +246,8 @@ class AdaptiveHarnessApp(App):
         self._activity = "Ready"
         self._activity_pulse = False
         self._palette_dismissed_value: str | None = None
-        self.isolation_mode = "auto"
-        self.swarm_mode = "auto"
+        self.isolation_mode = "off"
+        self.swarm_mode = DEFAULT_SWARM_MODE
         self._review_manager: WorktreeManager | None = None
         self._review_task: WorktreeTask | None = None
         self._review_patch = ""
@@ -253,7 +269,7 @@ class AdaptiveHarnessApp(App):
             self.session_store.close()
             raise ValueError(f"Session not found: {session_id}")
         if self.session is not None:
-            self.workspace_root = self.session.workspace
+            self.session.workspace = self.workspace_root
         else:
             self.session = self.session_store.create(self.workspace_root)
         self.skill_catalog = SkillCatalog(self.workspace_root)
@@ -281,7 +297,7 @@ class AdaptiveHarnessApp(App):
             repository=self.repository,
             clarification_callback=self._request_interactive_clarification,
             workspace_root=self.workspace_root,
-            explicit_model=default_model,
+            explicit_model="auto" if requested_auto_model else self.default_model,
             preferences_dir=config_dir,
             forced_mode=initial_mode,
             forced_thinking=initial_thinking,
@@ -325,6 +341,8 @@ class AdaptiveHarnessApp(App):
 
         log = self.query_one("#chat-log", RichLog)
         self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+            model=self.agent.explicit_model or self.agent.llm_client.default_model,
+            selection="manual" if self.agent.explicit_model else "auto",
             classifier_engine=self.agent.classifier_backend.name,
             classifier_model=self.agent.classifier_backend.model,
             domain_mode=self.agent.forced_mode.value if self.agent.forced_mode else "—",
@@ -336,6 +354,10 @@ class AdaptiveHarnessApp(App):
             provider_cached_tokens=self._cached_tokens,
             provider_prompt_tokens=self.prompt_tokens)
         log.write("[bold cyan]Welcome to Adaptive Agent Harness 2.0![/bold cyan]")
+        log.write(Text(f"Workspace: {self.workspace_root} · Model: "
+                       f"{self.agent.explicit_model or self.agent.llm_client.default_model} "
+                       f"[{'MANUAL' if self.agent.explicit_model else 'AUTO'}] · Swarm: {self.swarm_mode.upper()}",
+                       style="bold cyan"))
         log.write(
             "[dim]Autonomous coding agent with pervasive ML routing, active verification, and interactive clarification.[/dim]\n"
         )
@@ -392,12 +414,12 @@ class AdaptiveHarnessApp(App):
         context_label = (f" · Ctx:{telemetry.context_used // 1000}k/{telemetry.context_capacity // 1000}k"
                          if telemetry.context_capacity else "")
         safety = self.agent.safety_profile.upper()
-        self.sub_title = f"Safety: {safety}  ·  {provider} ({model})  ·  {activity}  ·  {mode} / {thinking}{context_label}  ·  Tokens:{token_total:,}  ·  {cost_display}"
+        self.sub_title = f"Safety: {safety}  ·  {provider} ({model}) [{telemetry.selection.upper()}]  ·  Swarm: {self.swarm_mode.upper()}  ·  {activity}  ·  {mode} / {thinking}{context_label}  ·  Tokens:{token_total:,}  ·  {cost_display}"
         status = Text(style="bold cyan")
         status.append("Safety: ")
         status.append("TURBO (Full Autonomy)" if safety == "TURBO" else safety,
                       style="bold green" if safety == "TURBO" else "bold yellow")
-        status.append(f"  ·  {activity}  ·  {provider}  ·  {mode}/{thinking}  ·  Tokens {token_total:,}  ·  {cost_display}  ·  Session {self.session.id}  ·  {self.workspace_root}")
+        status.append(f"  ·  {activity}  ·  {provider} [{telemetry.selection.upper()}]  ·  Swarm {self.swarm_mode.upper()}  ·  {mode}/{thinking}  ·  Tokens {token_total:,}  ·  {cost_display}  ·  Session {self.session.id}  ·  {self.workspace_root}")
         self.query_one("#status-line", Static).update(status)
 
     def _save_session(self) -> None:
@@ -406,6 +428,7 @@ class AdaptiveHarnessApp(App):
         self.session.model = self.agent.explicit_model
         self.session.skills = list(self.agent.active_skills)
         self.session.settings = {"classifier_backend": self.agent.classifier_backend.name,
+                                 "model_selection": "auto" if self.agent.explicit_model is None else DEFAULT_MODEL_SELECTION,
                                  "provider": self.agent.llm_client.provider,
                                  "classifier_model": self.agent.classifier_backend.model,
                                  "classifier_endpoint": self.classifier_endpoint or "",
@@ -443,8 +466,11 @@ class AdaptiveHarnessApp(App):
         self.agent.messages = self.session.messages or [{"role": "system", "content": self.agent.system_prompt}]
         self._last_agent_content = next((str(message.get("content")) for message in reversed(self.agent.messages)
             if message.get("role") == "assistant" and message.get("content") and not message.get("tool_calls")), "")
-        self.agent.explicit_model = (self._cli_model_override if preserve_cli_overrides and self._cli_model_override
-                                     else self.session.model)
+        saved_model = self._cli_model_override if preserve_cli_overrides and self._cli_model_override else self.session.model
+        auto_model = (self._cli_model_auto_override if preserve_cli_overrides and
+                      (self._cli_model_auto_override or self._cli_model_override) else
+                      settings.get("model_selection") == "auto")
+        self.agent.explicit_model = None if auto_model else saved_model or PROVIDERS[self.provider_name].default_model
         if self.agent.explicit_model:
             self.agent.llm_client.default_model = self.agent.explicit_model
         else:
@@ -658,7 +684,7 @@ class AdaptiveHarnessApp(App):
         self.query_one("#chat-log", RichLog).write(Text(f"✓ Model: {model_id}", style="green"))
         self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
             model=self.agent.explicit_model or self.agent.llm_client.default_model,
-            selection="forced" if self.agent.explicit_model else "auto")
+            selection="manual" if self.agent.explicit_model else "auto")
         self._save_session()
         self._refresh_status()
 
@@ -799,7 +825,7 @@ class AdaptiveHarnessApp(App):
         telemetry.reset_telemetry(classifier_engine=self.agent.classifier_backend.name,
                                   classifier_model=self.agent.classifier_backend.model,
                                   model=self.agent.explicit_model or self.agent.llm_client.default_model,
-                                  selection="forced" if self.agent.explicit_model else "auto")
+                                  selection="manual" if self.agent.explicit_model else "auto")
         telemetry.update_telemetry(
             domain_mode=self.agent.forced_mode.value if self.agent.forced_mode else "—",
             domain_selection="forced" if self.agent.forced_mode else "auto",
@@ -1051,7 +1077,7 @@ class AdaptiveHarnessApp(App):
                 self.agent.explicit_model = target_model
                 log.write(f"[green]✓ Switched to {arg.upper()} tier ({target_model})[/green]")
                 self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
-                    model=target_model, tier=arg, selection="forced")
+                    model=target_model, tier=arg, selection="manual")
                 self._save_session()
                 self._refresh_status()
             else:
@@ -1253,11 +1279,11 @@ class AdaptiveHarnessApp(App):
         self.query_one("#chat-log", RichLog).write(Text("Session usage · " + self._usage_summary(), style="bold cyan"))
 
     def _should_isolate(self, task: str) -> bool:
-        if self.swarm_mode == "on" or self.isolation_mode == "on":
-            return True
         if self.isolation_mode == "off":
             return False
-        if re.search(r"\b(?:multi[- ]agent|multiple agents|using agents|swarm)\b", task, re.I):
+        if self.swarm_mode == "on" or self.isolation_mode == "on":
+            return True
+        if re.search(r"\b(?:multi[- ]agent|multiple agents|using agents|subagents|swarm)\b", task, re.I):
             return True
         level = self.agent.forced_thinking or self.agent.thinking_classifier.classify(task).level
         editing = bool(re.search(r"\b(edit|implement|fix|refactor|add|write|change|modify|build|upgrade|migrate|create)\b",
@@ -1269,10 +1295,15 @@ class AdaptiveHarnessApp(App):
             return False
         if self.swarm_mode == "on":
             return True
-        if re.search(r"\b(?:multi[- ]agent|multiple agents|using agents|swarm)\b", task, re.I):
+        if re.search(r"\b(?:multi[- ]agent|multiple agents|using agents|subagents|swarm)\b", task, re.I):
+            return True
+        components = re.findall(r"\b(?:frontend|backend|database|api|tests?|html|css|javascript|assets?|ui|server)\b",
+                                task, re.I)
+        if len(task) > 100 and len(set(word.lower() for word in components)) >= 3:
             return True
         level = self.agent.forced_thinking or self.agent.thinking_classifier.classify(task).level
-        return level in {ThinkingLevel.DEEP, ThinkingLevel.EXTREME} and self._should_isolate(task)
+        editing = bool(re.search(r"\b(?:build|create|make|implement|refactor|fix|edit)\b", task, re.I))
+        return editing and level in {ThinkingLevel.DEEP, ThinkingLevel.EXTREME}
 
     def _swarm_client(self) -> LLMClient:
         source = self.agent.llm_client
@@ -1291,6 +1322,25 @@ class AdaptiveHarnessApp(App):
 
     def _swarm_status_changed(self, status: dict[str, str]) -> None:
         self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(swarm_status=status)
+
+    def _prepare_swarm_telemetry(self, task_text: str) -> None:
+        classification = self.agent.skill_classifier.classify(task_text)
+        probabilities = classification.probabilities
+        entropy = -sum(value * math.log2(value) for value in probabilities.values() if value > 0)
+        ranked = sorted(probabilities.values(), reverse=True)
+        self._render_event(AgentEvent("skill_classification", {
+            "primary_skill": classification.primary_skill,
+            "confidence": classification.confidence,
+            "probabilities": probabilities,
+            "backend": "sklearn", "classifier_model": "TF-IDF + Logistic Regression",
+            "latency_ms": 0.0,
+        }))
+        self._render_event(AgentEvent("ambiguity_assessment", {
+            "entropy": classification.entropy if classification.entropy is not None else entropy,
+            "confidence_margin": (classification.confidence_margin if classification.confidence_margin is not None
+                                  else ranked[0] - ranked[1] if len(ranked) > 1 else 1.0),
+            "risk_level": "low",
+        }))
 
     def _swarm_completed(self, report, task_text: str) -> None:
         log = self.query_one("#chat-log", RichLog)
@@ -1343,6 +1393,7 @@ class AdaptiveHarnessApp(App):
                     self.agent.set_workspace(isolated.workspace)
                     self.call_from_thread(self._worktree_started, isolated)
             if self._should_swarm(task_text):
+                self.call_from_thread(self._prepare_swarm_telemetry, task_text)
                 coordinator = SwarmCoordinator(DeveloperAgentWorker(llm_client_factory=self._swarm_client),
                     on_status=lambda status: self.call_from_thread(self._swarm_status_changed, dict(status)))
                 report = coordinator.run(task_text, isolated.workspace if isolated else self.workspace_root,

@@ -14,6 +14,8 @@ from adaptive_harness.learning.harvester import harvest_verified_traces
 from adaptive_harness.llm.mock_client import LLMResponse
 from adaptive_harness.tools.delegation import DelegateSubagentTool
 from adaptive_harness.tui.app import AdaptiveHarnessApp
+from adaptive_harness.tui.widgets import ClassifierTelemetryWidget, QuickSelectModal, ThemePickerModal
+import pytest
 
 
 class TextOnlyClient:
@@ -118,5 +120,57 @@ def test_explicit_multi_agent_request_selects_swarm(tmp_path: Path):
     app = AdaptiveHarnessApp(db_path=tmp_path / "ui.db", config_dir=tmp_path / "prefs",
                              workspace_root=str(tmp_path))
     assert app._should_swarm("using multiple agents build a 3D app")
-    assert app._should_isolate("using multiple agents build a 3D app")
+    assert not app._should_isolate("using multiple agents build a 3D app")
     app.session_store.close()
+
+
+def test_launch_workspace_and_manual_model_survive_session_resume(tmp_path: Path, monkeypatch):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    database = tmp_path / "ui.db"
+    monkeypatch.chdir(first)
+    app = AdaptiveHarnessApp(db_path=database, config_dir=tmp_path / "prefs")
+    session_id = app.session.id
+    assert app.workspace_root == str(first)
+    assert app.agent.explicit_model == "z-ai/glm-5.3-flash"
+    assert app.agent.llm_client.base_url == "https://openrouter.ai/api/v1"
+    assert app.swarm_mode == "auto" and app.isolation_mode == "off"
+    app.session_store.close()
+    monkeypatch.chdir(second)
+    resumed = AdaptiveHarnessApp(db_path=database, config_dir=tmp_path / "prefs",
+                                 session_id=session_id)
+    assert resumed.workspace_root == str(second)
+    assert resumed.agent.workspace_root == second
+    resumed.session_store.close()
+
+
+@pytest.mark.anyio
+async def test_model_and_theme_popup_labels_have_visible_foreground(tmp_path: Path):
+    app = AdaptiveHarnessApp(db_path=tmp_path / "ui.db", config_dir=tmp_path / "prefs",
+                             workspace_root=str(tmp_path))
+    async with app.run_test(size=(100, 30)) as pilot:
+        app.push_screen(QuickSelectModal("Models", [("z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash")]))
+        await pilot.pause()
+        choice = app.screen.query(".quick-choice").first()
+        assert choice.styles.color.a > 0.7
+        assert "z-ai/glm-5.3-flash" in choice.label.plain
+        await pilot.press("escape")
+        app.push_screen(ThemePickerModal("textual-dark"))
+        await pilot.pause()
+        theme_choice = app.screen.query(".theme-option").first()
+        assert theme_choice.styles.color.a > 0.7
+        await pilot.press("escape")
+
+
+@pytest.mark.anyio
+async def test_swarm_prompt_updates_live_skill_probabilities(tmp_path: Path):
+    app = AdaptiveHarnessApp(db_path=tmp_path / "ui.db", config_dir=tmp_path / "prefs",
+                             workspace_root=str(tmp_path))
+    async with app.run_test(size=(120, 30)):
+        app._prepare_swarm_telemetry("using multiple agents build a GPS app")
+        telemetry = app.query_one("#telemetry", ClassifierTelemetryWidget)
+        assert telemetry.primary_skill != "none"
+        assert sum(telemetry.probabilities.values()) == pytest.approx(1.0, abs=0.001)
+        assert telemetry.entropy > 0

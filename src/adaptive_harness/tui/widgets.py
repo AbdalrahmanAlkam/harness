@@ -222,7 +222,7 @@ class ClassifierTelemetryWidget(Static):
             labels = (("Architect", "architect:plan"), ("Coder", "coder:implement"),
                       ("Reviewer", "qa:verify"))
             icons = {"done": "Done ✓", "running": "Running ⚡",
-                     "queued": "Queued ⏳", "failed": "Failed ✗"}
+                     "queued": "Queued ⏳", "failed": "Failed ✗", "skipped": "Skipped"}
             status.append("Swarm: ", style="bold cyan")
             status.append("[" + " | ".join(f"{label}: {icons.get(self.swarm_status.get(key, 'queued'), 'Queued ⏳')}"
                                           for label, key in labels) + "]\n", style="bold yellow")
@@ -355,8 +355,8 @@ class CommandPalette(Static):
         margin: 0 0 0 1;
         padding: 0 1;
         border: round $accent;
-        background: $surface;
-        color: $text;
+        background: #1e1e2e;
+        color: #ffffff;
     }
     CommandPalette.visible { display: block; }
     CommandPalette Label, CommandPalette Static { color: #ffffff; background: $surface; }
@@ -465,7 +465,7 @@ class ThemePickerModal(ModalScreen[str | None]):
     DEFAULT_CSS = """
     ThemePickerModal { align: center middle; background: rgba(0, 0, 0, 0.65); }
     #theme-card { width: 75%; max-width: 58; height: 85%; max-height: 27;
-                  background: $surface; border: round $accent; padding: 1 2; }
+                  background: #1e1e2e; color: #ffffff; border: round #89b4fa; padding: 1 2; }
     #theme-title { height: 2; text-align: center; text-style: bold; color: $accent; }
     #theme-scroll { height: 1fr; }
     .theme-option { width: 100%; height: 2; min-height: 2; margin-bottom: 0;
@@ -528,11 +528,11 @@ class QuickSelectModal(ModalScreen[str | None]):
     DEFAULT_CSS = """
     QuickSelectModal { align: center middle; background: rgba(0, 0, 0, 0.70); }
     #quick-card { width: 88%; max-width: 96; height: 80%; max-height: 30;
-                  background: $surface; border: round $accent; padding: 1 2; }
+                  background: #1e1e2e; color: #ffffff; border: round #89b4fa; padding: 1 2; }
     #quick-title { height: 2; text-align: center; text-style: bold; color: $accent; }
     #quick-search { margin-bottom: 1; }
     #quick-results { height: 1fr; }
-    #quick-detail { height: 3; color: $text; background: $panel; padding: 0 1; }
+    #quick-detail { height: 3; color: #ffffff; background: #313244; padding: 0 1; }
     #quick-help { height: 1; color: $text-muted; text-align: center; }
     .quick-choice { width: 100%; height: 2; min-height: 2;
                     background: #202b3a; color: #ffffff; }
