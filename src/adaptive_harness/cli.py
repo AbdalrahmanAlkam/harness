@@ -49,6 +49,21 @@ app = typer.Typer(
 console = Console()
 
 
+@app.command()
+def distill(
+    db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Experience database"),
+    output_dir: Path = typer.Option(Path("output/distillation"), "--output", help="Dataset and LoRA scaffold directory"),
+    model: str = typer.Option("qwen2.5-0.5b", "--model", help="qwen2.5-0.5b, qwen2.5-1.5b, or smollm2"),
+):
+    """Export verified agent traces as local instruction-tuning data and LoRA scripts."""
+    from adaptive_harness.learning.distill import export_distillation
+    try:
+        count = export_distillation(db_path, output_dir, model)
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"[green]Exported {count} verified traces to {output_dir}[/green]")
+
+
 def _ensure_classifier(model_path: Path = DEFAULT_MODEL_PATH) -> TaskClassifier:
     """Loads existing classifier or automatically trains a baseline if missing."""
     if not model_path.exists():
@@ -196,6 +211,7 @@ def dev(
     mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Thinking level: none, low, medium, deep, auto"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
+    swarm: bool = typer.Option(False, "--swarm", help="Expose delegate_subagent to the coordinator agent"),
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Classifier endpoint"),
@@ -265,7 +281,7 @@ def dev(
     agent = DeveloperAgent(llm_client=client, repository=repo, workspace_root=str(workspace), explicit_model=selected_model,
                            classifier_backend=backend, overseer_backend=overseer_backend,
                            forced_mode=selected_mode, forced_thinking=selected_thinking,
-                           safety_profile=safety or "turbo")
+                           safety_profile=safety or "turbo", swarm_enabled=swarm)
     catalog = SkillCatalog(workspace)
     for name in skill or []:
         try:

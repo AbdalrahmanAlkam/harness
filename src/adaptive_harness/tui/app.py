@@ -391,9 +391,14 @@ class AdaptiveHarnessApp(App):
         cost_display = f"${self._reported_cost_usd:.6f}" if self._cost_reported else "cost n/a"
         context_label = (f" · Ctx:{telemetry.context_used // 1000}k/{telemetry.context_capacity // 1000}k"
                          if telemetry.context_capacity else "")
-        self.sub_title = f"{provider} ({model})  ·  {activity}  ·  {mode} / {thinking}{context_label}  ·  Tokens:{token_total:,}  ·  {cost_display}"
-        self.query_one("#status-line", Static).update(Text(
-            f"{activity}  ·  {provider}  ·  {mode}/{thinking}  ·  Tokens {token_total:,}  ·  {cost_display}  ·  Session {self.session.id}  ·  {self.workspace_root}", style="bold cyan"))
+        safety = self.agent.safety_profile.upper()
+        self.sub_title = f"Safety: {safety}  ·  {provider} ({model})  ·  {activity}  ·  {mode} / {thinking}{context_label}  ·  Tokens:{token_total:,}  ·  {cost_display}"
+        status = Text(style="bold cyan")
+        status.append("Safety: ")
+        status.append("TURBO (Full Autonomy)" if safety == "TURBO" else safety,
+                      style="bold green" if safety == "TURBO" else "bold yellow")
+        status.append(f"  ·  {activity}  ·  {provider}  ·  {mode}/{thinking}  ·  Tokens {token_total:,}  ·  {cost_display}  ·  Session {self.session.id}  ·  {self.workspace_root}")
+        self.query_one("#status-line", Static).update(status)
 
     def _save_session(self) -> None:
         self.session.workspace = self.workspace_root
@@ -949,6 +954,8 @@ class AdaptiveHarnessApp(App):
                 log.write(Text(f"Usage: {cmd} auto|on|off", style="yellow"))
             else:
                 setattr(self, "isolation_mode" if cmd == "/isolation" else "swarm_mode", arg)
+                if cmd == "/swarm":
+                    self.agent.enable_swarm(arg == "on")
                 log.write(Text(f"{cmd[1:].title()} mode: {arg}", style="green"))
         elif cmd == "/clear":
             self.action_clear_screen()
@@ -1250,6 +1257,8 @@ class AdaptiveHarnessApp(App):
             return True
         if self.isolation_mode == "off":
             return False
+        if re.search(r"\b(?:multi[- ]agent|multiple agents|using agents|swarm)\b", task, re.I):
+            return True
         level = self.agent.forced_thinking or self.agent.thinking_classifier.classify(task).level
         editing = bool(re.search(r"\b(edit|implement|fix|refactor|add|write|change|modify|build|upgrade|migrate|create)\b",
                                  task, flags=re.I))
@@ -1259,6 +1268,8 @@ class AdaptiveHarnessApp(App):
         if self.swarm_mode == "off":
             return False
         if self.swarm_mode == "on":
+            return True
+        if re.search(r"\b(?:multi[- ]agent|multiple agents|using agents|swarm)\b", task, re.I):
             return True
         level = self.agent.forced_thinking or self.agent.thinking_classifier.classify(task).level
         return level in {ThinkingLevel.DEEP, ThinkingLevel.EXTREME} and self._should_isolate(task)

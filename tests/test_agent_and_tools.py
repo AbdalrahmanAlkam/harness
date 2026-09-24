@@ -836,7 +836,8 @@ def test_destructive_tool_call_is_checked(tmp_path: Path):
             return LLMResponse(model="mock", tool_calls=[ToolCall(id="1", name="run_bash",
                                arguments={"command": "rm -rf output"})])
 
-    agent = DeveloperAgent(llm_client=RiskyClient(), workspace_root=str(tmp_path))
+    agent = DeveloperAgent(llm_client=RiskyClient(), workspace_root=str(tmp_path),
+                           safety_profile="balanced")
     events = list(agent.run_stream("clean old build output", max_steps=1))
     assert ToolRiskClassifier().evaluate("run_bash", {"command": "rm -rf output"})
     assert any(e.event_type == "clarification_needed" for e in events)

@@ -219,9 +219,13 @@ class ClassifierTelemetryWidget(Static):
         status.append(self.workspace_isolation + "\n",
                       style="bold green" if self.workspace_isolation != "Direct workspace" else "dim")
         if self.swarm_status:
+            labels = (("Architect", "architect:plan"), ("Coder", "coder:implement"),
+                      ("Reviewer", "qa:verify"))
+            icons = {"done": "Done ✓", "running": "Running ⚡",
+                     "queued": "Queued ⏳", "failed": "Failed ✗"}
             status.append("Swarm: ", style="bold cyan")
-            status.append(" · ".join(f"{name.split(':')[0]}:{value}" for name, value in self.swarm_status.items()
-                                     if value != "queued") + "\n", style="yellow")
+            status.append("[" + " | ".join(f"{label}: {icons.get(self.swarm_status.get(key, 'queued'), 'Queued ⏳')}"
+                                          for label, key in labels) + "]\n", style="bold yellow")
         overseer_color = "bold green" if self.overseer_state == "HEALTHY_PROGRESS" else "bold yellow"
         status.append("Overseer: ", style="bold cyan")
         status.append(self.overseer_state.replace("_", " ") + "\n", style=overseer_color)
@@ -355,6 +359,7 @@ class CommandPalette(Static):
         color: $text;
     }
     CommandPalette.visible { display: block; }
+    CommandPalette Label, CommandPalette Static { color: #ffffff; background: $surface; }
     """
 
     def __init__(self, **kwargs):
@@ -377,7 +382,7 @@ class CommandPalette(Static):
             active = index == self.selected_index
             output.append("❯ " if active else "  ", style="bold magenta" if active else "dim")
             output.append(f"{command:<18}", style="bold white on dark_cyan" if active else "bold cyan")
-            output.append(description + "\n", style="white" if active else "dim")
+            output.append(description + "\n", style="white" if active else "#d5dce8")
         return output
 
 
@@ -463,8 +468,10 @@ class ThemePickerModal(ModalScreen[str | None]):
                   background: $surface; border: round $accent; padding: 1 2; }
     #theme-title { height: 2; text-align: center; text-style: bold; color: $accent; }
     #theme-scroll { height: 1fr; }
-    .theme-option { width: 100%; height: 2; min-height: 2; margin-bottom: 0; }
-    .theme-option:focus { border: heavy $accent; }
+    .theme-option { width: 100%; height: 2; min-height: 2; margin-bottom: 0;
+                    background: #202b3a; color: #ffffff; }
+    .theme-option:hover, .theme-option:focus { border: heavy #72baff;
+                    background: #274c77; color: #ffffff; text-style: bold; }
     #theme-help { height: 2; color: $text; text-align: center; }
     """
     BINDINGS = [("escape", "cancel", "Cancel"), ("up", "previous_theme", "Previous"),
@@ -527,8 +534,12 @@ class QuickSelectModal(ModalScreen[str | None]):
     #quick-results { height: 1fr; }
     #quick-detail { height: 3; color: $text; background: $panel; padding: 0 1; }
     #quick-help { height: 1; color: $text-muted; text-align: center; }
-    .quick-choice { width: 100%; height: 2; min-height: 2; }
-    .quick-choice:focus { border: heavy $accent; }
+    .quick-choice { width: 100%; height: 2; min-height: 2;
+                    background: #202b3a; color: #ffffff; }
+    .quick-choice:hover, .quick-choice:focus { border: heavy #72baff;
+                    background: #274c77; color: #ffffff; text-style: bold; }
+    #quick-results { background: #202b3a; color: #ffffff; }
+    #quick-search { background: #202b3a; color: #ffffff; }
     """
     BINDINGS = [("escape", "cancel", "Cancel"), ("up", "previous", "Previous"),
                 ("down", "next", "Next"), ("enter", "choose", "Select")]

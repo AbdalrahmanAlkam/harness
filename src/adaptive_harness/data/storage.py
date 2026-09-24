@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 from pathlib import Path
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
@@ -61,6 +62,49 @@ class ExperienceRepository:
                 answer TEXT NOT NULL, dependencies_json TEXT NOT NULL,
                 original_tokens INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (task_key, workspace, settings_key))""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS agent_traces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace TEXT NOT NULL,
+                user_prompt TEXT NOT NULL,
+                trajectory_json TEXT NOT NULL,
+                final_solution TEXT NOT NULL,
+                verified_success INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_verified_workspace "
+                         "ON agent_traces(verified_success, workspace)")
+
+    def save_agent_trace(self, workspace: str, prompt: str, trajectory: list[dict[str, Any]],
+                         solution: str, *, verified_success: bool) -> None:
+        if not prompt.strip() or not solution.strip():
+            return
+        with self._get_connection() as conn:
+            conn.execute("""INSERT INTO agent_traces
+                (workspace, user_prompt, trajectory_json, final_solution, verified_success)
+                VALUES (?, ?, ?, ?, ?)""",
+                (str(Path(workspace).resolve()), prompt, json.dumps(trajectory, ensure_ascii=False),
+                 solution, int(verified_success)))
+
+    def lookup_verified_exemplar(self, workspace: str, prompt: str) -> dict[str, Any] | None:
+        """Find a nearby verified task in this workspace by lexical overlap."""
+        words = set(re.findall(r"[a-z0-9_./-]+", prompt.casefold()))
+        if len(words) < 3:
+            return None
+        with self._get_connection() as conn:
+            rows = conn.execute("""SELECT user_prompt, trajectory_json, final_solution
+                FROM agent_traces WHERE verified_success=1 AND workspace=?
+                ORDER BY id DESC LIMIT 100""", (str(Path(workspace).resolve()),)).fetchall()
+        best = None
+        best_score = 0.0
+        for row in rows:
+            candidate = set(re.findall(r"[a-z0-9_./-]+", row["user_prompt"].casefold()))
+            score = len(words & candidate) / len(words | candidate) if candidate else 0.0
+            if score > best_score and row["user_prompt"] != prompt:
+                best, best_score = row, score
+        if best is None or best_score < 0.6:
+            return None
+        return {"user_prompt": best["user_prompt"],
+                "trajectory_steps": json.loads(best["trajectory_json"]),
+                "final_solution": best["final_solution"], "similarity": best_score}
 
     @staticmethod
     def _task_key(task: str) -> str:
@@ -228,3 +272,4 @@ class ExperienceRepository:
         with self._get_connection() as conn:
             conn.execute("DELETE FROM executions;")
             conn.execute("DELETE FROM solution_cache;")
+            conn.execute("DELETE FROM agent_traces;")

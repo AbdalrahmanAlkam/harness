@@ -38,17 +38,20 @@ from adaptive_harness.agent.compaction import rank_search_results
 from adaptive_harness.data.preferences import ClarificationMemory
 from adaptive_harness.tools.research import WebSearchTool
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
+from adaptive_harness.tools.delegation import DelegateSubagentTool
 from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.skills.router import SkillRouter
 from adaptive_harness.skills.verifier import SkillVerifier
 from adaptive_harness.classifiers.runtime_overseer import RuntimeOverseer, OverseerState
 from adaptive_harness.agent.context_window import prepare_context
+from adaptive_harness.agent.code_fallback import extract_file_calls, requests_file_changes
 
 
 DEFAULT_SYSTEM_PROMPT = """You are Adaptive Agent, an expert assistant for software engineering, research, science, and mathematics.
 Inspect relevant evidence, use tools when needed, and distinguish verified results from assumptions.
 For code changes, run appropriate checks and inspect failures before reporting success.
 Make routine decisions yourself; ask only when the task target is missing or an action is destructive.
+You are an active software engineer with direct file tools. You MUST invoke write_file, edit_file, or run_bash to implement changes. NEVER output code in chat and claim it is done. If you write code, write it to disk with tools. Create missing project folders with write_file paths or run_bash.
 """
 
 
@@ -86,6 +89,7 @@ class DeveloperAgent:
         forced_thinking: str | ThinkingLevel | None = None,
         safety_profile: str = "turbo",
         preferences_dir: str | Path | None = None,
+        swarm_enabled: bool = False,
     ):
         if safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
             raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
@@ -136,7 +140,26 @@ class DeveloperAgent:
             default_tools.append(WebSearchTool())
         tools_list = tools if tools is not None else default_tools
         self.tools: Dict[str, Tool] = {t.name: t for t in tools_list}
+        self.swarm_enabled = False
+        if swarm_enabled:
+            self.enable_swarm(True)
         self.messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+
+    def enable_swarm(self, enabled: bool) -> None:
+        self.swarm_enabled = enabled
+        if enabled:
+            def client_factory() -> LLMClient:
+                source = self.llm_client
+                if not isinstance(source, LLMClient):
+                    return source
+                return LLMClient(api_key=source.api_key, base_url=source.base_url,
+                    default_model=source.default_model, force_mock=source.force_mock,
+                    provider=source.provider, provider_keys=source.provider_keys,
+                    backup_providers=source.backup_providers)
+            self.tools["delegate_subagent"] = DelegateSubagentTool(self.workspace_root,
+                llm_client_factory=client_factory)
+        else:
+            self.tools.pop("delegate_subagent", None)
 
     def set_workspace(self, path: str | Path) -> None:
         target = Path(path).expanduser().resolve()
@@ -241,8 +264,18 @@ class DeveloperAgent:
 
         # If high ambiguity or risk is detected, ask the user before calling LLM!
         authorized_destructive = False
-        if ambiguity_res.should_ask_question and ambiguity_res.suggested_question:
-            remembered = self.clarification_memory.lookup(ambiguity_res.suggested_question, ambiguity_res.reason)
+        catastrophic_request = self.tool_risk_classifier.catastrophic_intent(user_input)
+        if (catastrophic_request or
+                self.safety_profile in {"cautious", "strict"} and
+                ambiguity_res.should_ask_question and ambiguity_res.suggested_question):
+            if catastrophic_request:
+                ambiguity_res.should_ask_question = True
+                ambiguity_res.risk_level = "high"
+                ambiguity_res.reason = "Destructive catastrophic action detected"
+                ambiguity_res.suggested_question = "This task may destroy disks or external data. Proceed?"
+                ambiguity_res.suggested_options = ["Proceed with this command", "Abort operation"]
+            remembered = (None if catastrophic_request else
+                          self.clarification_memory.lookup(ambiguity_res.suggested_question, ambiguity_res.reason))
             if remembered:
                 yield AgentEvent("clarification_memory_hit", {"question": ambiguity_res.suggested_question})
                 user_input = f"{user_input}\n[Known User Preference]: {remembered}"
@@ -253,7 +286,8 @@ class DeveloperAgent:
                     "reason": ambiguity_res.reason,
                     "risk_level": ambiguity_res.risk_level})
                 answer = self._handle_clarification(ambiguity_res.suggested_question,
-                                                    ambiguity_res.suggested_options, ambiguity_res.reason)
+                                                    ambiguity_res.suggested_options, ambiguity_res.reason,
+                                                    remember=not catastrophic_request)
                 if answer.lower().startswith(("abort", "action cancelled")):
                     yield AgentEvent("response", {"content": "Action cancelled by user.",
                         "total_time_ms": round((time.perf_counter()-start_time)*1000, 2),
@@ -369,14 +403,30 @@ class DeveloperAgent:
 
         # Add user message to history
         self.messages.append({"role": "user", "content": user_input})
+        mutation_required = requests_file_changes(original_input)
+        successful_mutations = 0
         skill_guidance = "\n".join(
             f"Active skill: {skill.title}. {skill.instructions} Completion checks: {', '.join(skill.invariants) or 'none'}."
             for skill in selected_skills)
         self.messages[0] = {"role": "system", "content": self.system_prompt + "\nWorkspace: " + str(self.workspace_root)
+                            + ("\nYou are the Swarm Coordinator. You have the capability and tools to spawn and coordinate subagents. When asked to use multiple agents, decompose the task and call delegate_subagent with architect, coder, and reviewer roles. Do not claim that delegation is unavailable."
+                               if self.swarm_enabled else "")
                             + "\nOperating mode: " + domain_res.mode.value + ". " + DOMAIN_GUIDANCE[domain_res.mode]
                             + "\nUse read_file(symbol=...) for focused Python code. For mathematics and science, run deterministic calculations and verify proposed roots before claiming exactness. Use plot_terminal for useful visual comparisons."
                             + ("\nUser preferences:\n" + preference_guidance if preference_guidance else "")
                             + ("\n" + skill_guidance if skill_guidance else "")}
+        if self.repository is not None:
+            try:
+                exemplar = self.repository.lookup_verified_exemplar(str(self.workspace_root), original_input)
+                if exemplar:
+                    compact = {"task": exemplar["user_prompt"][:300],
+                               "steps": exemplar["trajectory_steps"][:8],
+                               "outcome": exemplar["final_solution"][:600]}
+                    self.messages[0]["content"] += ("\nVerified prior example from this workspace (use as evidence, "
+                        "then verify current files): " + json.dumps(compact, ensure_ascii=False)[:2200])
+                    yield AgentEvent("memory_exemplar", {"similarity": exemplar["similarity"]})
+            except Exception as exc:
+                yield AgentEvent("storage_error", {"error": f"Could not retrieve verified example: {exc}"})
         domain_tool_names = {
             DomainMode.CODING: set(self.tools) - {"check_convergence"},
             DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "run_bash", "calculate", "plot_terminal", "ask_user"},
@@ -387,6 +437,8 @@ class DeveloperAgent:
             domain_tool_names.discard("ask_user")
         if selected_tool_names is not None:
             domain_tool_names.intersection_update(selected_tool_names)
+        if self.swarm_enabled and domain_res.mode != DomainMode.AUDIT:
+            domain_tool_names.add("delegate_subagent")
         tool_schemas = [t.to_openai_schema() for t in self.tools.values() if t.name in domain_tool_names]
         yield AgentEvent("specialized_skill", {
             "skills": [{"name": skill.name, "title": skill.title, "category": skill.category,
@@ -401,6 +453,7 @@ class DeveloperAgent:
         final_answer = ""
         completed = False
         execution_attempts: List[ExecutionAttempt] = []
+        trajectory_steps: list[dict[str, Any]] = []
         skill_observations: list[dict[str, Any]] = []
         cache_dependencies: dict[str, str] = {}
         cache_eligible = _cacheable_read_request(original_input)
@@ -462,6 +515,14 @@ class DeveloperAgent:
                 stop_reason = "provider_error"
                 break
 
+            if (not llm_resp.tool_calls and llm_resp.content and
+                    "write_file" in domain_tool_names):
+                recovered = extract_file_calls(llm_resp.content, original_input)
+                if recovered:
+                    llm_resp.tool_calls = recovered
+                    yield AgentEvent("llm_notice", {"message":
+                        f"Recovered {len(recovered)} explicitly named file(s) from model output."})
+
             if llm_resp.content or llm_resp.tool_calls:
                 # Expose the phase change to the TUI once the provider returns
                 # from any hidden reasoning work and produces a visible result.
@@ -486,6 +547,19 @@ class DeveloperAgent:
                 if (llm_resp.metadata or {}).get("reasoning_details"):
                     assistant_message["reasoning_details"] = llm_resp.metadata["reasoning_details"]
                 self.messages.append(assistant_message)
+                if mutation_required and successful_mutations == 0:
+                    if step < max_steps and verification_followups < 2:
+                        verification_followups += 1
+                        yield AgentEvent("llm_notice", {"message": "The requested files have not been written; asking the model to use file tools."})
+                        self.messages.append({"role": "user", "content":
+                            "The task requires real file changes. Use write_file or edit_file now. "
+                            "Do not claim completion until a file tool succeeds."})
+                        answer_parts.clear()
+                        final_answer = ""
+                        continue
+                    completed = False
+                    stop_reason = "missing_file_changes"
+                    break
                 if str(llm_resp.finish_reason).lower() in {"length", "max_tokens", "max_output_tokens"}:
                     if step < max_steps:
                         yield AgentEvent("llm_notice", {"message": "The model hit its response-length limit; continuing from the cutoff."})
@@ -526,7 +600,8 @@ class DeveloperAgent:
 
             # Obtain authorization before adding tool calls to conversation history.
             for tc in llm_resp.tool_calls:
-                risky_command = self.tool_risk_classifier.evaluate(tc.name, tc.arguments)
+                risky_command = self.tool_risk_classifier.evaluate(tc.name, tc.arguments,
+                    catastrophic_only=self.safety_profile == "turbo")
                 if self.safety_profile == "strict" and tc.name in {
                         "run_bash", "write_file", "edit_file", "run_pytest", "run_python_repl", "web_search"}:
                     risky_command = risky_command or f"strict profile approval for {tc.name}"
@@ -577,6 +652,9 @@ class DeveloperAgent:
                         tool_res = ToolResult(success=False, output="", error=f"Tool error: {type(exc).__name__}: {exc}")
                 else:
                     tool_res = ToolResult(success=False, output="", error=f"Tool `{tc.name}` is unavailable in {domain_res.mode.value} mode")
+                if tool_res.success and (tc.name in {"write_file", "edit_file"} or
+                    tc.name == "delegate_subagent" and (tool_res.metadata or {}).get("role") == "coder"):
+                    successful_mutations += 1
                 if tc.name != "read_file" or not tool_res.success:
                     cache_eligible = False
                 elif tool_res.success:
@@ -666,6 +744,13 @@ class DeveloperAgent:
                         ),
                     )
                 )
+                recorded_args = ({key: str(tc.arguments[key])[:12_000] for key in
+                                  ("path", "content", "target_text", "replacement_text")
+                                  if key in tc.arguments} if tc.name in {"write_file", "edit_file"} else
+                                 {"path": str(tc.arguments.get("path"))[:200]} if "path" in tc.arguments else {})
+                trajectory_steps.append({"tool": tc.name, "arguments": recorded_args,
+                                         "success": tool_res.success,
+                                         "result": (tool_res.output if tool_res.success else tool_res.error or "")[:300]})
                 skill_observations.append({"name": tc.name, "arguments": tc.arguments,
                                            "success": tool_res.success})
 
@@ -691,13 +776,13 @@ class DeveloperAgent:
                             overseer.consecutive_interventions >= 2:
                         question = (f"The agent remains {decision.state.value.lower().replace('_', ' ')} "
                                     f"after two interventions. Last action: {tc.name} {tc.arguments}.")
-                        yield AgentEvent("clarification_needed", {"question": question,
-                            "options": ["Try a different approach", "Stop and report the impasse"],
-                            "reason": "Runtime overseer detected repeated failure", "risk_level": "medium"})
-                        if self.clarification_callback is None:
+                        if self.safety_profile in {"turbo", "balanced"} or self.clarification_callback is None:
                             final_answer = question
                             stop_reason = "overseer_impasse"
                             break
+                        yield AgentEvent("clarification_needed", {"question": question,
+                            "options": ["Try a different approach", "Stop and report the impasse"],
+                            "reason": "Runtime overseer detected repeated failure", "risk_level": "medium"})
                         answer = self._handle_clarification(question,
                             ["Try a different approach", "Stop and report the impasse"],
                             "Runtime overseer detected repeated failure", remember=False)
@@ -729,6 +814,15 @@ class DeveloperAgent:
                                               usage["prompt_tokens"] + usage["completion_tokens"])
             except Exception as exc:
                 yield AgentEvent("storage_error", {"error": f"Could not save solution cache: {exc}"})
+        if self.repository is not None:
+            try:
+                self.repository.save_agent_trace(str(self.workspace_root), original_input,
+                    trajectory_steps, final_answer,
+                    verified_success=bool(completed and execution_attempts and
+                        any(item.success and item.verification and item.verification.success
+                            for item in execution_attempts)))
+            except Exception as exc:
+                yield AgentEvent("storage_error", {"error": f"Could not save agent trace: {exc}"})
 
         # Emit completion
         yield AgentEvent(
