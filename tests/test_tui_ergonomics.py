@@ -11,7 +11,9 @@ from adaptive_harness.data.config import ConfigManager, PromptHistoryStore
 from adaptive_harness.agent.agent import AgentEvent, DeveloperAgent
 from adaptive_harness.llm.client import LLMClient
 from adaptive_harness.tui.app import AdaptiveHarnessApp
-from adaptive_harness.tui.widgets import ClassifierTelemetryWidget, HistoryInput, ThemePickerModal, QuickSelectModal
+from adaptive_harness.tui.widgets import (ClassifierTelemetryWidget, HistoryInput, ThemePickerModal,
+                                          QuickSelectModal, OutputViewerModal)
+from adaptive_harness.tui.formatting import format_model_markdown
 from adaptive_harness.llm.catalog import CatalogModel, fetch_models
 from adaptive_harness.llm.client import MODEL_TIERS
 from adaptive_harness.data.sessions import SessionStore
@@ -71,7 +73,8 @@ def test_agent_reports_token_usage_for_tui(tmp_path: Path):
     agent = DeveloperAgent(llm_client=LLMClient(force_mock=True), workspace_root=str(tmp_path))
     response = next(event.payload for event in agent.run_stream("say hello", max_steps=1)
                     if event.event_type == "response")
-    assert response["usage"] == {"prompt_tokens": 100, "completion_tokens": 50}
+    assert response["usage"] == {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
+                                 "reasoning_tokens": 0, "cached_tokens": 0, "cache_write_tokens": 0}
 
 
 def test_model_catalog_parses_text_models(monkeypatch):
@@ -115,8 +118,14 @@ async def test_quick_picker_model_and_session_keyboard(tmp_path: Path, monkeypat
                              config_dir=tmp_path / "prefs")
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.press("f4")
-        await pilot.pause()
+        for _ in range(5):
+            await pilot.pause()
+            if app.screen.query("#quick-search"):
+                break
         assert isinstance(app.screen, QuickSelectModal)
+        task_input = app.query_one("#prompt-input", HistoryInput)
+        task_input.value = "keep this prompt draft"
+        prior_messages = list(app.agent.messages)
         search = app.screen.query_one("#quick-search", Input)
         search.value = "test-model"
         await pilot.pause()
@@ -124,6 +133,8 @@ async def test_quick_picker_model_and_session_keyboard(tmp_path: Path, monkeypat
         await pilot.press("enter")
         await pilot.pause()
         assert app.agent.explicit_model == "openai/test-model"
+        assert app.agent.messages == prior_messages
+        assert task_input.value == "keep this prompt draft"
         app._reset_session(new=True, title="Other task")
         await pilot.press("f5")
         await pilot.pause()
@@ -140,13 +151,56 @@ async def test_activity_and_safety_controls(tmp_path: Path):
     async with app.run_test(size=(120, 30)):
         app._render_event(AgentEvent(
             "agent_stage", {"stage": "thinking", "step": 1, "model": "test", "thinking_tokens": 1000}))
-        assert "Thinking / generating" in app._activity
+        assert "Thinking" in app._activity and "1,000 budget tokens" in app._activity
         app._render_event(AgentEvent(
             "agent_stage", {"stage": "tool_running", "step": 1, "tool": "run_bash"}))
         assert "Running run_bash" in app._activity
         app._handle_slash_command("/safety cautious")
         assert app.agent.safety_profile == "cautious"
         assert app.session.settings["safety"] == "cautious"
+
+
+def test_math_and_channel_markers_render_readably():
+    rendered = format_model_markdown(r"Answer: $x^2 + \frac{1}{2} = \sqrt{4}$ [analysis]")
+    assert "x²" in rendered and "(1)/(2)" in rendered and "√(4)" in rendered
+    assert "[analysis]" not in rendered
+
+
+@pytest.mark.anyio
+async def test_output_popup_is_selectable_and_usage_persists(tmp_path: Path):
+    app = AdaptiveHarnessApp(db_path=tmp_path / "output.db", workspace_root=str(tmp_path),
+                             config_dir=tmp_path / "prefs")
+    async with app.run_test(size=(100, 28)) as pilot:
+        copied = []
+        app.copy_to_clipboard = copied.append
+        app._last_agent_content = "Result: x² = 4"
+        app._handle_slash_command("/output")
+        await pilot.pause()
+        assert isinstance(app.screen, OutputViewerModal)
+        assert app.screen.query_one("#output-text").text == "Result: x² = 4"
+        await pilot.press("ctrl+shift+c")
+        assert copied == ["Result: x² = 4"]
+        app.screen.dismiss(None)
+        await pilot.pause()
+        app._last_tool_output = "Full tool trace"
+        app._handle_slash_command("/tool-output")
+        await pilot.pause()
+        assert app.screen.query_one("#output-text").text == "Full tool trace"
+        app.screen.dismiss(None)
+        app.prompt_tokens, app.completion_tokens = 300, 80
+        app._reasoning_tokens, app._cached_tokens, app._cache_write_tokens = 24, 90, 12
+        app._reported_cost_usd, app._cost_reported = 0.00125, True
+        app.agent.messages.append({"role": "assistant", "content": "Saved answer"})
+        app._save_session()
+        saved_id = app.session.id
+    restored = AdaptiveHarnessApp(db_path=tmp_path / "output.db", workspace_root=str(tmp_path),
+                                  config_dir=tmp_path / "prefs", session_id=saved_id)
+    assert restored._usage_snapshot() == {
+        "total_tokens": 380, "input_tokens": 300, "output_tokens": 80, "reasoning_tokens": 24,
+        "cache_read_tokens": 90, "cache_write_tokens": 12, "cost_usd": 0.00125,
+        "cost_source": "provider-reported"}
+    assert restored._last_agent_content == "Saved answer"
+    restored.session_store.close()
 
 
 @pytest.mark.anyio

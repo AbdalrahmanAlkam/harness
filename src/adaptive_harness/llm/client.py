@@ -125,6 +125,10 @@ class LLMClient:
         # Other providers handle compatible prompt prefixes implicitly.
         if is_openrouter and model_name.startswith("anthropic/claude"):
             kwargs.setdefault("extra_body", {})["cache_control"] = {"type": "ephemeral"}
+        if is_openrouter:
+            # The OpenAI SDK has no `usage` keyword. `extra_body` sends this
+            # OpenRouter extension as a top-level JSON field instead.
+            kwargs.setdefault("extra_body", {})["usage"] = {"include": True}
 
         try:
             assert self._openai_client is not None
@@ -174,14 +178,35 @@ class LLMClient:
                     )
 
             usage_dict = {
-                "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-                "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+                "prompt_tokens": int(getattr(response.usage, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(response.usage, "completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(response.usage, "total_tokens", 0) or 0),
             }
             if response.usage:
-                details = getattr(response.usage, "prompt_tokens_details", None)
-                usage_dict["cached_tokens"] = int(
-                    getattr(details, "cached_tokens", None) or
-                    getattr(response.usage, "cache_read_input_tokens", None) or 0)
+                prompt_details = getattr(response.usage, "prompt_tokens_details", None)
+                completion_details = getattr(response.usage, "completion_tokens_details", None)
+                def field(obj, name):
+                    direct = getattr(obj, name, None) if obj is not None else None
+                    if direct is not None:
+                        return direct
+                    extras = getattr(obj, "model_extra", None) if obj is not None else None
+                    if not isinstance(extras, dict) and obj is not None:
+                        extras = getattr(obj, "__dict__", {})
+                    return extras.get(name) if isinstance(extras, dict) else None
+                usage_dict["cached_tokens"] = int(field(prompt_details, "cached_tokens") or
+                    field(response.usage, "cache_read_input_tokens") or 0)
+                usage_dict["cache_write_tokens"] = int(field(prompt_details, "cache_write_tokens") or 0)
+                usage_dict["reasoning_tokens"] = int(field(completion_details, "reasoning_tokens") or 0)
+                if not usage_dict["total_tokens"]:
+                    usage_dict["total_tokens"] = usage_dict["prompt_tokens"] + usage_dict["completion_tokens"]
+                reported_cost = field(response.usage, "cost")
+                cost_details = field(response.usage, "cost_details")
+                if reported_cost is None:
+                    reported_cost = field(cost_details, "upstream_inference_cost")
+                    if reported_cost is None:
+                        reported_cost = field(cost_details, "total_cost")
+                if reported_cost is not None:
+                    usage_dict["cost_usd"] = float(reported_cost)
 
             reasoning_details = getattr(msg, "reasoning_details", None)
             if reasoning_details is None:

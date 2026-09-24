@@ -3,8 +3,11 @@ import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 import time
+import json
 
 import pytest
+import httpx
+from openai import OpenAI
 from textual.widgets import Footer, Input
 
 from adaptive_harness.agent.agent import DeveloperAgent
@@ -62,6 +65,26 @@ def test_live_failure_keeps_saved_key_and_retries_live_next_call(tmp_path):
     assert recovered.content == "recovered"
     assert len(calls) == 2
     assert client.api_key == "private-test-key" and not client.is_mock
+
+
+def test_openrouter_usage_extension_is_sent_through_sdk_request_body():
+    requests = []
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"id": "gen-test", "object": "chat.completion", "created": 0,
+            "model": "z-ai/glm-5.3-flash", "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 4, "completion_tokens": 2,
+            "total_tokens": 6, "cost": 0.00002}})
+    transport_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = LLMClient(api_key="test-key")
+    client._openai_client = OpenAI(api_key="test-key", base_url=client.base_url, http_client=transport_client)
+    try:
+        result = client.complete([{"role": "user", "content": "hello"}])
+    finally:
+        client._openai_client.close()
+    assert result.content == "ok"
+    assert requests[0]["usage"] == {"include": True}
+    assert result.usage["cost_usd"] == 0.00002
 
 
 def test_reasoning_parameter_rejection_retries_same_model_without_thinking():

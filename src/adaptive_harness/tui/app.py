@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import asyncio
 import concurrent.futures
 from datetime import datetime
 import json
 import os
+import threading
 from typing import Optional
 from rich.syntax import Syntax
 from rich.text import Text
@@ -28,12 +30,13 @@ from adaptive_harness.data.sessions import SessionStore
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
 from adaptive_harness.llm.catalog import CatalogModel, fetch_models
 from adaptive_harness.tui.widgets import (ClarificationModal, ClassifierTelemetryWidget,
-    HistoryInput, PinnedRichLog, ThemePickerModal, QuickSelectModal, THEME_CHOICES)
+    HistoryInput, PinnedRichLog, ThemePickerModal, QuickSelectModal, OutputViewerModal, THEME_CHOICES)
+from adaptive_harness.tui.formatting import format_model_markdown
 
 
 COMMANDS = ("/key", "/model", "/models", "/tier", "/mode", "/thinking", "/safety", "/theme", "/classifier", "/new",
-            "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions",
-            "/session", "/skills", "/skill", "/output", "/copy", "/export")
+            "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
+            "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export")
 
 
 class AdaptiveHarnessApp(App):
@@ -175,6 +178,10 @@ class AdaptiveHarnessApp(App):
         self._quit_when_finished = False
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self._reasoning_tokens = 0
+        self._cache_write_tokens = 0
+        self._reported_cost_usd = 0.0
+        self._cost_reported = False
         self._tokens_saved_estimate = 0
         self._cached_tokens = 0
         self._has_focus = True
@@ -288,9 +295,11 @@ class AdaptiveHarnessApp(App):
                 telemetry.domain_mode.upper() if telemetry.domain_mode != "—" else "AUTO")
         thinking = telemetry.thinking_level.upper() if telemetry.thinking_level != "—" else "AUTO"
         activity = ("● " if self._activity_pulse and self._busy else "◦ ") + self._activity
-        self.sub_title = f"{provider} ({model})  ·  {activity}  ·  {mode} / {thinking}  ·  P:{self.prompt_tokens:,} C:{self.completion_tokens:,}"
+        token_total = self.prompt_tokens + self.completion_tokens
+        cost_display = f"${self._reported_cost_usd:.6f}" if self._cost_reported else "cost n/a"
+        self.sub_title = f"{provider} ({model})  ·  {activity}  ·  {mode} / {thinking}  ·  Tokens:{token_total:,}  ·  {cost_display}"
         self.query_one("#status-line", Static).update(Text(
-            f"{activity}  ·  {provider}  ·  {mode} / {thinking}  ·  {self.agent.safety_profile.upper()}  ·  P:{self.prompt_tokens:,} C:{self.completion_tokens:,}  ·  Session {self.session.id}  ·  {self.workspace_root}", style="bold cyan"))
+            f"{activity}  ·  {provider}  ·  {mode}/{thinking}  ·  Tokens {token_total:,}  ·  {cost_display}  ·  Session {self.session.id}  ·  {self.workspace_root}", style="bold cyan"))
 
     def _save_session(self) -> None:
         self.session.workspace = self.workspace_root
@@ -307,6 +316,10 @@ class AdaptiveHarnessApp(App):
                                  "safety": self.agent.safety_profile,
                                  "prompt_tokens": str(self.prompt_tokens),
                                  "completion_tokens": str(self.completion_tokens),
+                                 "reasoning_tokens": str(self._reasoning_tokens),
+                                 "cache_write_tokens": str(self._cache_write_tokens),
+                                 "reported_cost_usd": f"{self._reported_cost_usd:.12f}",
+                                 "cost_reported": str(self._cost_reported).lower(),
                                  "estimated_tokens_saved": str(self._tokens_saved_estimate),
                                  "cached_tokens": str(self._cached_tokens)}
         self.session_store.save(self.session)
@@ -314,6 +327,8 @@ class AdaptiveHarnessApp(App):
     def _restore_session(self, *, preserve_cli_overrides: bool = False) -> None:
         self._session_restore_warning = ""
         self.agent.messages = self.session.messages or [{"role": "system", "content": self.agent.system_prompt}]
+        self._last_agent_content = next((str(message.get("content")) for message in reversed(self.agent.messages)
+            if message.get("role") == "assistant" and message.get("content") and not message.get("tool_calls")), "")
         self.agent.explicit_model = (self._cli_model_override if preserve_cli_overrides and self._cli_model_override
                                      else self.session.model)
         if self.agent.explicit_model:
@@ -337,12 +352,19 @@ class AdaptiveHarnessApp(App):
             self.agent.safety_profile = "turbo"
         for field, setting in (("prompt_tokens", "prompt_tokens"),
                                ("completion_tokens", "completion_tokens"),
+                               ("_reasoning_tokens", "reasoning_tokens"),
+                               ("_cache_write_tokens", "cache_write_tokens"),
                                ("_tokens_saved_estimate", "estimated_tokens_saved"),
                                ("_cached_tokens", "cached_tokens")):
             try:
                 setattr(self, field, max(0, int(settings.get(setting, "0"))))
             except (ValueError, TypeError):
                 setattr(self, field, 0)
+        try:
+            self._reported_cost_usd = max(0.0, float(settings.get("reported_cost_usd", "0")))
+        except (TypeError, ValueError):
+            self._reported_cost_usd = 0.0
+        self._cost_reported = settings.get("cost_reported", "false").lower() == "true"
         self.classifier_endpoint = settings.get("classifier_endpoint") or None
         self.semif_device = settings.get("semif_device", self.semif_device)
         self.semif_4bit = settings.get("semif_4bit", str(self.semif_4bit)).lower() == "true"
@@ -435,18 +457,23 @@ class AdaptiveHarnessApp(App):
             return
         self._activity = "Fetching models"
         self._refresh_status()
-        self._fetch_model_catalog()
+        loop = asyncio.get_running_loop()
+        threading.Thread(target=self._fetch_model_catalog, args=(loop,), daemon=True,
+                         name="adaptive-harness-model-catalog").start()
 
-    @work(thread=True)
-    def _fetch_model_catalog(self) -> None:
+    def _fetch_model_catalog(self, loop: asyncio.AbstractEventLoop) -> None:
         error = ""
         try:
             models = fetch_models(self.api_key)
         except Exception as exc:
             models = self._model_catalog
             error = f"Model catalog unavailable ({type(exc).__name__}); showing saved choices."
-        if self.is_running:
-            self.call_from_thread(self._show_model_picker, models, error)
+        if not loop.is_closed():
+            def show_picker() -> None:
+                if self.is_running:
+                    with self._context():
+                        self._show_model_picker(models, error)
+            loop.call_soon_threadsafe(show_picker)
 
     def _show_model_picker(self, models: list[CatalogModel], error: str = "") -> None:
         self._activity = "Ready"
@@ -516,7 +543,6 @@ class AdaptiveHarnessApp(App):
         self.workspace_root = saved.workspace
         self._restore_session()
         self._last_tool_output = ""
-        self._last_agent_content = ""
         telemetry = self.query_one("#telemetry", ClassifierTelemetryWidget)
         telemetry.reset_telemetry(classifier_engine=self.agent.classifier_backend.name,
                                   classifier_model=self.agent.classifier_backend.model)
@@ -547,7 +573,7 @@ class AdaptiveHarnessApp(App):
             elif role == "assistant":
                 if content:
                     log.write(Text("\nAgent:", style="bold magenta"))
-                    log.write(Markdown(content))
+                    log.write(Markdown(format_model_markdown(content)))
                 for call in message.get("tool_calls") or []:
                     name = (call.get("function") or {}).get("name", "tool")
                     log.write(Text(f"⚡ {name}", style="yellow"))
@@ -591,8 +617,13 @@ class AdaptiveHarnessApp(App):
         self.agent.forced_thinking = self._cli_thinking_override
         self.agent.safety_profile = self._cli_safety_override or self._default_safety
         self._last_tool_output = ""
+        self._last_agent_content = ""
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self._reasoning_tokens = 0
+        self._cache_write_tokens = 0
+        self._reported_cost_usd = 0.0
+        self._cost_reported = False
         self._tokens_saved_estimate = 0
         self._cached_tokens = 0
         self._activity = "Ready"
@@ -650,7 +681,9 @@ class AdaptiveHarnessApp(App):
         log.write("  /skills                - List installed skills")
         log.write("  /skill list            - Browse 22 built-in and custom skills")
         log.write("  /skill <name|off>      - Force a skill or restore automatic routing")
-        log.write("  /output                - Show the last tool result (up to 20k characters)")
+        log.write("  /output                - Open a selectable full-text view of the latest agent response")
+        log.write("  /tool-output           - Open a selectable view of the latest tool result")
+        log.write("  /usage                 - Show all session token types and reported cost")
         log.write("  /new | /reset          - Start a new session or reset current one")
         log.write("  /theme [name]          - Preview and save terminal theme (F2)")
         log.write("  /history               - Show recent prompts; Up/Down recalls prompts")
@@ -919,10 +952,17 @@ class AdaptiveHarnessApp(App):
             self._refresh_status()
             log.write(Text(f"Active skills: {', '.join(self.agent.active_skills) or 'none'}", style="green"))
         elif cmd == "/output":
+            if self._last_agent_content:
+                self.push_screen(OutputViewerModal(format_model_markdown(self._last_agent_content)))
+            else:
+                log.write(Text("No agent response yet.", style="yellow"))
+        elif cmd == "/tool-output":
             if self._last_tool_output:
-                log.write(Text(self._last_tool_output))
+                self.push_screen(OutputViewerModal(self._last_tool_output, title="Latest Tool Output"))
             else:
                 log.write(Text("No tool result yet.", style="yellow"))
+        elif cmd == "/usage":
+            self._show_usage()
         elif cmd == "/copy":
             self.action_copy_output()
         else:
@@ -940,7 +980,7 @@ class AdaptiveHarnessApp(App):
         transcript = {
             "session_id": self.session.id, "title": self.session.title,
             "workspace": self.workspace_root, "model": self.agent.explicit_model or "auto",
-            "usage": {"prompt_tokens": self.prompt_tokens, "completion_tokens": self.completion_tokens},
+            "usage": self._usage_snapshot(),
             "messages": self.agent.messages,
         }
         if export_format == "json":
@@ -948,7 +988,7 @@ class AdaptiveHarnessApp(App):
         else:
             lines = [f"# {self.session.title}", "", f"Session: `{self.session.id}`",
                      f"Workspace: `{self.workspace_root}`", "",
-                     f"Tokens: prompt {self.prompt_tokens:,}, completion {self.completion_tokens:,}", ""]
+                     f"Usage: {self._usage_summary()}", ""]
             for message in self.agent.messages:
                 lines.extend([f"## {message.get('role', 'message').title()}", "", str(message.get("content") or ""), ""])
                 for call in message.get("tool_calls", []):
@@ -963,6 +1003,28 @@ class AdaptiveHarnessApp(App):
             log.write(Text(f"Could not export session: {exc}", style="red"))
             return
         log.write(Text(f"✓ Exported session to {path}", style="green"))
+
+    def _usage_snapshot(self) -> dict:
+        return {
+            "total_tokens": self.prompt_tokens + self.completion_tokens,
+            "input_tokens": self.prompt_tokens,
+            "output_tokens": self.completion_tokens,
+            "reasoning_tokens": self._reasoning_tokens,
+            "cache_read_tokens": self._cached_tokens,
+            "cache_write_tokens": self._cache_write_tokens,
+            "cost_usd": self._reported_cost_usd if self._cost_reported else None,
+            "cost_source": "provider-reported" if self._cost_reported else "unavailable",
+        }
+
+    def _usage_summary(self) -> str:
+        usage = self._usage_snapshot()
+        cost = f"${usage['cost_usd']:.6f} (reported)" if usage["cost_usd"] is not None else "not reported by provider"
+        return (f"{usage['total_tokens']:,} total · input {usage['input_tokens']:,} · "
+                f"output {usage['output_tokens']:,} · reasoning {usage['reasoning_tokens']:,} · "
+                f"cache read {usage['cache_read_tokens']:,} · cache write {usage['cache_write_tokens']:,} · cost {cost}")
+
+    def _show_usage(self) -> None:
+        self.query_one("#chat-log", RichLog).write(Text("Session usage · " + self._usage_summary(), style="bold cyan"))
 
     @work(thread=True)
     def execute_agent_task(self, task_text: str) -> None:
@@ -1007,8 +1069,8 @@ class AdaptiveHarnessApp(App):
         if et == "agent_stage":
                 stage = p["stage"]
                 self._activity = {
-                    "thinking": f"Thinking / generating · step {p['step']}",
-                    "generating": f"Generating · step {p['step']}",
+                    "thinking": f"Thinking · step {p['step']} · {p.get('thinking_tokens', 0):,} budget tokens",
+                    "generating": f"Generating response · step {p['step']}",
                     "tool_running": f"Running {p.get('tool', '')}",
                     "verifying": f"Verifying {p.get('tool', '')}",
                 }.get(stage, stage)
@@ -1075,10 +1137,10 @@ class AdaptiveHarnessApp(App):
         elif et == "thought":
                 self._last_agent_content = p["content"]
                 log.write(Text(f"\nAgent · {p.get('model', 'model')}:", style="bold magenta"))
-                log.write(Markdown(p["content"]))
+                log.write(Markdown(format_model_markdown(p["content"])))
         elif et == "tool_call":
                 arguments = json.dumps(p["arguments"], ensure_ascii=False)
-                preview = arguments[:400] + ("… Use /output after completion." if len(arguments) > 400 else "")
+                preview = arguments[:400] + ("… Use /export for full tool arguments." if len(arguments) > 400 else "")
                 log.write(Text(f"⚡ {p['name']}  {preview}", style="yellow"))
         elif et == "tool_result":
                 self._tokens_saved_estimate += p.get("saved_tokens_estimate", 0)
@@ -1094,7 +1156,7 @@ class AdaptiveHarnessApp(App):
                     diff = output.split("Diff:\n", 1)[-1]
                     log.write(Syntax(diff, "diff", theme="monokai", line_numbers=False))
                 elif len(output) > 800:
-                    log.write(Text(output[:800] + f"\n… {len(output)-800} more characters. Use /output to expand."))
+                    log.write(Text(output[:800] + f"\n… {len(output)-800} more characters. Use /tool-output to expand."))
                 else:
                     log.write(Text(output))
                 if p.get("time_ms", 0) >= 5000 and not self._has_focus and not self._bell_rung:
@@ -1106,16 +1168,31 @@ class AdaptiveHarnessApp(App):
                 if p.get("content") and p["content"] != self._last_agent_content:
                     self._last_agent_content = p["content"]
                     log.write(Text("\nAgent:", style="bold magenta"))
-                    log.write(Markdown(p["content"]))
+                    log.write(Markdown(format_model_markdown(p["content"])))
                 elif not p.get("content") and not p["success"]:
                     log.write(Text("No final answer was produced; inspect the last tool result or retry.", style="yellow"))
                 usage = p.get("usage") or {}
                 self.prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
                 self.completion_tokens += int(usage.get("completion_tokens", 0) or 0)
+                self._reasoning_tokens += int(usage.get("reasoning_tokens", 0) or 0)
+                self._cache_write_tokens += int(usage.get("cache_write_tokens", 0) or 0)
                 self._cached_tokens += int(p.get("cached_tokens", 0) or 0)
+                self._reported_cost_usd += float(p.get("cost_usd", 0.0) or 0.0)
+                self._cost_reported = self._cost_reported or bool(p.get("cost_reported", False))
                 telemetry.update_telemetry(provider_cached_tokens=self._cached_tokens,
                                            provider_prompt_tokens=self.prompt_tokens)
-                status = "✓ Task completed" if p["success"] else "Task stopped before completion"
+                status = "✓ Task completed" if p["success"] else {
+                    "response_length_limit": "Response stopped at the model output limit",
+                    "step_limit": "Task reached the tool-step limit",
+                    "verification_failed": "Task needs another verification pass",
+                    "skill_verification_failed": "Task did not meet skill verification checks",
+                    "provider_error": "Provider request failed",
+                }.get(p.get("stop_reason"), "Task stopped before completion")
+                cost_display = f"${self._reported_cost_usd:.6f}" if self._cost_reported else "not reported by provider"
+                log.write(Text(f"Session tokens: {self.prompt_tokens + self.completion_tokens:,} total · "
+                    f"input {self.prompt_tokens:,} · output {self.completion_tokens:,} · reasoning {self._reasoning_tokens:,} · "
+                    f"cache read {self._cached_tokens:,} · cache write {self._cache_write_tokens:,} · cost {cost_display}",
+                    style="dim cyan"))
                 log.write(Text(f"\n{status} in {p['total_time_ms']} ms ({p['steps']} steps)\n",
                                style="bold green" if p["success"] else "bold yellow"))
                 if p.get("total_time_ms", 0) >= 5000 and not self._has_focus and not self._bell_rung:

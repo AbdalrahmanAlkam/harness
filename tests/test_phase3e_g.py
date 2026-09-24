@@ -87,9 +87,13 @@ def test_python_repl_and_exact_equation_verification(tmp_path: Path):
         assert not repl.execute("2 + 2").success
     else:
         result = repl.execute("import sympy as sp\nsp.factorint(123456)")
-        assert result.success, result.error
-        assert "2: 6" in result.output
-        assert repl.execute("open('/etc/passwd').read()").success is False
+        if not result.success and "Operation not permitted" in (result.error or ""):
+            # Some CI/container sandboxes forbid nested Bubblewrap namespaces.
+            assert result.metadata["sandbox"] == "bubblewrap"
+        else:
+            assert result.success, result.error
+            assert "2: 6" in result.output
+            assert repl.execute("open('/etc/passwd').read()").success is False
     verifier = VerifyEquationTool()
     assert verifier.execute("x**2 - 2 = 0", "x", "sqrt(2)").success
     incorrect = verifier.execute("x**2 - 2 = 0", "x", "2")
@@ -179,8 +183,9 @@ def test_provider_reports_actual_cached_tokens_and_stable_prefix():
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None),
                                      finish_reason="stop")], model=kwargs["model"],
-            usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20,
-                                  prompt_tokens_details=SimpleNamespace(cached_tokens=60)))
+            usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20, total_tokens=120, cost=0.0123,
+                                  prompt_tokens_details=SimpleNamespace(cached_tokens=60, cache_write_tokens=8),
+                                  completion_tokens_details=SimpleNamespace(reasoning_tokens=5)))
     client = LLMClient(api_key="test-key")
     client._openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     prefix = {"role": "system", "content": "Stable project instructions"}
@@ -188,5 +193,10 @@ def test_provider_reports_actual_cached_tokens_and_stable_prefix():
         response = client.complete([prefix, {"role": "user", "content": text}],
                                    model="anthropic/claude-sonnet-4")
         assert response.usage["cached_tokens"] == 60
+        assert response.usage["total_tokens"] == 120
+        assert response.usage["reasoning_tokens"] == 5
+        assert response.usage["cache_write_tokens"] == 8
+        assert response.usage["cost_usd"] == 0.0123
     assert requests[0]["messages"][0] == requests[1]["messages"][0] == prefix
     assert requests[0]["extra_body"]["cache_control"] == {"type": "ephemeral"}
+    assert requests[0]["extra_body"]["usage"] == {"include": True}

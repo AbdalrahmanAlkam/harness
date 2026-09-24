@@ -125,7 +125,7 @@ def test_openrouter_reasoning_request_uses_effort_without_temperature():
     assert response.content == "ok"
     assert captured["model"] == MODEL_TIERS["reasoning"]
     assert captured["extra_body"] == {"reasoning": {"effort": "high"},
-                                      "cache_control": {"type": "ephemeral"}}
+                                      "cache_control": {"type": "ephemeral"}, "usage": {"include": True}}
     assert "temperature" not in captured
 
 
@@ -143,20 +143,20 @@ def test_reasoning_budget_uses_supported_openrouter_parameters():
     client.complete(messages, model="anthropic/claude-3.7-sonnet", reasoning_effort="high",
                     reasoning_budget_tokens=16000)
     assert requests[-1]["extra_body"] == {"reasoning": {"max_tokens": 16000},
-                                          "cache_control": {"type": "ephemeral"}}
+                                          "cache_control": {"type": "ephemeral"}, "usage": {"include": True}}
     assert requests[-1]["max_completion_tokens"] > 16000
     assert "temperature" not in requests[-1]
     client.complete(messages, model="deepseek/deepseek-r1", reasoning_effort="medium",
                     reasoning_budget_tokens=4000)
-    assert requests[-1]["extra_body"] == {"reasoning": {"effort": "medium"}}
+    assert requests[-1]["extra_body"] == {"reasoning": {"effort": "medium"}, "usage": {"include": True}}
     client.complete(messages, model="anthropic/claude-3.7-sonnet", reasoning_budget_tokens=0)
     assert requests[-1]["extra_body"] == {"reasoning": {"enabled": False},
-                                          "cache_control": {"type": "ephemeral"}}
+                                          "cache_control": {"type": "ephemeral"}, "usage": {"include": True}}
     client.complete(messages, model=MODEL_TIERS["standard"], reasoning_effort="low",
                     reasoning_budget_tokens=1000)
-    assert requests[-1]["extra_body"] == {"reasoning": {"effort": "low"}}
+    assert requests[-1]["extra_body"] == {"reasoning": {"effort": "low"}, "usage": {"include": True}}
     client.complete(messages, model=MODEL_TIERS["standard"], reasoning_budget_tokens=0)
-    assert requests[-1]["extra_body"] == {"reasoning": {"effort": "none"}}
+    assert requests[-1]["extra_body"] == {"reasoning": {"effort": "none"}, "usage": {"include": True}}
 
 
 def test_run_bash_tool(tmp_path: Path):
@@ -748,6 +748,69 @@ def test_model_error_is_not_reported_as_success(tmp_path: Path):
     events = list(DeveloperAgent(llm_client=FailingClient(), workspace_root=str(tmp_path)).run_stream("git status"))
     assert any(e.event_type == "llm_error" for e in events)
     assert next(e.payload for e in events if e.event_type == "response")["success"] is False
+
+
+def test_length_limited_model_response_continues_before_completion(tmp_path: Path):
+    class TruncatingClient:
+        default_model = "test/model"
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            return LLMResponse(content="First part" if self.calls == 1 else "Finished part",
+                               model=self.default_model, finish_reason="length" if self.calls == 1 else "stop",
+                               usage={"prompt_tokens": 10, "completion_tokens": 5})
+
+    client = TruncatingClient()
+    events = list(DeveloperAgent(llm_client=client, workspace_root=str(tmp_path)).run_stream("say hello", max_steps=3))
+    response = next(event.payload for event in events if event.event_type == "response")
+    assert client.calls == 2
+    assert response["success"] is True
+    assert "First part" in response["content"] and "Finished part" in response["content"]
+    assert any(event.event_type == "llm_notice" and "continuing" in event.payload["message"] for event in events)
+
+
+def test_failed_tool_requires_repair_before_agent_reports_completion(tmp_path: Path):
+    class RecoveringClient:
+        default_model = "test/model"
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            if self.calls in (1, 3):
+                return LLMResponse(model=self.default_model, tool_calls=[ToolCall(
+                    id=str(self.calls), name="run_bash", arguments={"command": "check"})])
+            return LLMResponse(model=self.default_model,
+                               content="Done" if self.calls == 2 else "Verified repair")
+
+    class FlakyTool(Tool):
+        name = "run_bash"
+        description = "Check a task"
+        parameters = {"type": "object", "properties": {"command": {"type": "string"}}}
+
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, **kwargs):
+            self.calls += 1
+            return ToolResult(success=self.calls > 1, output="ok" if self.calls > 1 else "",
+                              error="failed" if self.calls == 1 else None)
+
+    client = RecoveringClient()
+    tool = FlakyTool()
+    agent = DeveloperAgent(llm_client=client, tools=[tool], workspace_root=str(tmp_path), forced_mode="coding")
+    events = list(agent.run_stream("check status", max_steps=5))
+    response = next(event.payload for event in events if event.event_type == "response")
+    assert client.calls == 4
+    assert tool.calls == 2
+    assert response["success"] is True
+    assert response["content"] == "Verified repair"
+    assert any(event.event_type == "llm_notice" and "verification" in event.payload["message"]
+               for event in events)
 
 
 def test_workspace_paths_and_pytest_arguments(tmp_path: Path):

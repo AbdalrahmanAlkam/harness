@@ -26,7 +26,7 @@ class SemIfDecision:
 class SemIfEngine:
     """Probe candidate option token logits with one lazy local model pass."""
 
-    DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+    DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
     def __init__(self, model_name_or_path: str = DEFAULT_MODEL, device: str = "auto",
                  load_in_4bit: bool = False, temperature: float = 1.0):

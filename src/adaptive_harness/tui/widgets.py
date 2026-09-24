@@ -14,7 +14,7 @@ from textual import events
 from textual.message import Message
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, RichLog, Static
+from textual.widgets import Button, Input, Label, RichLog, Static, TextArea
 
 
 SKILL_LABELS = {
@@ -456,6 +456,9 @@ class QuickSelectModal(ModalScreen[str | None]):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "quick-search":
+            # Input.Submitted bubbles to the app; stop it here or Enter can
+            # submit the underlying task prompt after selecting a model.
+            event.stop()
             self.action_choose()
 
     def _select_index(self, index: int) -> None:
@@ -647,6 +650,58 @@ class ClarificationModal(ModalScreen[str]):
             self.focused.press()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
         val = event.value.strip()
         if val:
             self.dismiss(val)
+
+
+class OutputViewerModal(ModalScreen[None]):
+    """Scrollable, selectable view of the complete latest agent response."""
+
+    DEFAULT_CSS = """
+    OutputViewerModal { align: center middle; background: rgba(0, 0, 0, 0.70); }
+    #output-card { width: 92%; height: 88%; background: $surface; border: round $accent; padding: 1 2; }
+    #output-title { height: 2; text-align: center; text-style: bold; color: $accent; }
+    #output-text { height: 1fr; border: solid $primary; }
+    #output-help { height: 1; color: $text-muted; text-align: center; }
+    #output-actions { height: 3; }
+    #output-actions Button { width: 1fr; }
+    """
+    BINDINGS = [("escape", "close", "Close"), ("ctrl+shift+c", "copy_all", "Copy all")]
+
+    def __init__(self, content: str, title: str = "Latest Agent Output"):
+        super().__init__()
+        self.content = content
+        self.title_text = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="output-card"):
+            yield Label(f"{self.title_text} · Select text or copy all", id="output-title")
+            yield TextArea(self.content, read_only=True, soft_wrap=True, show_line_numbers=False, id="output-text")
+            yield Static("Mouse drag / keyboard select · Ctrl+Shift+C copy selection or all · Esc close", id="output-help")
+            with Horizontal(id="output-actions"):
+                yield Button("Copy all", id="output-copy", variant="success")
+                yield Button("Close", id="output-close")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def action_copy_all(self) -> None:
+        selection = self.get_selected_text()
+        if not selection:
+            selection = self.query_one("#output-text", TextArea).selected_text
+        copied = selection if selection else self.content
+        self.app.copy_to_clipboard(copied)
+        label = "Selection" if selection else "Full response"
+        self.query_one("#output-help", Static).update(f"✓ {label} copied to clipboard · Esc close")
+
+    def on_mount(self) -> None:
+        self.query_one("#output-text", TextArea).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "output-copy":
+            self.action_copy_all()
+        elif event.button.id == "output-close":
+            self.action_close()

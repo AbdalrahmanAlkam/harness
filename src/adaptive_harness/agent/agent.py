@@ -326,7 +326,7 @@ class DeveloperAgent:
         if max_steps is None:
             max_steps = {ThinkingLevel.NONE: 4, ThinkingLevel.LOW: 8, ThinkingLevel.MEDIUM: 12,
                          ThinkingLevel.DEEP: 16, ThinkingLevel.EXTREME: 20}[thinking_res.level]
-        max_steps = max(1, min(max_steps, 24))
+        max_steps = max(1, min(max_steps, 32))
         yield AgentEvent("domain_mode", {"mode": domain_res.mode.value, "confidence": domain_res.confidence,
                                           "selection": "forced" if self.forced_mode else "auto",
                                           "latency_ms": round(domain_prediction.latency_ms, 2)})
@@ -400,8 +400,14 @@ class DeveloperAgent:
         cache_dependencies: dict[str, str] = {}
         cache_eligible = _cacheable_read_request(original_input)
         unresolved_failures: set[str] = set()
-        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                 "reasoning_tokens": 0, "cached_tokens": 0, "cache_write_tokens": 0}
+        reported_cost_usd = 0.0
+        cost_reported = False
         cached_tokens = 0
+        answer_parts: list[str] = []
+        stop_reason = ""
+        verification_followups = 0
 
         while step < max_steps:
             step += 1
@@ -418,8 +424,15 @@ class DeveloperAgent:
             except Exception as exc:
                 llm_resp = LLMResponse(content=f"Model request failed ({type(exc).__name__}). Retry the task or check the connection.",
                     finish_reason="error", usage={"prompt_tokens": 0, "completion_tokens": 0})
+            response_usage = llm_resp.usage or {}
             for token_type in usage:
-                usage[token_type] += int((llm_resp.usage or {}).get(token_type, 0) or 0)
+                usage[token_type] += int(response_usage.get(token_type, 0) or 0)
+            if not response_usage.get("total_tokens"):
+                usage["total_tokens"] += int(response_usage.get("prompt_tokens", 0) or 0) + int(
+                    response_usage.get("completion_tokens", 0) or 0)
+            if response_usage.get("cost_usd") is not None:
+                reported_cost_usd += float(response_usage["cost_usd"])
+                cost_reported = True
             cached_tokens += int((llm_resp.usage or {}).get("cached_tokens", 0) or 0)
             if (llm_resp.metadata or {}).get("thinking_fallback"):
                 reason = (llm_resp.metadata or {}).get("thinking_fallback_reason")
@@ -430,7 +443,14 @@ class DeveloperAgent:
             if llm_resp.finish_reason == "error":
                 yield AgentEvent("llm_error", {"message": llm_resp.content or "Unknown model error", "model": selected_model})
                 final_answer = llm_resp.content or "Model request failed"
+                stop_reason = "provider_error"
                 break
+
+            if llm_resp.content or llm_resp.tool_calls:
+                # Expose the phase change to the TUI once the provider returns
+                # from any hidden reasoning work and produces a visible result.
+                yield AgentEvent("agent_stage", {"stage": "generating", "step": step,
+                    "model": selected_model, "thinking_tokens": thinking_res.budget_tokens})
 
             # Emit thought / content if present
             if llm_resp.content:
@@ -440,13 +460,42 @@ class DeveloperAgent:
                 )
                 final_answer = llm_resp.content
 
-            # If no tool calls, task is finished
+            # A plain-text answer is not completion when a tool failed or the
+            # selected skill still lacks required execution evidence.
             if not llm_resp.tool_calls:
+                partial = llm_resp.content or ""
+                answer_parts.append(partial)
+                final_answer = "\n\n".join(part for part in answer_parts if part)
                 assistant_message = {"role": "assistant", "content": llm_resp.content or ""}
                 if (llm_resp.metadata or {}).get("reasoning_details"):
                     assistant_message["reasoning_details"] = llm_resp.metadata["reasoning_details"]
                 self.messages.append(assistant_message)
-                completed = not unresolved_failures
+                if str(llm_resp.finish_reason).lower() in {"length", "max_tokens", "max_output_tokens"}:
+                    if step < max_steps:
+                        yield AgentEvent("llm_notice", {"message": "The model hit its response-length limit; continuing from the cutoff."})
+                        self.messages.append({"role": "user", "content":
+                            "Continue your previous response from exactly where it stopped. Do not repeat prior text; finish the requested work and clearly report what remains."})
+                        continue
+                    stop_reason = "response_length_limit"
+                    break
+                pending_checks = self.skill_verifier.verify(selected_skills, skill_observations)
+                missing_checks = [f"{check.skill}: {', '.join(check.missing)}"
+                                  for check in pending_checks if not check.verified]
+                if (unresolved_failures or missing_checks or not final_answer.strip()) and step < max_steps and verification_followups < 2:
+                    verification_followups += 1
+                    yield AgentEvent("llm_notice", {"message":
+                        "The response lacks a final answer or required verification; continuing to repair and check it."})
+                    self.messages.append({"role": "user", "content":
+                        "The task is not complete. Repair failed tools and perform the missing checks before answering. "
+                        f"Failed tools: {', '.join(sorted(unresolved_failures)) or 'none'}. "
+                        f"Missing checks: {'; '.join(missing_checks) or 'none'}. "
+                        "If a check cannot be completed, state the concrete blocker instead of claiming success."})
+                    answer_parts.clear()
+                    final_answer = ""
+                    continue
+                completed = bool(final_answer.strip()) and not unresolved_failures and not missing_checks
+                stop_reason = ("verification_failed" if unresolved_failures or missing_checks else
+                               "no_answer" if not final_answer.strip() else "completed")
                 break
 
             # Obtain authorization before adding tool calls to conversation history.
@@ -609,6 +658,9 @@ class DeveloperAgent:
                 "missing": skill_check.missing})
         if skill_checks and not all(check.verified for check in skill_checks):
             completed = False
+            stop_reason = "skill_verification_failed"
+        if not completed and not stop_reason and step >= max_steps:
+            stop_reason = "step_limit"
         total_wall_ms = (time.perf_counter() - start_time) * 1000.0
         if self.repository is not None and completed and cache_eligible and cache_dependencies and final_answer:
             try:
@@ -628,6 +680,9 @@ class DeveloperAgent:
                 "success": completed,
                 "usage": usage,
                 "cached_tokens": cached_tokens,
+                "cost_usd": reported_cost_usd,
+                "cost_reported": cost_reported,
+                "stop_reason": stop_reason or ("completed" if completed else "incomplete"),
             },
         )
 
