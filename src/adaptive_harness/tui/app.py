@@ -139,6 +139,7 @@ class AdaptiveHarnessApp(App):
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+l", "clear_screen", "Clear Log"),
         ("ctrl+shift+c", "copy_output", "Copy Output"),
+        ("ctrl+y", "copy_output", "Copy Output"),
         ("ctrl+n", "new_session", "New Session"),
         ("f1", "show_help", "Help"),
         ("f2", "choose_theme", "Theme"),
@@ -356,7 +357,10 @@ class AdaptiveHarnessApp(App):
         self.set_interval(0.7, self._pulse_waiting)
 
     def _pulse_waiting(self) -> None:
-        indicator = self.query_one("#waiting-indicator", Static)
+        indicators = self.query("#waiting-indicator")
+        if not indicators:
+            return
+        indicator = indicators.first()
         if indicator.has_class("visible"):
             indicator.toggle_class("pulse")
         else:
@@ -532,7 +536,7 @@ class AdaptiveHarnessApp(App):
 
     def action_copy_output(self) -> None:
         selected = self.screen.get_selected_text()
-        content = selected.strip() if selected and selected.strip() else self._last_agent_content
+        content = selected.strip() if selected and selected.strip() else (self._last_agent_content or self._review_patch)
         if not content:
             self.query_one("#chat-log", RichLog).write(Text("No agent output to copy yet.", style="yellow"))
             return
@@ -1300,6 +1304,11 @@ class AdaptiveHarnessApp(App):
         self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
             workspace_isolation="Direct workspace", swarm_status={})
 
+    def _direct_workspace_notice(self, reason: str) -> None:
+        self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+            workspace_isolation="Direct workspace")
+        self.query_one("#chat-log", RichLog).write(Text(reason, style="dim"))
+
     @work(thread=True)
     def execute_agent_task(self, task_text: str) -> None:
         """Worker thread executing the agent task and streaming events back to the UI."""
@@ -1308,20 +1317,25 @@ class AdaptiveHarnessApp(App):
         ready_for_review = False
         try:
             if self._should_isolate(task_text):
-                try:
-                    manager = WorktreeManager(self.workspace_root)
-                    isolated = manager.create()
-                except WorktreeError as exc:
-                    if "not a git repository" not in str(exc).lower() or self.isolation_mode == "on" or self.swarm_mode == "on":
-                        raise
-                    manager = None
+                if not WorktreeManager.is_git_repo(self.workspace_root):
+                    self.call_from_thread(self._direct_workspace_notice,
+                        "Workspace is not a Git repo: executing directly in workspace")
+                else:
+                    try:
+                        manager = WorktreeManager(self.workspace_root)
+                        isolated = manager.create()
+                    except (WorktreeError, OSError) as exc:
+                        manager = None
+                        self.call_from_thread(self._direct_workspace_notice,
+                            f"Git worktree unavailable ({exc}): executing directly in workspace")
                 if isolated:
                     self.agent.set_workspace(isolated.workspace)
                     self.call_from_thread(self._worktree_started, isolated)
-            if self._should_swarm(task_text) and isolated:
+            if self._should_swarm(task_text):
                 coordinator = SwarmCoordinator(DeveloperAgentWorker(llm_client_factory=self._swarm_client),
                     on_status=lambda status: self.call_from_thread(self._swarm_status_changed, dict(status)))
-                report = coordinator.run(task_text, isolated.workspace, isolated=True)
+                report = coordinator.run(task_text, isolated.workspace if isolated else self.workspace_root,
+                                         isolated=bool(isolated))
                 self.call_from_thread(self._swarm_completed, report, task_text)
                 success = report.success
             else:

@@ -5,6 +5,8 @@ import subprocess
 
 import pytest
 
+from adaptive_harness.agent.agent import DeveloperAgent
+from adaptive_harness.llm.client import LLMClient
 from adaptive_harness.workspace.worktree import WorktreeError, WorktreeManager
 from adaptive_harness.tui.app import AdaptiveHarnessApp
 from adaptive_harness.tui.widgets import DiffReviewModal
@@ -97,6 +99,28 @@ def test_worktree_refuses_symlinked_storage(repo: Path):
     (repo / ".harness").symlink_to(repo.parent, target_is_directory=True)
     with pytest.raises(WorktreeError, match="symlink"):
         WorktreeManager(repo).create()
+
+
+def test_non_git_and_unborn_repo_degrade_without_initial_commit(tmp_path: Path):
+    assert not WorktreeManager.is_git_repo(tmp_path)
+    with pytest.raises(WorktreeError, match="not inside a Git repository"):
+        WorktreeManager(tmp_path)
+    git(tmp_path, "init", "-q")
+    assert WorktreeManager.is_git_repo(tmp_path)
+    manager = WorktreeManager(tmp_path)
+    assert not manager.has_commits()
+    with pytest.raises(WorktreeError, match="no commits"):
+        manager.create()
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_agent_writes_nested_file_in_non_git_workspace(tmp_path: Path):
+    agent = DeveloperAgent(llm_client=LLMClient(force_mock=True), workspace_root=str(tmp_path),
+                           preferences_dir=tmp_path / "preferences")
+    responses = [event.payload for event in agent.run_stream("write file nested/hello.py")
+                 if event.event_type == "response"]
+    assert responses[-1]["success"]
+    assert (tmp_path / "nested" / "hello.py").is_file()
 
 
 @pytest.mark.anyio

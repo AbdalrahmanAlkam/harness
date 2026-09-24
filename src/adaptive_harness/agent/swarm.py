@@ -1,4 +1,4 @@
-"""Bounded, artifact-driven collaboration for an isolated developer task.
+"""Bounded, artifact-driven collaboration for a developer task.
 
 Only one worker may edit the worktree. Independent planning and final review
 jobs run concurrently; each receives compact JSON artifacts from earlier jobs
@@ -108,8 +108,8 @@ StatusCallback = Callable[[Mapping[str, str]], None]
 class SwarmCoordinator:
     """Run read-only roles in parallel and serialize the sole writer.
 
-    The caller must supply an already-created isolated worktree. The
-    coordinator never creates, applies, or discards changes itself.
+    The caller supplies a workspace. Only the coder can mutate files, so
+    direct workspaces remain safe from concurrent agent writes.
     """
 
     def __init__(self, worker: SwarmWorker, *, max_workers: int = 2,
@@ -123,10 +123,8 @@ class SwarmCoordinator:
     def run(self, task: str, workspace_root: str | Path, *,
             isolated: bool = False) -> SwarmReport:
         root = Path(workspace_root).resolve()
-        if not isolated:
-            raise ValueError("Swarm tasks require an isolated worktree")
         if not root.is_dir():
-            raise ValueError(f"Worktree does not exist: {root}")
+            raise ValueError(f"Workspace does not exist: {root}")
         if not task.strip():
             raise ValueError("Swarm task cannot be empty")
 
@@ -155,6 +153,19 @@ class SwarmCoordinator:
                     except Exception as exc:
                         result = SwarmResult(assignment.role, assignment.phase, False,
                                              "Subagent failed", error=f"{type(exc).__name__}: {exc}")
+                    # Retry a transient worker failure once. The writer is
+                    # still serialized because each wave finishes before the next.
+                    if not result.success and result.error:
+                        try:
+                            retry = self.worker(assignment)
+                            if retry.role is not assignment.role or retry.phase is not assignment.phase:
+                                raise ValueError("Worker returned a result for a different assignment")
+                            json.dumps(retry.to_dict(), ensure_ascii=False)
+                            result = retry
+                        except Exception as exc:
+                            result = SwarmResult(assignment.role, assignment.phase, False,
+                                                 "Subagent failed after retry",
+                                                 error=f"{type(exc).__name__}: {exc}")
                     statuses[assignment.key] = "done" if result.success else "failed"
                     collected[assignment.key] = result
                     self._notify(statuses)
@@ -191,8 +202,8 @@ class SwarmCoordinator:
 class DeveloperAgentWorker:
     """Opt-in role runner using separate agent state for each assignment.
 
-    Shell access is omitted. Only the coder receives file mutation tools, and
-    every file tool is rooted in the caller's isolated worktree.
+    Only the coder receives file mutation and shell tools, and
+    every file tool is rooted in the assigned workspace.
     """
 
     def __init__(self, *, llm_client_factory: Callable[[], Any] | None = None,
@@ -204,6 +215,7 @@ class DeveloperAgentWorker:
 
     def __call__(self, assignment: SwarmAssignment) -> SwarmResult:
         from adaptive_harness.agent.agent import DeveloperAgent, DEFAULT_SYSTEM_PROMPT
+        from adaptive_harness.tools.bash import RunBashTool
         from adaptive_harness.tools.file_ops import EditFileTool, ReadFileTool, WriteFileTool
         from adaptive_harness.tools.testing import RunPytestTool
         from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
@@ -213,14 +225,14 @@ class DeveloperAgentWorker:
                  SearchFilesTool(workspace_root=root)]
         if assignment.may_edit:
             tools += [WriteFileTool(workspace_root=root), EditFileTool(workspace_root=root),
-                      RunPytestTool(workspace_root=root)]
+                      RunBashTool(workspace_root=root), RunPytestTool(workspace_root=root)]
         elif assignment.role is SwarmRole.QA and assignment.phase is SwarmPhase.VERIFY:
             tools.append(RunPytestTool(workspace_root=root))
         agent = DeveloperAgent(llm_client=self.llm_client_factory() if self.llm_client_factory else None,
             tools=tools, workspace_root=root,
             forced_mode="security" if assignment.role is SwarmRole.SECURITY else "coding",
             system_prompt=f"{DEFAULT_SYSTEM_PROMPT}\n{assignment.instruction}\n"
-                          "Only use available tools within the assigned worktree.")
+                          "Only use available tools within the assigned workspace.")
         prompt = assignment.task
         if assignment.context:
             prompt += "\nPrior verified artifacts (JSON):\n" + json.dumps(assignment.context, ensure_ascii=False)

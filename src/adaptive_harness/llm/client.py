@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Union
 
@@ -20,6 +21,38 @@ MODEL_TIERS = {
     "standard": "z-ai/glm-5.3-flash",
     "reasoning": "anthropic/claude-sonnet-4",
 }
+
+
+def _fenced_tool_calls(content: str | None, tools: List[Dict[str, Any]] | None) -> List[ToolCall]:
+    """Recover explicit JSON tool requests from providers without native calls.
+
+    Plain JSON examples are deliberately ignored. Only a ``tool_call`` fence
+    or a JSON object with a ``tool_call`` wrapper may initiate a tool.
+    """
+    if not content or not tools:
+        return []
+    available = {item.get("function", {}).get("name") for item in tools}
+    calls = []
+    for index, match in enumerate(re.finditer(r"```(tool_call|tool|json)\s*\n(.*?)\n```",
+                                           content, flags=re.I | re.S), start=1):
+        try:
+            payload = json.loads(match.group(2))
+        except (ValueError, TypeError):
+            continue
+        if match.group(1).lower() == "json":
+            payload = payload.get("tool_call") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        name = payload.get("name") or payload.get("tool")
+        args = payload.get("arguments", payload.get("args"))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                continue
+        if name in available and isinstance(args, dict):
+            calls.append(ToolCall(id=f"fenced_tool_{index}", name=name, arguments=args))
+    return calls
 
 
 class LLMClient:
@@ -226,6 +259,8 @@ class LLMClient:
                             arguments=args,
                         )
                     )
+            else:
+                tool_calls = _fenced_tool_calls(msg.content, tools)
 
             usage_dict = {
                 "prompt_tokens": int(getattr(response.usage, "prompt_tokens", 0) or 0),

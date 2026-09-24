@@ -34,7 +34,7 @@ def test_swarm_parallel_readers_single_writer_and_structured_handoff(tmp_path):
                            verified=assignment.phase is SwarmPhase.VERIFY)
 
     coordinator = SwarmCoordinator(worker, on_status=lambda status: statuses.append(status))
-    report = coordinator.run("Fix module", tmp_path, isolated=True)
+    report = coordinator.run("Fix module", tmp_path)
 
     assert report.success
     assert peak == 2
@@ -49,7 +49,7 @@ def test_swarm_parallel_readers_single_writer_and_structured_handoff(tmp_path):
     assert json.loads(report.to_json())["success"] is True
 
 
-def test_swarm_refuses_direct_workspace_and_stops_on_plan_failure(tmp_path):
+def test_swarm_runs_in_direct_workspace_and_stops_on_plan_failure(tmp_path):
     calls = []
 
     def worker(assignment):
@@ -58,10 +58,7 @@ def test_swarm_refuses_direct_workspace_and_stops_on_plan_failure(tmp_path):
         return SwarmResult(assignment.role, assignment.phase, success, "done")
 
     coordinator = SwarmCoordinator(worker)
-    with pytest.raises(ValueError, match="isolated worktree"):
-        coordinator.run("Fix", tmp_path)
-    assert calls == []
-    report = coordinator.run("Fix", tmp_path, isolated=True)
+    report = coordinator.run("Fix", tmp_path)
     assert not report.success
     assert set(calls) == {"architect:plan", "qa:plan"}
     assert report.status["coder:implement"] == "queued"
@@ -84,6 +81,21 @@ def test_swarm_catches_worker_errors_and_requires_qa_evidence(tmp_path):
     report = SwarmCoordinator(unverified_worker).run("Fix", tmp_path, isolated=True)
     assert not report.success
     assert report.status["qa:verify"] == "done"
+
+
+def test_swarm_retries_transient_subagent_exception(tmp_path):
+    attempts = {}
+
+    def worker(assignment):
+        attempts[assignment.key] = attempts.get(assignment.key, 0) + 1
+        if assignment.key == "architect:plan" and attempts[assignment.key] == 1:
+            raise RuntimeError("temporary provider error")
+        return SwarmResult(assignment.role, assignment.phase, True, "done",
+                           verified=assignment.phase is SwarmPhase.VERIFY)
+
+    report = SwarmCoordinator(worker).run("Fix module", tmp_path)
+    assert report.success
+    assert attempts["architect:plan"] == 2
 
 
 def test_swarm_rejects_mismatched_and_unserializable_worker_results(tmp_path):

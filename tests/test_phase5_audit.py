@@ -13,7 +13,7 @@ from textual.widgets import Footer, Input
 from adaptive_harness.agent.agent import DeveloperAgent
 from adaptive_harness.data.config import ConfigManager, PromptHistoryStore
 from adaptive_harness.data.storage import ExperienceRepository
-from adaptive_harness.llm.client import LLMClient
+from adaptive_harness.llm.client import LLMClient, _fenced_tool_calls
 from adaptive_harness.llm.mock_client import LLMResponse, ToolCall
 from adaptive_harness.skills.registry import BUILTIN_BY_NAME
 from adaptive_harness.skills.router import SkillRouter
@@ -137,6 +137,22 @@ async def test_copy_shortcut_copies_latest_agent_output(tmp_path, monkeypatch):
         app._last_agent_content = "Useful answer with exact result."
         app._handle_slash_command("/copy")
         assert copied == ["Useful answer with exact result."]
+        app._last_agent_content = ""
+        app._review_patch = "diff --git a/a.py b/a.py"
+        await pilot.press("ctrl+y")
+        assert copied[-1] == app._review_patch
+
+
+def test_fenced_tool_call_fallback_requires_explicit_marker_and_known_tool():
+    tools = [{"type": "function", "function": {"name": "write_file"}}]
+    block = '```tool_call\n{"name":"write_file","arguments":{"path":"x.py","content":"ok"}}\n```'
+    recovered = _fenced_tool_calls(block, tools)
+    assert len(recovered) == 1
+    assert recovered[0].arguments == {"path": "x.py", "content": "ok"}
+    assert not _fenced_tool_calls(block.replace("tool_call", "json"), tools)
+    assert not _fenced_tool_calls(block.replace("write_file", "run_bash"), tools)
+    wrapped = '```json\n{"tool_call":{"name":"write_file","arguments":{"path":"x.py","content":"ok"}}}\n```'
+    assert _fenced_tool_calls(wrapped, tools)[0].name == "write_file"
 
 
 def test_semantic_routing_does_not_require_keyword_overlap_and_can_chain():

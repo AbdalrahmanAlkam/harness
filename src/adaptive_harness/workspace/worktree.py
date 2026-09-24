@@ -31,12 +31,35 @@ class WorktreeManager:
 
     def __init__(self, workspace: str | Path):
         self.workspace = Path(workspace).expanduser().resolve()
+        if not self.is_git_repo(self.workspace):
+            raise WorktreeError("The workspace is not inside a Git repository")
         self.repo = self._git("rev-parse", "--show-toplevel", cwd=self.workspace).stdout.strip()
         if not self.repo:
             raise WorktreeError("The workspace is not inside a Git repository")
         self.repo_root = Path(self.repo).resolve()
         self.relative_workspace = self.workspace.relative_to(self.repo_root)
         self.worktrees_dir = self.repo_root / ".harness" / "worktrees"
+
+    @staticmethod
+    def is_git_repo(workspace: str | Path) -> bool:
+        """Return whether Git recognizes the directory as a working tree."""
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(Path(workspace).expanduser().resolve()),
+                 "rev-parse", "--is-inside-work-tree"],
+                text=True, capture_output=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0 and result.stdout.strip() == "true"
+
+    def has_commits(self) -> bool:
+        """An unborn HEAD cannot be used as a linked worktree base."""
+        try:
+            self._git("rev-parse", "--verify", "HEAD", cwd=self.repo_root)
+        except WorktreeError:
+            return False
+        return True
 
     @staticmethod
     def _git(*args: str, cwd: Path, input_data: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -50,6 +73,8 @@ class WorktreeManager:
         return result
 
     def create(self) -> WorktreeTask:
+        if not self.has_commits():
+            raise WorktreeError("The Git repository has no commits; use the direct workspace")
         if self.worktrees_dir.parent.is_symlink() or self.worktrees_dir.is_symlink():
             raise WorktreeError("The .harness worktree directory must not be a symlink")
         task_id = uuid.uuid4().hex[:10]
