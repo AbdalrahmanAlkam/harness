@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+import json
 import os
 import typer
 from rich.console import Console
@@ -399,6 +400,44 @@ def dev(
             }.get(p.get("stop_reason"), "Stopped before completion")
             color = "green" if p.get("success", True) else "yellow"
             console.print(f"\n[bold {color}]{status} in {p['total_time_ms']} ms ({p['steps']} steps)[/bold {color}]\n")
+
+
+@app.command()
+def prompts(
+    action: str = typer.Argument("list", help="list, show NAME, export [PATH], or path"),
+    name: str = typer.Argument("", help="Prompt name for `show`, or destination file for `export`"),
+):
+    """Inspect and customize every prompt the models receive."""
+    from adaptive_harness.prompts import PromptRegistry, get_default_registry, DEFAULT_CONFIG_DIR
+    registry = get_default_registry()
+    override_paths = [Path(DEFAULT_CONFIG_DIR) / "prompts.json",
+                      Path(".harness") / "prompts.json",
+                      Path(os.environ["ADAPTIVE_PROMPTS_FILE"]) if os.getenv("ADAPTIVE_PROMPTS_FILE") else None]
+    if action == "list":
+        for prompt_name in registry.names():
+            marker = " [overridden]" if registry.is_overridden(prompt_name) else ""
+            preview = registry.get(prompt_name).strip().splitlines()[0][:90]
+            console.print(f"  [cyan]{prompt_name}[/cyan]{marker} [dim]{escape(preview)}[/dim]")
+        console.print("\n[dim]Override with a JSON file mapping names to new text; see `prompts path`.[/dim]")
+    elif action == "show":
+        if not name:
+            raise typer.BadParameter("show requires a prompt name", param_hint="name")
+        try:
+            console.print(Text(registry.get(name)))
+        except KeyError as exc:
+            raise typer.BadParameter(str(exc), param_hint="name") from exc
+    elif action == "export":
+        target = Path(name or "output/prompts.json")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(registry.export(), indent=2, ensure_ascii=False), encoding="utf-8")
+        console.print(f"[green]Wrote {len(registry.names())} prompts to {target}[/green]")
+        console.print("[dim]Edit any entry and copy it to one of the override paths listed by `prompts path`.[/dim]")
+    elif action == "path":
+        for path in override_paths:
+            if path is not None:
+                console.print(f"  {path}{'  (exists)' if path.exists() else ''}")
+    else:
+        raise typer.BadParameter("Choose list, show, export, or path", param_hint="action")
 
 
 @app.command()

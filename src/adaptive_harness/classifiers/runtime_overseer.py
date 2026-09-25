@@ -10,6 +10,8 @@ import re
 import time
 from typing import Any
 
+from adaptive_harness.prompts import PromptRegistry, get_default_registry
+
 
 class OverseerState(StrEnum):
     HEALTHY_PROGRESS = "HEALTHY_PROGRESS"
@@ -41,9 +43,11 @@ class _Observation:
 class RuntimeOverseer:
     """Fast evidence gate; optional local semantic resolver for uncertain drift."""
 
-    def __init__(self, task: str, semantic_backend: Any = None):
+    def __init__(self, task: str, semantic_backend: Any = None,
+                 prompts: PromptRegistry | None = None):
         self.task = task
         self.semantic_backend = semantic_backend
+        self.prompts = prompts or get_default_registry()
         self.recent: deque[_Observation] = deque(maxlen=8)
         self.last_decision = OverseerDecision(OverseerState.HEALTHY_PROGRESS, 1.0)
         self.consecutive_interventions = 0
@@ -137,28 +141,18 @@ class RuntimeOverseer:
         if self.consecutive_interventions < 2 or not looping:
             return None
         state = looping[-1]
-        directive = ("OVERSEER TERMINATION VERDICT: The classifier detects no path to progress after "
-                     "repeated interventions (" + state.value + "). Further tool calls are unnecessary. "
-                     "The run is stopped here; report the verified results obtained so far and the "
-                     "concrete blocker that prevented completion.")
+        directive = self.prompts.get("intervention.termination_verdict", state=state.value)
         self.last_decision = OverseerDecision(state, 0.99, directive,
             self.last_decision.latency_ms, "verdict")
         return self.last_decision
 
     def _directive(self, state: OverseerState, target: str, evidence: str) -> str:
         if state == OverseerState.LOOPING_DETECTED:
-            return ("OVERSEER INTERVENTION: Repeated tool actions are looping on " + repr(target) +
-                    ". Stop repeating the same edit or command. Read the relevant module afresh, "
-                    "identify why prior attempts failed, and use a different strategy before editing again.")
+            return self.prompts.get("intervention.looping", target=target)
         if state == OverseerState.HALLUCINATION_DETECTED:
-            return ("OVERSEER INTERVENTION: Reality check failed. The available tool evidence says " +
-                    repr(evidence[:250]) + ". Do not claim success or assume file contents. "
-                    "Use read_file or search_files to ground the next step.")
+            return self.prompts.get("intervention.hallucination", evidence=evidence[:250])
         if state == OverseerState.PROGRESS_STALLED:
-            return ("OVERSEER INTERVENTION: Three attempts made no verified progress. "
-                    "Isolate the smallest failing case, inspect its error, and change strategy. "
-                    "Use run_python_repl only when numerical or symbolic reproduction is appropriate.")
+            return self.prompts.get("intervention.stalled")
         if state == OverseerState.SEMANTIC_DRIFT:
-            return ("OVERSEER INTERVENTION: Scope may have drifted. Re-anchor the next action to the "
-                    f"user's original task: {self.task[:400]!r}. Explain how any proposed edit serves it.")
+            return self.prompts.get("intervention.drift", task=self.task[:400])
         return ""

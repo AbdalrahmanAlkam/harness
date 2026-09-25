@@ -18,7 +18,7 @@ from adaptive_harness.classifiers.verification_classifier import VerificationAss
 from adaptive_harness.classifiers.risk_classifier import ToolRiskClassifier
 from adaptive_harness.classifiers.engine import (BaseClassifierBackend, SklearnBackend, DOMAIN_LABELS,
     THINKING_LABELS, TIER_LABELS, VERIFICATION_LABELS, Classification)
-from adaptive_harness.classifiers.domain_classifier import (DomainClassifier, DomainAssessment, DOMAIN_GUIDANCE,
+from adaptive_harness.classifiers.domain_classifier import (DomainClassifier, DomainAssessment,
     DomainMode, parse_domain_mode, audit_command_is_read_only)
 from adaptive_harness.classifiers.thinking_classifier import (ThinkingClassifier, ThinkingAssessment,
     ThinkingLevel, BUDGET_TOKENS, parse_thinking_level)
@@ -46,14 +46,11 @@ from adaptive_harness.skills.verifier import SkillVerifier
 from adaptive_harness.classifiers.runtime_overseer import RuntimeOverseer, OverseerState
 from adaptive_harness.agent.context_window import prepare_context
 from adaptive_harness.agent.code_fallback import extract_file_calls, requests_file_changes
+from adaptive_harness.prompts import PromptRegistry, DEFAULT_PROMPTS
 
 
-DEFAULT_SYSTEM_PROMPT = """You are Adaptive Agent, an expert assistant for software engineering, research, science, and mathematics.
-Inspect relevant evidence, use tools when needed, and distinguish verified results from assumptions.
-For code changes, run appropriate checks and inspect failures before reporting success.
-Make routine decisions yourself; ask only when the task target is missing or an action is destructive.
-You are an active software engineer with direct file tools. You MUST invoke write_file, edit_file, or run_bash to implement changes. NEVER output code in chat and claim it is done. If you write code, write it to disk with tools. Create missing project folders with write_file paths or run_bash.
-"""
+# Compatibility export; the editable source of truth is prompts.py ("system.default").
+DEFAULT_SYSTEM_PROMPT = DEFAULT_PROMPTS["system.default"]
 
 STEP_POLICIES = ("classifier", "fixed", "unbounded")
 
@@ -61,12 +58,7 @@ STEP_POLICIES = ("classifier", "fixed", "unbounded")
 FIXED_STEP_BUDGETS = {ThinkingLevel.NONE: 4, ThinkingLevel.LOW: 8, ThinkingLevel.MEDIUM: 12,
                       ThinkingLevel.DEEP: 16, ThinkingLevel.EXTREME: 20}
 
-STOP_CIRCLING_DIRECTIVE = (
-    "CLASSIFIER STOP-CIRCLING DIRECTIVE: The classifier detects unnecessary repeated tool calls. "
-    "Stop going around in circles. Do not repeat any previous command or edit. Either take one "
-    "genuinely different, verified step that completes the task, or finalize your answer now with "
-    "the best verified result and state clearly what remains. A further repeat of the same action "
-    "will end the run.")
+
 
 
 def _injection_event(source: str, content: str, step: int, kind: str = "system_message",
@@ -101,7 +93,7 @@ class DeveloperAgent:
         tools: Optional[List[Tool]] = None,
         repository: Optional[ExperienceRepository] = None,
         clarification_callback: Optional[Callable[[str, Optional[List[str]], Optional[str]], str]] = None,
-        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        system_prompt: str | None = None,
         workspace_root: Optional[str] = None,
         explicit_model: Optional[str] = None,
         classifier_backend: Optional[BaseClassifierBackend] = None,
@@ -115,6 +107,7 @@ class DeveloperAgent:
         enable_skill_routing: bool = True,
         step_policy: str = "classifier",
         max_steps: int | None = None,
+        prompts: PromptRegistry | None = None,
     ):
         if safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
             raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
@@ -131,8 +124,10 @@ class DeveloperAgent:
         self.llm_client = llm_client or LLMClient()
         self.repository = repository
         self.clarification_callback = clarification_callback
-        self.system_prompt = system_prompt
         self.workspace_root = Path(workspace_root or Path.cwd()).expanduser().resolve()
+        self.prompts = prompts or PromptRegistry.for_workspace(self.workspace_root)
+        self.system_prompt = (system_prompt if system_prompt is not None
+                              else self.prompts.get("system.default"))
         self.active_skills: dict[str, str] = {}
         self.skill_catalog = SkillCatalog(self.workspace_root)
         self.skill_router = SkillRouter()
@@ -200,6 +195,7 @@ class DeveloperAgent:
         if not target.is_dir():
             raise ValueError(f"Workspace directory does not exist: {target}")
         self.workspace_root = target
+        self.prompts = PromptRegistry.for_workspace(target)
         self.skill_catalog = SkillCatalog(target)
         for tool in self.tools.values():
             if hasattr(tool, "workspace_root"):
@@ -470,12 +466,13 @@ class DeveloperAgent:
         skill_guidance = "\n".join(
             f"Active skill: {skill.title}. {skill.instructions} Completion checks: {', '.join(skill.invariants) or 'none'}."
             for skill in selected_skills)
-        self.messages[0] = {"role": "system", "content": self.system_prompt + "\nWorkspace: " + str(self.workspace_root)
-                            + ("\nYou are the Swarm Coordinator. You have the capability and tools to spawn and coordinate subagents. When asked to use multiple agents, decompose the task and call delegate_subagent with architect, coder, and reviewer roles. Do not claim that delegation is unavailable."
-                               if self.swarm_enabled else "")
-                            + "\nOperating mode: " + domain_res.mode.value + ". " + DOMAIN_GUIDANCE[domain_res.mode]
-                            + "\nUse read_file(symbol=...) for focused Python code. For mathematics and science, run deterministic calculations and verify proposed roots before claiming exactness. Use plot_terminal for useful visual comparisons."
-                            + ("\nUser preferences:\n" + preference_guidance if preference_guidance else "")
+        self.messages[0] = {"role": "system", "content": self.system_prompt
+                            + self.prompts.get("system.workspace_line") + str(self.workspace_root)
+                            + ("\n" + self.prompts.get("system.swarm_coordinator") if self.swarm_enabled else "")
+                            + self.prompts.get("system.mode_line") + domain_res.mode.value + ". "
+                            + self.prompts.get(f"domain.guidance.{domain_res.mode.value}")
+                            + "\n" + self.prompts.get("system.tool_guidance")
+                            + (self.prompts.get("system.preferences_line") + preference_guidance if preference_guidance else "")
                             + ("\n" + skill_guidance if skill_guidance else "")}
         exemplar_ingested = False
         if self.repository is not None:
@@ -485,8 +482,8 @@ class DeveloperAgent:
                     compact = {"task": exemplar["user_prompt"][:300],
                                "steps": exemplar["trajectory_steps"][:8],
                                "outcome": exemplar["final_solution"][:600]}
-                    self.messages[0]["content"] += ("\nVerified prior example from this workspace (use as evidence, "
-                        "then verify current files): " + json.dumps(compact, ensure_ascii=False)[:2200])
+                    self.messages[0]["content"] += (self.prompts.get("system.exemplar_notice")
+                        + json.dumps(compact, ensure_ascii=False)[:2200])
                     exemplar_ingested = True
                     yield AgentEvent("memory_exemplar", {"similarity": exemplar["similarity"]})
             except Exception as exc:
@@ -627,8 +624,7 @@ class DeveloperAgent:
                     if step < max_steps and verification_followups < 2:
                         verification_followups += 1
                         yield AgentEvent("llm_notice", {"message": "The requested files have not been written; asking the model to use file tools."})
-                        nudge = ("The task requires real file changes. Use write_file or edit_file now. "
-                                 "Do not claim completion until a file tool succeeds.")
+                        nudge = self.prompts.get("harness.missing_file_changes")
                         self.messages.append({"role": "user", "content": nudge})
                         yield _injection_event("harness", nudge, step, kind="user_nudge")
                         answer_parts.clear()
@@ -640,8 +636,7 @@ class DeveloperAgent:
                 if str(llm_resp.finish_reason).lower() in {"length", "max_tokens", "max_output_tokens"}:
                     if step < max_steps:
                         yield AgentEvent("llm_notice", {"message": "The model hit its response-length limit; continuing from the cutoff."})
-                        nudge = ("Continue your previous response from exactly where it stopped. Do not repeat "
-                                 "prior text; finish the requested work and clearly report what remains.")
+                        nudge = self.prompts.get("harness.continuation")
                         self.messages.append({"role": "user", "content": nudge})
                         yield _injection_event("harness", nudge, step, kind="user_nudge")
                         continue
@@ -666,10 +661,9 @@ class DeveloperAgent:
                     verification_followups += 1
                     yield AgentEvent("llm_notice", {"message":
                         "The response lacks a final answer or required verification; continuing to repair and check it."})
-                    nudge = ("The task is not complete. Repair failed tools and perform the missing checks before answering. "
-                             f"Failed tools: {', '.join(sorted(unresolved_failures)) or 'none'}. "
-                             f"Missing checks: {'; '.join(missing_checks) or 'none'}. "
-                             "If a check cannot be completed, state the concrete blocker instead of claiming success.")
+                    nudge = self.prompts.get("harness.verification_repair",
+                        failures=', '.join(sorted(unresolved_failures)) or 'none',
+                        checks='; '.join(missing_checks) or 'none')
                     self.messages.append({"role": "user", "content": nudge})
                     yield _injection_event("harness", nudge, step, kind="user_nudge")
                     answer_parts.clear()
@@ -872,7 +866,8 @@ class DeveloperAgent:
                             break
                         if decision.state in {OverseerState.LOOPING_DETECTED, OverseerState.PROGRESS_STALLED}:
                             # Unnecessary tool calls: inject a visible prompt to stop circling.
-                            pending_directives.append((decision.state.value, STOP_CIRCLING_DIRECTIVE))
+                            pending_directives.append((decision.state.value,
+                                                       self.prompts.get("intervention.stop_circling")))
                     elif decision.state in {OverseerState.LOOPING_DETECTED, OverseerState.PROGRESS_STALLED} and \
                             overseer.consecutive_interventions >= 2:
                         question = (f"The agent remains {decision.state.value.lower().replace('_', ' ')} "

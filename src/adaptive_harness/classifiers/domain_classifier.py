@@ -13,18 +13,14 @@ class DomainMode(str, Enum):
     AUDIT = "audit"
 
 
+from adaptive_harness.prompts import DEFAULT_PROMPTS
+
+# The editable source of truth for domain guidance is prompts.py (domain.guidance.*).
 DOMAIN_GUIDANCE = {
-    DomainMode.CODING: ("Inspect relevant code, make focused edits, validate Python syntax, run appropriate tests, "
-                        "and review the final diff before claiming success."),
-    DomainMode.RESEARCH: ("Compare primary sources and retain their URLs or document references. Separate evidence "
-                          "from inference. Present findings, uncertainty, and citations in a structured Markdown report. "
-                          "Keep concise research notes when the task spans several sources."),
-    DomainMode.SCIENCE: ("State assumptions and units. Check algebra or numerical results with the calculator or "
-                         "reproducible code. Use check_convergence to test observed numerical tail stability, and "
-                         "check boundary cases and precision. A finite sample does not prove mathematical convergence."),
-    DomainMode.AUDIT: ("Inspect code and diffs without modifying the target. Check injection, authentication, "
-                       "memory safety, and unsafe command patterns. Verify each suspected finding and report "
-                       "severity, evidence, and a concrete mitigation."),
+    DomainMode.CODING: DEFAULT_PROMPTS["domain.guidance.coding"],
+    DomainMode.RESEARCH: DEFAULT_PROMPTS["domain.guidance.research"],
+    DomainMode.SCIENCE: DEFAULT_PROMPTS["domain.guidance.science"],
+    DomainMode.AUDIT: DEFAULT_PROMPTS["domain.guidance.audit"],
 }
 
 

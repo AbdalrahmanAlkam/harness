@@ -180,8 +180,9 @@ class OllamaBackend(BaseClassifierBackend):
         self.model, self.endpoint = model, endpoint
 
     def classify(self, text: str, labels: list[str]) -> Classification:
+        from adaptive_harness.prompts import get_default_registry
         start = time.perf_counter()
-        prompt = f"Classify the task into exactly one of {labels}. Return JSON with label, confidence (0-1), reasoning. Task: {text}"
+        prompt = get_default_registry().get("classifier.ollama", labels=labels, text=text)
         data = json.dumps({"model": self.model, "prompt": prompt, "stream": False, "format": "json"}).encode()
         with urlopen(Request(self.endpoint, data=data, headers={"Content-Type": "application/json"}), timeout=30) as response:
             payload = json.load(response)
@@ -196,9 +197,10 @@ class LocalHTTPBackend(BaseClassifierBackend):
         self.model, self.endpoint = model, endpoint
 
     def classify(self, text: str, labels: list[str]) -> Classification:
+        from adaptive_harness.prompts import get_default_registry
         start = time.perf_counter()
         data = json.dumps({"model": self.model, "messages": [{"role": "user", "content":
-                           f"Classify into {labels}. Return JSON with label, confidence, reasoning. Task: {text}"}],
+                           get_default_registry().get("classifier.local_http", labels=labels, text=text)}],
                            "temperature": 0}).encode()
         with urlopen(Request(self.endpoint, data=data, headers={"Content-Type": "application/json"}), timeout=30) as response:
             payload = json.load(response)
@@ -216,8 +218,10 @@ class OpenRouterBackend(BaseClassifierBackend):
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY is required for openrouter classifier")
         start = time.perf_counter()
+        from adaptive_harness.prompts import get_default_registry
         data = json.dumps({"model": self.model, "response_format": {"type": "json_object"},
-                           "messages": [{"role": "user", "content": f"Classify this task into {labels}. Return JSON with label, confidence (0-1), reasoning. Task: {text}"}]}).encode()
+                           "messages": [{"role": "user", "content":
+                               get_default_registry().get("classifier.openrouter", labels=labels, text=text)}]}).encode()
         request = Request(self.endpoint, data=data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"})
         with urlopen(request, timeout=30) as response:
             payload = json.load(response)

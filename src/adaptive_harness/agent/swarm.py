@@ -29,18 +29,11 @@ class SwarmPhase(str, Enum):
     VERIFY = "verify"
 
 
-_ROLE_INSTRUCTIONS: dict[tuple[SwarmRole, SwarmPhase], str] = {
-    (SwarmRole.ARCHITECT, SwarmPhase.PLAN):
-        "Inspect relevant interfaces and produce a concise implementation plan with risks. Do not edit files.",
-    (SwarmRole.QA, SwarmPhase.PLAN):
-        "Inspect relevant tests and propose concrete regression cases for the task. Do not edit files.",
-    (SwarmRole.CODER, SwarmPhase.IMPLEMENT):
-        "Implement the task in the assigned workspace. Create the requested directories and files with write_file or edit_file. Run relevant checks.",
-    (SwarmRole.QA, SwarmPhase.VERIFY):
-        "Independently inspect the implementation and run relevant tests. Report exact test evidence; do not edit files.",
-    (SwarmRole.SECURITY, SwarmPhase.VERIFY):
-        "Review the changed files for injection, path traversal, unsafe shell use, and credential leaks. Do not edit files.",
-}
+def _role_instruction(role: SwarmRole, phase: SwarmPhase, workspace_root: Path) -> str:
+    """Editable role instructions live in the prompt registry (swarm.instruction.*)."""
+    from adaptive_harness.prompts import PromptRegistry
+    return PromptRegistry.for_workspace(workspace_root).get(
+        f"swarm.instruction.{role.value}.{phase.value}")
 
 
 @dataclass(frozen=True)
@@ -61,7 +54,7 @@ class SwarmAssignment:
 
     @property
     def instruction(self) -> str:
-        return _ROLE_INSTRUCTIONS[(self.role, self.phase)]
+        return _role_instruction(self.role, self.phase, self.workspace_root)
 
 
 @dataclass(frozen=True)
@@ -199,14 +192,17 @@ class DeveloperAgentWorker:
     """
 
     def __init__(self, *, llm_client_factory: Callable[[], Any] | None = None,
-                 max_steps: int = 8) -> None:
-        if max_steps < 1:
+                 max_steps: int | None = None,
+                 step_policy: str = "classifier") -> None:
+        if max_steps is not None and max_steps < 1:
             raise ValueError("max_steps must be positive")
         self.llm_client_factory = llm_client_factory
         self.max_steps = max_steps
+        self.step_policy = step_policy
 
     def __call__(self, assignment: SwarmAssignment) -> SwarmResult:
-        from adaptive_harness.agent.agent import DeveloperAgent, DEFAULT_SYSTEM_PROMPT
+        from adaptive_harness.agent.agent import DeveloperAgent
+        from adaptive_harness.prompts import PromptRegistry
         from adaptive_harness.tools.bash import RunBashTool
         from adaptive_harness.tools.file_ops import EditFileTool, ReadFileTool, WriteFileTool
         from adaptive_harness.tools.testing import RunPytestTool
@@ -222,19 +218,21 @@ class DeveloperAgentWorker:
             tools.append(RunBashTool(workspace_root=root))
             if (assignment.workspace_root / "tests").is_dir():
                 tools.append(RunPytestTool(workspace_root=root))
-        role_prompt = ("You are a read-only planning or review subagent. Do not attempt write_file or edit_file. "
-                       "Inspect available evidence and return a useful plan or review with the tools you have."
-                       if not assignment.may_edit else DEFAULT_SYSTEM_PROMPT)
+        prompts = PromptRegistry.for_workspace(assignment.workspace_root)
+        role_prompt = (prompts.get("swarm.role.read_only") if not assignment.may_edit
+                       else prompts.get("system.default"))
         agent = DeveloperAgent(llm_client=self.llm_client_factory() if self.llm_client_factory else None,
             tools=tools, workspace_root=root,
             forced_mode="security" if assignment.role is SwarmRole.SECURITY else "coding",
             require_file_changes=assignment.may_edit,
             enable_skill_routing=False,
+            step_policy=self.step_policy,
             system_prompt=f"{role_prompt}\n{assignment.instruction}\n"
-                          "Only use available tools within the assigned workspace.")
+                          + prompts.get("swarm.workspace_limit"),
+            prompts=prompts)
         prompt = assignment.task
         if assignment.context:
-            prompt += "\nPrior verified artifacts (JSON):\n" + json.dumps(assignment.context, ensure_ascii=False)
+            prompt += prompts.get("swarm.context_header") + json.dumps(assignment.context, ensure_ascii=False)
         response: dict[str, Any] = {}
         evidence: list[dict[str, Any]] = []
         for event in agent.run_stream(prompt, max_steps=self.max_steps):

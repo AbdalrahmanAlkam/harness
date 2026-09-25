@@ -43,7 +43,7 @@ from adaptive_harness.tui.formatting import format_model_markdown
 from adaptive_harness.workspace.worktree import WorktreeManager, WorktreeTask, WorktreeError
 
 
-COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/steps", "/safety", "/classifier", "/new",
+COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/steps", "/prompts", "/safety", "/classifier", "/new",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
             "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export",
             "/diff", "/isolation", "/swarm")
@@ -57,6 +57,7 @@ COMMAND_DESCRIPTIONS = {
     "/mode": "Choose coding, research, science, or security",
     "/thinking": "Set reasoning budget",
     "/steps": "Set tool-step policy: classifier, fixed, unbounded, or a number",
+    "/prompts": "List model prompts; /prompts show NAME prints one",
     "/safety": "Choose interaction profile",
     "/theme": "Preview and save a terminal theme",
     "/classifier": "Switch local classification engine",
@@ -916,6 +917,7 @@ class AdaptiveHarnessApp(App):
         log.write("  /mode <coding|research|science|security|auto> - Set operational mode")
         log.write("  /thinking <none|low|medium|deep|auto> - Set reasoning budget")
         log.write("  /steps <classifier|fixed|unbounded|N> - Set tool-step limit policy")
+        log.write("  /prompts [show NAME]   - List model prompts or print one; edit via prompts.json overrides")
         log.write("  /classifier <semif|sklearn|backend> [model/path] - Switch decision engine")
         log.write("  /workspace [path]      - Show or change working directory")
         log.write("  /sessions              - Browse saved sessions (F5); /sessions list prints IDs")
@@ -1157,6 +1159,24 @@ class AdaptiveHarnessApp(App):
                 step_limit_display="unbounded" if self.agent.max_steps is None else f"{self.agent.max_steps} steps")
             self._save_session()
             self._refresh_status()
+        elif cmd == "/prompts":
+            from adaptive_harness.prompts import DEFAULT_CONFIG_DIR
+            registry = self.agent.prompts
+            if arg.startswith("show "):
+                prompt_name = arg[5:].strip()
+                try:
+                    log.write(Text(f"◈ {prompt_name}:", style="bold cyan"))
+                    log.write(Text(registry.get(prompt_name), style="dim"))
+                except KeyError as exc:
+                    log.write(Text(str(exc), style="red"))
+                return
+            for prompt_name in registry.names():
+                marker = " [overridden]" if registry.is_overridden(prompt_name) else ""
+                preview = registry.get(prompt_name).strip().splitlines()[0][:80]
+                log.write(Text(f"  {prompt_name}{marker} · {preview}", style="cyan"))
+            log.write(Text("Override with a JSON file at " + str(Path(DEFAULT_CONFIG_DIR) / "prompts.json") +
+                           " or " + str(self.workspace_root / ".harness" / "prompts.json") +
+                           ". /prompts show NAME prints one.", style="dim"))
         elif cmd == "/safety":
             if not arg:
                 self.push_screen(QuickSelectModal("Choose interaction profile", [
@@ -1438,7 +1458,8 @@ class AdaptiveHarnessApp(App):
                     self.call_from_thread(self._worktree_started, isolated)
             if self._should_swarm(task_text):
                 self.call_from_thread(self._prepare_swarm_telemetry, task_text)
-                coordinator = SwarmCoordinator(DeveloperAgentWorker(llm_client_factory=self._swarm_client),
+                coordinator = SwarmCoordinator(DeveloperAgentWorker(llm_client_factory=self._swarm_client,
+                    max_steps=self.agent.max_steps, step_policy=self.agent.step_policy),
                     on_status=lambda status: self.call_from_thread(self._swarm_status_changed, dict(status)))
                 report = coordinator.run(task_text, isolated.workspace if isolated else self.workspace_root,
                                          isolated=bool(isolated))
