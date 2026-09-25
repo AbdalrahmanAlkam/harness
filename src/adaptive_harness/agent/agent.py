@@ -381,10 +381,12 @@ class DeveloperAgent:
                     self.complexity_router.tier_models[aligned_tier],
                     thinking_prediction.probabilities.get(predicted_level.value, 0.0),
                     "Thinking classification adjusted the model tier.")
+        # Tool-call step limit removed per operator request (temporary).
+        # Explicit max_steps values are still honored and clamped to a positive integer.
         if max_steps is None:
-            max_steps = {ThinkingLevel.NONE: 4, ThinkingLevel.LOW: 8, ThinkingLevel.MEDIUM: 12,
-                         ThinkingLevel.DEEP: 16, ThinkingLevel.EXTREME: 20}[thinking_res.level]
-        max_steps = max(1, min(max_steps, 32))
+            max_steps = math.inf
+        else:
+            max_steps = max(1, max_steps)
         yield AgentEvent("domain_mode", {"mode": domain_res.mode.value, "confidence": domain_res.confidence,
                                           "selection": "forced" if self.forced_mode else "auto",
                                           "latency_ms": round(domain_prediction.latency_ms, 2)})
