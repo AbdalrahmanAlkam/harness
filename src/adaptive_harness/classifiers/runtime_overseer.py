@@ -47,6 +47,7 @@ class RuntimeOverseer:
         self.recent: deque[_Observation] = deque(maxlen=8)
         self.last_decision = OverseerDecision(OverseerState.HEALTHY_PROGRESS, 1.0)
         self.consecutive_interventions = 0
+        self.intervention_states: list[OverseerState] = []
 
     def observe(self, name: str, arguments: dict[str, Any], *, success: bool,
                 error: str = "", output: str = "", model_text: str = "") -> OverseerDecision:
@@ -99,6 +100,7 @@ class RuntimeOverseer:
             self.consecutive_interventions = 0
         elif directive:
             self.consecutive_interventions += 1
+            self.intervention_states.append(state)
         self.last_decision = OverseerDecision(state, confidence, directive,
             (time.perf_counter() - start) * 1000, tier)
         return self.last_decision
@@ -117,10 +119,31 @@ class RuntimeOverseer:
             directive = self._directive(OverseerState.HALLUCINATION_DETECTED, last.target,
                                         last.error or last.output)
             self.consecutive_interventions += 1
+            self.intervention_states.append(OverseerState.HALLUCINATION_DETECTED)
             self.last_decision = OverseerDecision(OverseerState.HALLUCINATION_DETECTED, 0.96,
                                                   directive)
             return self.last_decision
         return None
+
+    def termination_verdict(self) -> OverseerDecision | None:
+        """Classifier verdict that further attempts are pointless after failed interventions.
+
+        Returns a verdict only when at least two interventions have been injected and
+        the trajectory is still looping or stalled, i.e. corrective prompts did not
+        get the model back on a productive path.
+        """
+        looping = [state for state in self.intervention_states
+                   if state in {OverseerState.LOOPING_DETECTED, OverseerState.PROGRESS_STALLED}]
+        if self.consecutive_interventions < 2 or not looping:
+            return None
+        state = looping[-1]
+        directive = ("OVERSEER TERMINATION VERDICT: The classifier detects no path to progress after "
+                     "repeated interventions (" + state.value + "). Further tool calls are unnecessary. "
+                     "The run is stopped here; report the verified results obtained so far and the "
+                     "concrete blocker that prevented completion.")
+        self.last_decision = OverseerDecision(state, 0.99, directive,
+            self.last_decision.latency_ms, "verdict")
+        return self.last_decision
 
     def _directive(self, state: OverseerState, target: str, evidence: str) -> str:
         if state == OverseerState.LOOPING_DETECTED:

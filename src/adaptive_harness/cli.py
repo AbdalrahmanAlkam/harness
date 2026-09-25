@@ -133,6 +133,8 @@ def tui(
     mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Thinking level: none, low, medium, deep, auto"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
+    step_policy: str = typer.Option("classifier", "--step-policy", help="Tool-step limits: classifier (default; stops circling loops), fixed (hardcoded per-thinking budgets), unbounded"),
+    max_steps: Optional[int] = typer.Option(None, "--max-steps", min=1, help="Explicit tool-step cap overriding the step policy"),
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Local or OpenRouter classifier endpoint"),
@@ -157,6 +159,9 @@ def tui(
         raise typer.BadParameter("Choose fast, standard, or reasoning", param_hint="--tier")
     if safety is not None and safety not in {"turbo", "balanced", "cautious", "strict"}:
         raise typer.BadParameter("Choose turbo, balanced, cautious, or strict", param_hint="--safety")
+    from adaptive_harness.agent.agent import STEP_POLICIES
+    if step_policy not in STEP_POLICIES:
+        raise typer.BadParameter("Choose classifier, fixed, or unbounded", param_hint="--step-policy")
     try:
         parse_domain_mode(mode)
         parse_thinking_level(thinking)
@@ -177,6 +182,8 @@ def tui(
             classifier_backend="semif" if semif_model else classifier_backend,
             classifier_model=semif_model or classifier_model,
             classifier_endpoint=classifier_endpoint,
+            step_policy=step_policy,
+            max_steps=max_steps,
             overseer_model=overseer_model,
             semif_device=semif_device,
             semif_4bit=semif_4bit,
@@ -211,6 +218,8 @@ def dev(
     mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Thinking level: none, low, medium, deep, auto"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
+    step_policy: str = typer.Option("classifier", "--step-policy", help="Tool-step limits: classifier (default; stops circling loops), fixed (hardcoded per-thinking budgets), unbounded"),
+    max_steps: Optional[int] = typer.Option(None, "--max-steps", min=1, help="Explicit tool-step cap overriding the step policy"),
     swarm: bool = typer.Option(False, "--swarm", help="Expose delegate_subagent to the coordinator agent"),
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
@@ -246,6 +255,9 @@ def dev(
         raise typer.BadParameter("Unknown backup provider", param_hint="--backup-provider")
     if safety is not None and safety not in {"turbo", "balanced", "cautious", "strict"}:
         raise typer.BadParameter("Choose turbo, balanced, cautious, or strict", param_hint="--safety")
+    from adaptive_harness.agent.agent import STEP_POLICIES
+    if step_policy not in STEP_POLICIES:
+        raise typer.BadParameter("Choose classifier, fixed, or unbounded", param_hint="--step-policy")
     try:
         selected_mode = parse_domain_mode(mode)
         selected_thinking = parse_thinking_level(thinking)
@@ -284,7 +296,8 @@ def dev(
                                           selected_model or client.default_model,
                            classifier_backend=backend, overseer_backend=overseer_backend,
                            forced_mode=selected_mode, forced_thinking=selected_thinking,
-                           safety_profile=safety or "turbo", swarm_enabled=swarm)
+                           safety_profile=safety or "turbo", swarm_enabled=swarm,
+                           step_policy=step_policy, max_steps=max_steps)
     catalog = SkillCatalog(workspace)
     for name in skill or []:
         try:
@@ -329,6 +342,22 @@ def dev(
                           f"({p['used_tokens']:,}/{p['capacity']:,})")
         elif et == "overseer" and p.get("directive"):
             console.print(f"  [yellow]Overseer: {escape(p['state'])} · correction injected[/yellow]")
+        elif et == "step_policy":
+            cap = "unbounded" if p["max_steps"] is None else f"{p['max_steps']} steps"
+            console.print(f"  [cyan]Step policy:[/cyan] {p['policy']} · limit: {cap} ({p['limit_source']}) · "
+                          f"classifier supervision {'on' if p['classifier_supervision'] else 'off'}")
+        elif et == "system_prompt":
+            ingested = ", ".join(f"{key}={value}" for key, value in (p.get("ingested") or {}).items()
+                                 if value not in (False, None, "", []))
+            console.print(f"  [dim]Ingested system prompt ({len(p['content']):,} chars)"
+                          f"{': ' + escape(ingested) if ingested else ''}:[/dim]")
+            console.print(Text(p["content"], style="dim"))
+        elif et == "prompt_injection":
+            label = {"runtime_overseer": "classifier · runtime overseer", "claim_check": "classifier · claim check",
+                     "harness": "harness"}.get(p["source"], p["source"])
+            console.print(f"  [bold yellow]Prompt injected · {escape(label)}"
+                          f"{(' · ' + escape(p['state'])) if p.get('state') else ''}:[/bold yellow]")
+            console.print(Text(p["content"], style="yellow"))
         elif et == "provider_failover":
             console.print(f"  [yellow]Provider failover: {escape(p['from'])} → {escape(p['to'])} "
                           f"({escape(p['model'])})[/yellow]")
@@ -359,7 +388,15 @@ def dev(
             if p.get("content") and p["content"] != last_agent_content:
                 console.print("\n[bold magenta]Agent:[/bold magenta]")
                 console.print(Markdown(format_model_markdown(p["content"])))
-            status = "✓ Completed" if p.get("success", True) else "Stopped before completion"
+            status = "✓ Completed" if p.get("success", True) else {
+                "classifier_stop": "Stopped by the classifier: no further progress expected",
+                "overseer_impasse": "Stopped at an overseer impasse",
+                "step_limit": "Stopped at the tool-step limit",
+                "verification_failed": "Stopped: needs another verification pass",
+                "skill_verification_failed": "Stopped: skill verification checks unmet",
+                "missing_file_changes": "Stopped: required file changes were not made",
+                "provider_error": "Stopped: provider request failed",
+            }.get(p.get("stop_reason"), "Stopped before completion")
             color = "green" if p.get("success", True) else "yellow"
             console.print(f"\n[bold {color}]{status} in {p['total_time_ms']} ms ({p['steps']} steps)[/bold {color}]\n")
 

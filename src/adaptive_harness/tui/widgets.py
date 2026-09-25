@@ -69,6 +69,8 @@ class ClassifierTelemetryWidget(Static):
         self.thinking_level: str = "—"
         self.thinking_tokens: int = 0
         self.thinking_selection: str = "auto"
+        self.step_policy: str = "classifier"
+        self.step_limit_display: str = "unbounded"
         self.tokens_saved_estimate = 0
         self.provider_cached_tokens = 0
         self.provider_prompt_tokens = 0
@@ -143,6 +145,8 @@ class ClassifierTelemetryWidget(Static):
         thinking_level: Optional[str] = None,
         thinking_tokens: Optional[int] = None,
         thinking_selection: Optional[str] = None,
+        step_policy: Optional[str] = None,
+        step_limit_display: Optional[str] = None,
         tokens_saved_estimate: Optional[int] = None,
         provider_cached_tokens: Optional[int] = None,
         provider_prompt_tokens: Optional[int] = None,
@@ -181,6 +185,7 @@ class ClassifierTelemetryWidget(Static):
                            ("domain_mode", domain_mode), ("domain_selection", domain_selection),
                            ("thinking_level", thinking_level), ("thinking_tokens", thinking_tokens),
                            ("thinking_selection", thinking_selection),
+                           ("step_policy", step_policy), ("step_limit_display", step_limit_display),
                            ("tokens_saved_estimate", tokens_saved_estimate),
                            ("provider_cached_tokens", provider_cached_tokens),
                            ("provider_prompt_tokens", provider_prompt_tokens),
@@ -215,6 +220,9 @@ class ClassifierTelemetryWidget(Static):
         status.append("Engine: ", style="bold cyan")
         status.append(f"{engine_name} ({model_name})\n", style=engine_color)
         status.append(f"Latency: {self.classifier_latency_ms:.2f} ms\n", style="cyan")
+        status.append("Steps: ", style="bold cyan")
+        status.append(f"{self.step_policy} · {self.step_limit_display}\n",
+                      style="bold green" if self.step_policy == "classifier" else "cyan")
         status.append("Workspace: ", style="bold cyan")
         status.append(self.workspace_isolation + "\n",
                       style="bold green" if self.workspace_isolation != "Direct workspace" else "dim")

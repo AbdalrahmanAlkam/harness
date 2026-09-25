@@ -43,7 +43,7 @@ from adaptive_harness.tui.formatting import format_model_markdown
 from adaptive_harness.workspace.worktree import WorktreeManager, WorktreeTask, WorktreeError
 
 
-COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/safety", "/classifier", "/new",
+COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/steps", "/safety", "/classifier", "/new",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
             "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export",
             "/diff", "/isolation", "/swarm")
@@ -56,6 +56,7 @@ COMMAND_DESCRIPTIONS = {
     "/tier": "Force fast, standard, or reasoning",
     "/mode": "Choose coding, research, science, or security",
     "/thinking": "Set reasoning budget",
+    "/steps": "Set tool-step policy: classifier, fixed, unbounded, or a number",
     "/safety": "Choose interaction profile",
     "/theme": "Preview and save a terminal theme",
     "/classifier": "Switch local classification engine",
@@ -181,6 +182,8 @@ class AdaptiveHarnessApp(App):
         mode: str = "auto",
         thinking: str = "auto",
         safety: str | None = None,
+        step_policy: str = "classifier",
+        max_steps: Optional[int] = None,
         session_id: Optional[str] = None,
         config_dir: Path | str | None = None,
         **kwargs,
@@ -238,6 +241,8 @@ class AdaptiveHarnessApp(App):
         initial_thinking = parse_thinking_level(thinking)
         self._cli_mode_override = initial_mode
         self._cli_thinking_override = initial_thinking
+        self._cli_step_policy_override = step_policy
+        self._cli_max_steps_override = max_steps
         if safety is not None and safety not in {"turbo", "balanced", "cautious", "strict"}:
             raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
         self._cli_safety_override = safety
@@ -302,6 +307,8 @@ class AdaptiveHarnessApp(App):
             forced_mode=initial_mode,
             forced_thinking=initial_thinking,
             safety_profile=safety or self._default_safety,
+            step_policy=step_policy,
+            max_steps=max_steps,
             classifier_backend=create_backend(classifier_backend, classifier_model, classifier_endpoint,
                 api_key=self.api_key, device=semif_device, load_in_4bit=semif_4bit,
                 temperature=semif_temperature),
@@ -437,6 +444,8 @@ class AdaptiveHarnessApp(App):
                                  "mode": self.agent.forced_mode.value if self.agent.forced_mode else "auto",
                                  "thinking": self.agent.forced_thinking.value if self.agent.forced_thinking else "auto",
                                  "safety": self.agent.safety_profile,
+                                 "step_policy": self.agent.step_policy,
+                                 "max_steps": str(self.agent.max_steps or ""),
                                  "prompt_tokens": str(self.prompt_tokens),
                                  "completion_tokens": str(self.completion_tokens),
                                  "reasoning_tokens": str(self._reasoning_tokens),
@@ -489,6 +498,18 @@ class AdaptiveHarnessApp(App):
                                      else settings.get("safety", self._default_safety))
         if self.agent.safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
             self.agent.safety_profile = "turbo"
+        self.agent.step_policy = (self._cli_step_policy_override
+                                  if preserve_cli_overrides and self._cli_step_policy_override
+                                  else settings.get("step_policy", "classifier"))
+        if self.agent.step_policy not in {"classifier", "fixed", "unbounded"}:
+            self.agent.step_policy = "classifier"
+        if preserve_cli_overrides and self._cli_max_steps_override:
+            self.agent.max_steps = self._cli_max_steps_override
+        else:
+            try:
+                self.agent.max_steps = int(settings["max_steps"]) if settings.get("max_steps") else None
+            except (TypeError, ValueError):
+                self.agent.max_steps = None
         for field, setting in (("prompt_tokens", "prompt_tokens"),
                                ("completion_tokens", "completion_tokens"),
                                ("_reasoning_tokens", "reasoning_tokens"),
@@ -894,6 +915,7 @@ class AdaptiveHarnessApp(App):
         log.write("  /safety <turbo|balanced|cautious|strict> - Set tool confirmation level")
         log.write("  /mode <coding|research|science|security|auto> - Set operational mode")
         log.write("  /thinking <none|low|medium|deep|auto> - Set reasoning budget")
+        log.write("  /steps <classifier|fixed|unbounded|N> - Set tool-step limit policy")
         log.write("  /classifier <semif|sklearn|backend> [model/path] - Switch decision engine")
         log.write("  /workspace [path]      - Show or change working directory")
         log.write("  /sessions              - Browse saved sessions (F5); /sessions list prints IDs")
@@ -966,7 +988,7 @@ class AdaptiveHarnessApp(App):
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        if self._busy and cmd in {"/key", "/provider", "/model", "/models", "/tier", "/mode", "/thinking", "/safety", "/classifier", "/sessions",
+        if self._busy and cmd in {"/key", "/provider", "/model", "/models", "/tier", "/mode", "/thinking", "/steps", "/safety", "/classifier", "/sessions",
                                   "/workspace", "/session", "/skill", "/new", "/reset", "/export", "/isolation", "/swarm"}:
             log.write(Text("Wait for the current task before changing settings or exiting.", style="yellow"))
             return
@@ -1113,6 +1135,28 @@ class AdaptiveHarnessApp(App):
             self._save_session()
             self._refresh_status()
             log.write(Text(f"✓ Thinking: {self.agent.forced_thinking.value if self.agent.forced_thinking else 'auto'}", style="green"))
+        elif cmd == "/steps":
+            if not arg:
+                cap = "unbounded" if self.agent.max_steps is None else f"{self.agent.max_steps} steps"
+                log.write(Text(f"Step policy: {self.agent.step_policy} · limit: {cap}", style="cyan"))
+                return
+            if arg.isdigit() and int(arg) >= 1:
+                self.agent.max_steps = int(arg)
+                log.write(Text(f"✓ Step cap set to {arg} (policy {self.agent.step_policy})", style="green"))
+            elif arg in {"classifier", "fixed", "unbounded"}:
+                self.agent.step_policy = arg
+                self.agent.max_steps = None
+                log.write(Text(f"✓ Step policy: {arg} "
+                               f"({'classifier stops circling loops' if arg == 'classifier' else 'hardcoded budgets' if arg == 'fixed' else 'no limits'})",
+                               style="green"))
+            else:
+                log.write(Text("Usage: /steps classifier|fixed|unbounded|<number>", style="yellow"))
+                return
+            self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
+                step_policy=self.agent.step_policy,
+                step_limit_display="unbounded" if self.agent.max_steps is None else f"{self.agent.max_steps} steps")
+            self._save_session()
+            self._refresh_status()
         elif cmd == "/safety":
             if not arg:
                 self.push_screen(QuickSelectModal("Choose interaction profile", [
@@ -1477,6 +1521,25 @@ class AdaptiveHarnessApp(App):
                 if p.get("directive"):
                     log.write(Text(f"⚠ Overseer: {p['state'].replace('_', ' ').title()} · strategy correction injected",
                                    style="bold yellow"))
+        elif et == "step_policy":
+                cap = "unbounded" if p["max_steps"] is None else f"{p['max_steps']} steps"
+                telemetry.update_telemetry(step_policy=p["policy"], step_limit_display=cap)
+                log.write(Text(f"Step policy: {p['policy']} · limit: {cap} ({p['limit_source']}) · "
+                               f"classifier supervision {'on' if p['classifier_supervision'] else 'off'}",
+                               style="cyan"))
+        elif et == "system_prompt":
+                ingested = ", ".join(f"{key}={value}" for key, value in (p.get("ingested") or {}).items()
+                                     if value not in (False, None, "", []))
+                log.write(Text(f"◈ Ingested system prompt ({len(p['content']):,} chars)"
+                               f"{': ' + ingested if ingested else ''}", style="dim"))
+                log.write(Text(p["content"], style="dim"))
+        elif et == "prompt_injection":
+                label = {"runtime_overseer": "classifier · runtime overseer",
+                         "claim_check": "classifier · claim check",
+                         "harness": "harness"}.get(p["source"], p["source"])
+                suffix = f" · {p['state'].replace('_', ' ').title()}" if p.get("state") else ""
+                log.write(Text(f"⚠ Prompt injected ({label}{suffix}):", style="bold yellow"))
+                log.write(Text(p["content"], style="yellow"))
         elif et == "provider_failover":
                 log.write(Text(f"Provider failover: {p['from']} → {p['to']} ({p['model']})", style="bold yellow"))
                 telemetry.update_telemetry(model=p["model"], selection="failover")
@@ -1600,6 +1663,9 @@ class AdaptiveHarnessApp(App):
                 status = "✓ Task completed" if p["success"] else {
                     "response_length_limit": "Response stopped at the model output limit",
                     "step_limit": "Task reached the tool-step limit",
+                    "classifier_stop": "The classifier stopped the run: no further progress expected",
+                    "overseer_impasse": "Stopped at an overseer impasse after failed interventions",
+                    "missing_file_changes": "Task stopped before the required file changes were made",
                     "verification_failed": "Task needs another verification pass",
                     "skill_verification_failed": "Task did not meet skill verification checks",
                     "provider_error": "Provider request failed",

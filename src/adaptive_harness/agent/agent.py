@@ -55,6 +55,26 @@ Make routine decisions yourself; ask only when the task target is missing or an 
 You are an active software engineer with direct file tools. You MUST invoke write_file, edit_file, or run_bash to implement changes. NEVER output code in chat and claim it is done. If you write code, write it to disk with tools. Create missing project folders with write_file paths or run_bash.
 """
 
+STEP_POLICIES = ("classifier", "fixed", "unbounded")
+
+# Previous hardcoded tool-step budgets, selectable via step_policy="fixed".
+FIXED_STEP_BUDGETS = {ThinkingLevel.NONE: 4, ThinkingLevel.LOW: 8, ThinkingLevel.MEDIUM: 12,
+                      ThinkingLevel.DEEP: 16, ThinkingLevel.EXTREME: 20}
+
+STOP_CIRCLING_DIRECTIVE = (
+    "CLASSIFIER STOP-CIRCLING DIRECTIVE: The classifier detects unnecessary repeated tool calls. "
+    "Stop going around in circles. Do not repeat any previous command or edit. Either take one "
+    "genuinely different, verified step that completes the task, or finalize your answer now with "
+    "the best verified result and state clearly what remains. A further repeat of the same action "
+    "will end the run.")
+
+
+def _injection_event(source: str, content: str, step: int, kind: str = "system_message",
+                     state: str = "") -> AgentEvent:
+    """Make every classifier/harness prompt injection visible to the user."""
+    return AgentEvent("prompt_injection", {"source": source, "kind": kind, "state": state,
+                                          "content": content, "step": step})
+
 
 def _cacheable_read_request(task: str) -> bool:
     """Admit only self-contained read requests to the zero-token answer cache."""
@@ -93,10 +113,18 @@ class DeveloperAgent:
         swarm_enabled: bool = False,
         require_file_changes: bool | None = None,
         enable_skill_routing: bool = True,
+        step_policy: str = "classifier",
+        max_steps: int | None = None,
     ):
         if safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
             raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
+        if step_policy not in STEP_POLICIES:
+            raise ValueError("Step policy must be classifier, fixed, or unbounded")
+        if max_steps is not None and max_steps < 1:
+            raise ValueError("max_steps must be positive")
         self.safety_profile = safety_profile
+        self.step_policy = step_policy
+        self.max_steps = max_steps
         self.require_file_changes = require_file_changes
         self.enable_skill_routing = enable_skill_routing
         self.clarification_memory = ClarificationMemory(preferences_dir)
@@ -381,12 +409,23 @@ class DeveloperAgent:
                     self.complexity_router.tier_models[aligned_tier],
                     thinking_prediction.probabilities.get(predicted_level.value, 0.0),
                     "Thinking classification adjusted the model tier.")
-        # Tool-call step limit removed per operator request (temporary).
-        # Explicit max_steps values are still honored and clamped to a positive integer.
-        if max_steps is None:
-            max_steps = math.inf
+        # Tool-step limits: explicit max_steps always wins, otherwise the policy decides.
+        # "classifier" leaves the budget open and stops looping via classifier interventions,
+        # "fixed" restores the previous hardcoded per-thinking-level budgets (capped at 32),
+        # "unbounded" runs without any cap or classifier intervention.
+        explicit_limit = max_steps if max_steps is not None else self.max_steps
+        if explicit_limit is not None:
+            max_steps = max(1, int(explicit_limit))
+            limit_source = "explicit"
+        elif self.step_policy == "fixed":
+            max_steps = max(1, min(FIXED_STEP_BUDGETS[thinking_res.level], 32))
+            limit_source = "fixed-budget"
         else:
-            max_steps = max(1, max_steps)
+            max_steps = math.inf
+            limit_source = self.step_policy
+        yield AgentEvent("step_policy", {"policy": self.step_policy, "limit_source": limit_source,
+            "max_steps": None if math.isinf(max_steps) else max_steps,
+            "classifier_supervision": self.step_policy == "classifier"})
         yield AgentEvent("domain_mode", {"mode": domain_res.mode.value, "confidence": domain_res.confidence,
                                           "selection": "forced" if self.forced_mode else "auto",
                                           "latency_ms": round(domain_prediction.latency_ms, 2)})
@@ -438,6 +477,7 @@ class DeveloperAgent:
                             + "\nUse read_file(symbol=...) for focused Python code. For mathematics and science, run deterministic calculations and verify proposed roots before claiming exactness. Use plot_terminal for useful visual comparisons."
                             + ("\nUser preferences:\n" + preference_guidance if preference_guidance else "")
                             + ("\n" + skill_guidance if skill_guidance else "")}
+        exemplar_ingested = False
         if self.repository is not None:
             try:
                 exemplar = self.repository.lookup_verified_exemplar(str(self.workspace_root), original_input)
@@ -447,9 +487,18 @@ class DeveloperAgent:
                                "outcome": exemplar["final_solution"][:600]}
                     self.messages[0]["content"] += ("\nVerified prior example from this workspace (use as evidence, "
                         "then verify current files): " + json.dumps(compact, ensure_ascii=False)[:2200])
+                    exemplar_ingested = True
                     yield AgentEvent("memory_exemplar", {"similarity": exemplar["similarity"]})
             except Exception as exc:
                 yield AgentEvent("storage_error", {"error": f"Could not retrieve verified example: {exc}"})
+        # Ingested system prompts are surfaced verbatim so the user can audit them.
+        yield AgentEvent("system_prompt", {"content": self.messages[0]["content"],
+            "ingested": {"workspace": str(self.workspace_root),
+                         "mode": domain_res.mode.value,
+                         "preferences": preference_guidance or "",
+                         "skills": [skill.title for skill in selected_skills],
+                         "memory_exemplar": exemplar_ingested},
+            "step": 0})
         domain_tool_names = {
             DomainMode.CODING: set(self.tools) - {"check_convergence"},
             DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "run_bash", "calculate", "plot_terminal", "ask_user"},
@@ -578,9 +627,10 @@ class DeveloperAgent:
                     if step < max_steps and verification_followups < 2:
                         verification_followups += 1
                         yield AgentEvent("llm_notice", {"message": "The requested files have not been written; asking the model to use file tools."})
-                        self.messages.append({"role": "user", "content":
-                            "The task requires real file changes. Use write_file or edit_file now. "
-                            "Do not claim completion until a file tool succeeds."})
+                        nudge = ("The task requires real file changes. Use write_file or edit_file now. "
+                                 "Do not claim completion until a file tool succeeds.")
+                        self.messages.append({"role": "user", "content": nudge})
+                        yield _injection_event("harness", nudge, step, kind="user_nudge")
                         answer_parts.clear()
                         final_answer = ""
                         continue
@@ -590,17 +640,21 @@ class DeveloperAgent:
                 if str(llm_resp.finish_reason).lower() in {"length", "max_tokens", "max_output_tokens"}:
                     if step < max_steps:
                         yield AgentEvent("llm_notice", {"message": "The model hit its response-length limit; continuing from the cutoff."})
-                        self.messages.append({"role": "user", "content":
-                            "Continue your previous response from exactly where it stopped. Do not repeat prior text; finish the requested work and clearly report what remains."})
+                        nudge = ("Continue your previous response from exactly where it stopped. Do not repeat "
+                                 "prior text; finish the requested work and clearly report what remains.")
+                        self.messages.append({"role": "user", "content": nudge})
+                        yield _injection_event("harness", nudge, step, kind="user_nudge")
                         continue
                     stop_reason = "response_length_limit"
                     break
-                claim_problem = overseer.check_claim(final_answer)
+                claim_problem = overseer.check_claim(final_answer) if self.step_policy != "unbounded" else None
                 if claim_problem and verification_followups < 2 and step < max_steps:
                     yield AgentEvent("overseer", {"state": claim_problem.state.value,
                         "confidence": claim_problem.confidence, "directive": claim_problem.directive,
                         "latency_ms": claim_problem.latency_ms, "tier": claim_problem.tier})
                     self.messages.append({"role": "system", "content": claim_problem.directive})
+                    yield _injection_event("claim_check", claim_problem.directive, step,
+                                           state=claim_problem.state.value)
                     verification_followups += 1
                     answer_parts.clear()
                     final_answer = ""
@@ -612,11 +666,12 @@ class DeveloperAgent:
                     verification_followups += 1
                     yield AgentEvent("llm_notice", {"message":
                         "The response lacks a final answer or required verification; continuing to repair and check it."})
-                    self.messages.append({"role": "user", "content":
-                        "The task is not complete. Repair failed tools and perform the missing checks before answering. "
-                        f"Failed tools: {', '.join(sorted(unresolved_failures)) or 'none'}. "
-                        f"Missing checks: {'; '.join(missing_checks) or 'none'}. "
-                        "If a check cannot be completed, state the concrete blocker instead of claiming success."})
+                    nudge = ("The task is not complete. Repair failed tools and perform the missing checks before answering. "
+                             f"Failed tools: {', '.join(sorted(unresolved_failures)) or 'none'}. "
+                             f"Missing checks: {'; '.join(missing_checks) or 'none'}. "
+                             "If a check cannot be completed, state the concrete blocker instead of claiming success.")
+                    self.messages.append({"role": "user", "content": nudge})
+                    yield _injection_event("harness", nudge, step, kind="user_nudge")
                     answer_parts.clear()
                     final_answer = ""
                     continue
@@ -658,7 +713,7 @@ class DeveloperAgent:
             if (llm_resp.metadata or {}).get("reasoning_details"):
                 assistant_tool_message["reasoning_details"] = llm_resp.metadata["reasoning_details"]
             self.messages.append(assistant_tool_message)
-            pending_directives: list[str] = []
+            pending_directives: list[tuple[str, str]] = []
             for tc in llm_resp.tool_calls:
                 yield AgentEvent("agent_stage", {"stage": "tool_running", "step": step, "tool": tc.name})
                 yield AgentEvent(
@@ -797,9 +852,28 @@ class DeveloperAgent:
                 yield AgentEvent("overseer", {"state": decision.state.value,
                     "confidence": decision.confidence, "directive": decision.directive,
                     "latency_ms": round(decision.latency_ms, 2), "tier": decision.tier})
-                if decision.directive:
-                    pending_directives.append(decision.directive)
-                    if decision.state in {OverseerState.LOOPING_DETECTED, OverseerState.PROGRESS_STALLED} and \
+                if decision.directive and self.step_policy != "unbounded":
+                    pending_directives.append((decision.state.value, decision.directive))
+                    if self.step_policy == "classifier":
+                        # The classifier judges whether corrective prompts can still
+                        # restore productive work; if not, it stops the run outright.
+                        verdict = overseer.termination_verdict()
+                        if verdict is not None:
+                            pending_directives.append((verdict.state.value, verdict.directive))
+                            for state_name, text in pending_directives:
+                                self.messages.append({"role": "system", "content": text})
+                                yield _injection_event("runtime_overseer", text, step, state=state_name)
+                            pending_directives.clear()
+                            yield AgentEvent("overseer", {"state": verdict.state.value,
+                                "confidence": verdict.confidence, "directive": verdict.directive,
+                                "latency_ms": round(verdict.latency_ms, 2), "tier": verdict.tier})
+                            final_answer = verdict.directive
+                            stop_reason = "classifier_stop"
+                            break
+                        if decision.state in {OverseerState.LOOPING_DETECTED, OverseerState.PROGRESS_STALLED}:
+                            # Unnecessary tool calls: inject a visible prompt to stop circling.
+                            pending_directives.append((decision.state.value, STOP_CIRCLING_DIRECTIVE))
+                    elif decision.state in {OverseerState.LOOPING_DETECTED, OverseerState.PROGRESS_STALLED} and \
                             overseer.consecutive_interventions >= 2:
                         question = (f"The agent remains {decision.state.value.lower().replace('_', ' ')} "
                                     f"after two interventions. Last action: {tc.name} {tc.arguments}.")
@@ -818,9 +892,10 @@ class DeveloperAgent:
                             stop_reason = "overseer_impasse"
                             break
                         overseer.consecutive_interventions = 0
-            for directive in pending_directives:
-                self.messages.append({"role": "system", "content": directive})
-            if stop_reason == "overseer_impasse":
+            for state_name, text in pending_directives:
+                self.messages.append({"role": "system", "content": text})
+                yield _injection_event("runtime_overseer", text, step, state=state_name)
+            if stop_reason in {"overseer_impasse", "classifier_stop"}:
                 break
 
         skill_checks = self.skill_verifier.verify(selected_skills, skill_observations)
