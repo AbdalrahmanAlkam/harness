@@ -88,9 +88,18 @@ def test_isolation_and_swarm_modes_select_complex_edits(repo: Path):
     assert not app._should_isolate("Refactor the architecture across modules and add tests")
     app.isolation_mode = "auto"
     assert app._should_isolate("Refactor the architecture across modules and add tests")
-    assert app._should_swarm("Fix a concurrency deadlock and refactor the architecture")
+    # Auto mode pipelines only explicit multi-agent requests; complex edits are
+    # model-driven via delegate_subagent and long prompts are never hijacked.
+    assert not app._should_swarm("Fix a concurrency deadlock and refactor the architecture")
+    assert app._should_swarm("using multiple agents build the scheduler")
+    assert not app._should_swarm(
+        "Implement a frontend backend database api tests html css javascript ui server "
+        "pipeline with many component words " * 6)
+    app.swarm_mode = "on"
+    assert app._should_swarm("Fix a concurrency deadlock")
     app.swarm_mode = "off"
     assert not app._should_swarm("Fix a concurrency deadlock")
+    assert not app._should_swarm("using multiple agents build the scheduler")
     app.isolation_mode = "off"
     assert not app._should_isolate("Refactor the architecture")
     app.isolation_mode = "on"

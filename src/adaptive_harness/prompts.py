@@ -133,6 +133,10 @@ DEFAULT_PROMPTS: dict[str, str] = {
         "You are a read-only planning or review subagent. Do not attempt write_file or edit_file. "
         "Inspect available evidence and return a useful plan or review with the tools you have."
     ),
+    "swarm.role.security": (
+        "You are a security reviewer subagent. Do not attempt write_file or edit_file. "
+        "Inspect the changed files for security problems and report concrete findings."
+    ),
     "swarm.workspace_limit": "Only use available tools within the assigned workspace.",
     "swarm.context_header": "\nPrior verified artifacts (JSON):\n",
     "swarm.instruction.architect.plan": (

@@ -315,6 +315,7 @@ class AdaptiveHarnessApp(App):
                 temperature=semif_temperature),
             overseer_backend=create_backend("onnx", overseer_model) if overseer_model else None,
         )
+        self.agent.subagent_event_callback = self._subagent_event
         if session_id:
             self._restore_session(preserve_cli_overrides=True)
 
@@ -1005,7 +1006,8 @@ class AdaptiveHarnessApp(App):
             else:
                 setattr(self, "isolation_mode" if cmd == "/isolation" else "swarm_mode", arg)
                 if cmd == "/swarm":
-                    self.agent.enable_swarm(arg == "on")
+                    # Model-driven delegation stays available unless fully off.
+                    self.agent.enable_swarm(arg != "off")
                 log.write(Text(f"{cmd[1:].title()} mode: {arg}", style="green"))
         elif cmd == "/clear":
             self.action_clear_screen()
@@ -1355,19 +1357,18 @@ class AdaptiveHarnessApp(App):
         return editing and level in {ThinkingLevel.MEDIUM, ThinkingLevel.DEEP, ThinkingLevel.EXTREME}
 
     def _should_swarm(self, task: str) -> bool:
+        """Auto mode only pipelines explicit multi-agent requests.
+
+        Complex edits are model-driven instead: the main agent receives
+        delegate_subagent and decides when to spawn roles. Long prompts are
+        never hijacked by text heuristics.
+        """
         if self.swarm_mode == "off":
             return False
         if self.swarm_mode == "on":
             return True
-        if re.search(r"\b(?:multi[- ]agent|multiple agents|using agents|subagents|swarm)\b", task, re.I):
-            return True
-        components = re.findall(r"\b(?:frontend|backend|database|api|tests?|html|css|javascript|assets?|ui|server)\b",
-                                task, re.I)
-        if len(task) > 100 and len(set(word.lower() for word in components)) >= 3:
-            return True
-        level = self.agent.forced_thinking or self.agent.thinking_classifier.classify(task).level
-        editing = bool(re.search(r"\b(?:build|create|make|implement|refactor|fix|edit)\b", task, re.I))
-        return editing and level in {ThinkingLevel.DEEP, ThinkingLevel.EXTREME}
+        return bool(re.search(r"\b(?:multi[- ]agent|multiple agents|using agents|subagents|swarm)\b",
+                              task, re.I))
 
     def _swarm_client(self) -> LLMClient:
         source = self.agent.llm_client
@@ -1386,6 +1387,30 @@ class AdaptiveHarnessApp(App):
 
     def _swarm_status_changed(self, status: dict[str, str]) -> None:
         self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(swarm_status=status)
+
+    def _subagent_event(self, event) -> None:
+        """Render subagent activity into the main log so it is never invisible."""
+        try:
+            self.call_from_thread(self._render_subagent_event, event)
+        except RuntimeError:
+            pass
+
+    def _render_subagent_event(self, event) -> None:
+        log = self.query_one("#chat-log", RichLog)
+        et, p = event.event_type, event.payload
+        if et == "tool_call":
+            log.write(Text(f"⇢ subagent tool call: {p.get('name')} {json.dumps(p.get('arguments', {}), ensure_ascii=False)[:160]}",
+                           style="dim cyan"))
+        elif et == "tool_result":
+            log.write(Text(f"⇢ subagent result: {p.get('name')} "
+                           f"{'ok' if p.get('success') else 'failed: ' + str(p.get('error') or '')[:160]}",
+                           style="dim cyan"))
+        elif et == "prompt_injection":
+            log.write(Text(f"⇢ subagent prompt injected ({p.get('source')}): {str(p.get('content'))[:200]}",
+                           style="dim yellow"))
+        elif et == "response":
+            log.write(Text(f"⇢ subagent finished ({p.get('stop_reason') or 'completed'})",
+                           style="dim cyan"))
 
     def _prepare_swarm_telemetry(self, task_text: str) -> None:
         classification = self.agent.skill_classifier.classify(task_text)
@@ -1413,8 +1438,14 @@ class AdaptiveHarnessApp(App):
                             for result in report.results)
         self.agent.messages.append({"role": "assistant", "content": summary})
         for result in report.results:
+            detail = result.summary[:400]
+            if result.error:
+                detail = f"{result.error} · {detail}"
+            stop = (result.artifacts or {}).get("stop_reason")
+            if stop and not result.success:
+                detail = f"{detail} · stop reason: {stop}"
             log.write(Text(f"{result.role.value.title()} · {result.phase.value}: "
-                           f"{'✓' if result.success else '✗'} {result.summary[:400]}",
+                           f"{'✓' if result.success else '✗'} {detail}",
                            style="green" if result.success else "red"))
         log.write(Text("Swarm verification passed" if report.success else
                        "Swarm stopped without verified completion", style="bold green" if report.success else "bold yellow"))
@@ -1456,10 +1487,15 @@ class AdaptiveHarnessApp(App):
                 if isolated:
                     self.agent.set_workspace(isolated.workspace)
                     self.call_from_thread(self._worktree_started, isolated)
+            # Model-driven decomposition: outside the explicit pipeline the main
+            # agent keeps delegate_subagent and decides when to spawn roles.
+            self.agent.enable_swarm(self.swarm_mode != "off")
             if self._should_swarm(task_text):
                 self.call_from_thread(self._prepare_swarm_telemetry, task_text)
                 coordinator = SwarmCoordinator(DeveloperAgentWorker(llm_client_factory=self._swarm_client,
-                    max_steps=self.agent.max_steps, step_policy=self.agent.step_policy),
+                    max_steps=self.agent.max_steps, step_policy=self.agent.step_policy,
+                    repository=self.agent.repository, safety_profile=self.agent.safety_profile,
+                    on_event=self._subagent_event),
                     on_status=lambda status: self.call_from_thread(self._swarm_status_changed, dict(status)))
                 report = coordinator.run(task_text, isolated.workspace if isolated else self.workspace_root,
                                          isolated=bool(isolated))

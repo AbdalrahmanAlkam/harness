@@ -1,5 +1,15 @@
 # Swarm/subagent design vs. modern harness practice
 
+> **Status: fully implemented.** Every recommendation in this document is now
+> covered by code and regression tests: observable subagents (`on_event`
+> forwarding, never-empty summaries, surfaced stop reasons), structural refusal
+> detection, file-state mutation evidence, evidence-based QA verification,
+> feedback retries, a bounded QA→coder repair loop, the reachable security
+> reviewer role, genuinely parallel read-only review waves, shared delegation
+> machinery (`run_assignment`), memory/safety inheritance for subagents, and
+> model-driven delegation (auto mode pipelines only explicit multi-agent
+> requests; long prompts are never hijacked).
+
 Analysis of `SwarmCoordinator` + `DeveloperAgentWorker` + `DelegateSubagentTool`
 against how contemporary agent harnesses (Claude Code subagents, OpenAI Agents
 SDK, LangGraph/AutoGen, aider architect mode, Devin/Cursor-style composers)

@@ -228,7 +228,7 @@ class ClassifierTelemetryWidget(Static):
                       style="bold green" if self.workspace_isolation != "Direct workspace" else "dim")
         if self.swarm_status:
             labels = (("Architect", "architect:plan"), ("Coder", "coder:implement"),
-                      ("Reviewer", "qa:verify"))
+                      ("Reviewer", "qa:verify"), ("Security", "security:verify"))
             icons = {"done": "Done ✓", "running": "Running ⚡",
                      "queued": "Queued ⏳", "failed": "Failed ✗", "skipped": "Skipped"}
             status.append("Swarm: ", style="bold cyan")

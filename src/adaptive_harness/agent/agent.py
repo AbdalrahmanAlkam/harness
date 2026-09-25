@@ -68,6 +68,34 @@ def _injection_event(source: str, content: str, step: int, kind: str = "system_m
                                           "content": content, "step": step})
 
 
+_WORKSPACE_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", ".tox",
+                        ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+
+
+def _workspace_signature(root: Path) -> dict[str, tuple[int, int]]:
+    """Cheap observable file state (path -> mtime_ns, size) for mutation detection.
+
+    Shell commands may legitimately create or modify files; evidence of that is
+    file state, not which tool was used. Bounded by skip dirs and entry count.
+    """
+    signature: dict[str, tuple[int, int]] = {}
+    try:
+        for path in root.rglob("*"):
+            if len(signature) >= 50_000:
+                break
+            try:
+                if any(part in _WORKSPACE_SKIP_DIRS for part in path.parts):
+                    continue
+                if path.is_file():
+                    stat = path.stat()
+                    signature[str(path.relative_to(root))] = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                continue
+    except OSError:
+        return signature
+    return signature
+
+
 def _cacheable_read_request(task: str) -> bool:
     """Admit only self-contained read requests to the zero-token answer cache."""
     return bool(re.fullmatch(
@@ -186,7 +214,12 @@ class DeveloperAgent:
                     provider=source.provider, provider_keys=source.provider_keys,
                     backup_providers=source.backup_providers)
             self.tools["delegate_subagent"] = DelegateSubagentTool(self.workspace_root,
-                llm_client_factory=client_factory)
+                llm_client_factory=client_factory,
+                repository=self.repository,
+                safety_profile=self.safety_profile,
+                step_policy=self.step_policy,
+                max_steps=self.max_steps,
+                on_event=getattr(self, "subagent_event_callback", None))
         else:
             self.tools.pop("delegate_subagent", None)
 
@@ -717,6 +750,10 @@ class DeveloperAgent:
 
                 tool = self.tools.get(tc.name) if tc.name in domain_tool_names else None
                 t_start = time.perf_counter()
+                # Shell and test tools may write files; mutation evidence is the
+                # observable file state before/after, not the tool name.
+                observes_writes = tool is not None and tc.name in {"run_bash", "run_pytest"}
+                signature_before = _workspace_signature(self.workspace_root) if observes_writes else None
                 if (tool and (domain_res.mode == DomainMode.AUDIT or security_skill_active) and tc.name == "run_bash" and
                         not audit_command_is_read_only(str(tc.arguments.get("command", "")))):
                     tool_res = ToolResult(success=False, output="",
@@ -730,6 +767,9 @@ class DeveloperAgent:
                     tool_res = ToolResult(success=False, output="", error=f"Tool `{tc.name}` is unavailable in {domain_res.mode.value} mode")
                 if tool_res.success and (tc.name in {"write_file", "edit_file"} or
                     tc.name == "delegate_subagent" and (tool_res.metadata or {}).get("role") == "coder"):
+                    successful_mutations += 1
+                elif tool_res.success and signature_before is not None and \
+                        _workspace_signature(self.workspace_root) != signature_before:
                     successful_mutations += 1
                 if tc.name != "read_file" or not tool_res.success:
                     cache_eligible = False
