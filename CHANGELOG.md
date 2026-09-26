@@ -79,6 +79,19 @@ work in this push; earlier history is summarized in `git log`.
   tasks, unanswered requests, and any human stop — with model-authored text
   escaped so it cannot break the build.
 
+### Verified
+A live Space Bunny Alpha run on `"exact identity: (2 : Nat) + 2 = 4"`
+(`research/smoke6/`, `--max-cycles 2 --worker-steps 6 --parallel-workers 2`)
+reached **VERDICT: PROVEN** — 3 of 3 claims PROVEN, 0 inconclusive, each with a
+`VERIFIED_EXIT_0` receipt carrying the SHA-256 of the executed script, and a
+230-entry hash-chained ledger that verifies. The run exited `STAGNATION_ABORT`
+and published a progress report rather than a paper, because three invariants
+were still open when the operator stopped it: one claim's natural-language
+derivation was missing, only 1 of 4 Lean files was certified, and `paper.typ`
+omitted a receipt tag. That is the intended behaviour — a proven claim with an
+incomplete formal tier is reported as PROVEN *and* as not-yet-finished, and the
+document says so rather than claiming a completed paper.
+
 ### Changed
 - Standalone `research` now uses separate live OpenRouter agents by default;
   `--offline-legacy` preserves the earlier deterministic demonstration.
