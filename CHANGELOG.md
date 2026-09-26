@@ -78,6 +78,10 @@ work in this push; earlier history is summarized in `git log`.
   intervals, and a rank-order prediction that a wrong theory would break.
 
 ### Added
+- **Per-file Lean receipts** at `proofs/<theorem>.lean.receipt.json`, carrying the
+  digest, verdict, exit code, located diagnostics, unsolved goals, placeholders,
+  axiom set, compiler output, and verification time, so a later audit reads a
+  durable record rather than re-running the compiler.
 - **Lean 4 as the machine-checked epistemic proof engine.** `RunLeanProofTool`
   (`run_lean_proof`) compiles and adjudicates Lean sources, and a sixth
   invariant, `formal_verification`, requires that any theorem the paper asserts
@@ -107,6 +111,17 @@ work in this push; earlier history is summarized in `git log`.
   Lean discharges the induction itself, which SymPy cannot do.
 
 ### Fixed
+- **`compile_typst` and `run_lean_proof` were unreachable from a task.** Both were
+  absent from `domain_tool_names[DomainMode.RESEARCH]`, and `run_lean_proof` was
+  not on the toolbelt at all, so a research agent could not build the paper it was
+  writing nor machine-check a proof even though the swarm used the tool
+  internally. Both are now registered and exposed in RESEARCH and SCIENCE, and
+  both are carried by the `research_active` set.
+- **A bare `axiom` declaration was accepted.** `sorry` and `admit` were refused,
+  but an assumed constant was not, so a theorem could lean on an unproved premise.
+  `axiom` is now a placeholder token, matched as a whole word so `#print axioms`
+  is not a false positive. The axiom-dependency audit would have caught it, but
+  only after the fact and with a far less obvious message.
 - **Live mode could never converge.** Any non-empty falsification response was read
   as a counterexample, so with `--author` the adversarial gate never cleared. The
   red team now requires a structured verdict

@@ -141,7 +141,7 @@ def test_tool_requires_source_or_path(tmp_path: Path):
         pytest.skip("Lean 4 is not installed")
     result = tool.execute()
     assert not result.success
-    assert "source" in (result.error or "")
+    assert "lean_code" in (result.error or "")
 
 
 def test_missing_file_is_reported_not_crashed(tmp_path: Path):
@@ -337,7 +337,7 @@ def test_proven_claim_requires_a_certified_lean_proof(tmp_path: Path):
     swarm._formalise()
     swarm._adjudicate()
     assert swarm.claims.headline is Verdict.PROVEN
-    ok, detail, _ = swarm._evaluate_formal()
+    ok, detail, _ = swarm._evaluate_lean_proofs()
     assert ok, detail
     assert "sorryAx" in detail
 
@@ -355,7 +355,7 @@ def test_refuted_claim_needs_no_lean_proof(tmp_path: Path):
     swarm._formalise()
     swarm._adjudicate()
     assert swarm.claims.headline is Verdict.DISPROVEN
-    ok, detail, _ = swarm._evaluate_formal()
+    ok, detail, _ = swarm._evaluate_lean_proofs()
     assert ok, detail
     assert "no theorem is asserted" in detail
 
@@ -433,5 +433,5 @@ def test_tampered_lean_file_blocks_the_run(tmp_path: Path):
     blocked = reopened.run()
     assert not blocked.solved, "a sorry-bearing proof was allowed to publish"
     failing = [status for status in reopened._last_report.statuses
-               if status.invariant is Invariant.FORMAL_VERIFICATION]
+               if status.invariant is Invariant.LEAN_FORMAL_SOUNDNESS]
     assert failing and not failing[0].satisfied

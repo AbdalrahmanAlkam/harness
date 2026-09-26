@@ -46,7 +46,7 @@ GAP_ROUTING: Mapping[str, Division] = {
     Invariant.ADVERSARIAL_CLEARANCE.value: Division.ADVERSARIAL,
     Invariant.DOCUMENT_INTEGRITY.value: Division.LITERATURE,
     Invariant.CLAIM_ADJUDICATION.value: Division.THEORY,
-    Invariant.FORMAL_VERIFICATION.value: Division.FORMAL,
+    Invariant.LEAN_FORMAL_SOUNDNESS.value: Division.FORMAL,
 }
 
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
@@ -480,7 +480,7 @@ class ResearchSwarm:
                  "scripts_written": written, "notes": notes,
                  "supplied_lean_files": sorted(existing)})
 
-    def _evaluate_formal(self) -> tuple[bool, str, tuple[str, ...]]:
+    def _evaluate_lean_proofs(self) -> tuple[bool, str, tuple[str, ...]]:
         """Pre-compilation clearance for the formal tier.
 
         The standard applies to *asserted theorems*, so what is required depends
@@ -736,7 +736,7 @@ class ResearchSwarm:
             Invariant.EMPIRICAL_REPLICATION: self._evaluate_experiments,
             Invariant.ADVERSARIAL_CLEARANCE: self._evaluate_adversarial,
             Invariant.CLAIM_ADJUDICATION: self._evaluate_claim,
-            Invariant.FORMAL_VERIFICATION: self._evaluate_formal,
+            Invariant.LEAN_FORMAL_SOUNDNESS: self._evaluate_lean_proofs,
             Invariant.DOCUMENT_INTEGRITY: self._evaluate_document,
         })
 

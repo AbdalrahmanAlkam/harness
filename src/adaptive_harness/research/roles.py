@@ -54,7 +54,7 @@ DIVISION_SPECS: Mapping[Division, DivisionSpec] = {
         Division.THEORY, "Theoretical Lead",
         "Convert the objective into exact, self-contained derivations whose scripts "
         "execute to exit code 0 with no floating-point approximation.",
-        ("SymPy Prover", "Lemma Hunter", "Bound Analyst"),
+        ("SymPy Prover", "Lean Formalist", "Lemma Hunter", "Bound Analyst"),
         ("read_file", "write_file", "edit_file", "run_bash", "run_python_repl", "calculate")),
     Division.EMPIRICAL: DivisionSpec(
         Division.EMPIRICAL, "Empirical Lead",

@@ -32,6 +32,7 @@ means core-only proofs verify with no extra download.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -43,16 +44,27 @@ from typing import Any, Iterable, Sequence
 
 from adaptive_harness.tools.base import Tool, ToolResult
 
-# Placeholders that let Lean accept an unfinished proof. `sorry` is the canonical
-# one; `admit` is its alias, and Mathlib's `stop` aborts with an error rather
-# than producing a proof, so it is listed for completeness.
-PLACEHOLDER_TOKENS = ("sorry", "admit")
+# Placeholders and escape hatches that let Lean accept an unproved claim.
+# `sorry` is the canonical one and `admit` is its alias. A bare `axiom`
+# declaration is also refused: a theorem that leans on an assumed constant is
+# not proved, and the axiom-dependency check would only catch it after the fact
+# with a less obvious message. Note `axioms` (plural) is deliberately not a
+# match, so `#print axioms` in a source is not a false positive.
+PLACEHOLDER_TOKENS = ("sorry", "admit", "axiom")
 SORRY_AXIOM = "sorryAx"
+
+# The token a placeholder is reported under, so the message names what the
+# author actually wrote rather than always saying "sorry".
+_TOKEN_LABEL = {"sorry": "sorry", "admit": "admit", "axiom": "unproved axiom declaration"}
 
 # Lean's own foundational axioms. A proof depending only on these is accepted;
 # anything else beyond them (choice, classical logic) is reported but not fatal,
 # because it is a legitimate modelling decision rather than a hole.
 BENIGN_AXIOMS = frozenset({"propext", "Quot.sound", "Classical.choice"})
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 _LEAN_SEARCH_PATHS = (
     Path.home() / ".elan" / "bin",
@@ -131,6 +143,12 @@ def find_placeholders(source: str) -> list[tuple[int, str]]:
                 hits.append((number, token))
                 break
     return hits
+
+
+def describe_placeholders(placeholders: Iterable[tuple[int, str]]) -> str:
+    """Human-readable summary of what was found and where."""
+    return ", ".join(f"line {line} ({_TOKEN_LABEL.get(token, token)})"
+                     for line, token in placeholders)
 
 
 def declarations(source: str) -> list[tuple[str, str]]:
@@ -375,12 +393,12 @@ class LeanVerifier:
         # Check 1: no placeholder token in the source itself.
         placeholders = find_placeholders(text)
         if placeholders:
-            lines = ", ".join(f"line {line} ('{token}')" for line, token in placeholders)
             return LeanVerification(
                 False, None, str(target), digest, launcher=self.toolchain.lean or "lean",
                 duration_ms=(time.perf_counter() - begin) * 1000.0,
                 placeholders=tuple(placeholders),
-                error=f"Proof contains unproven placeholder 'sorry': {lines}")
+                error=("Proof contains an unproven placeholder and was rejected: "
+                       f"{describe_placeholders(placeholders)}"))
 
         lean = self.toolchain.require()
         # The axiom audit must be part of the compiled file, so it is appended to
@@ -450,23 +468,42 @@ class RunLeanProofTool(Tool):
     name = "run_lean_proof"
     description = (
         "Compiles a Lean 4 file or snippet with 'lean' (or 'lake env lean') and verifies there are "
-        "zero errors and zero 'sorry' placeholders. A proof is rejected if the source contains "
-        "sorry, if the compiler reports one, or if any declaration depends on the sorryAx axiom.")
+        "zero errors and zero unproven placeholders. A proof is rejected if the source contains "
+        "sorry, admit, or a bare axiom declaration, if the compiler reports one, or if any "
+        "declaration depends on the sorryAx axiom. Writes a SHA-256 receipt next to the file.")
     parameters = {"type": "object", "properties": {
-        "source": {"type": "string", "description": "Complete Lean 4 source, or the file to check."},
-        "path": {"type": "string", "description": "Existing .lean file to verify instead of source."},
-        "name": {"type": "string", "description": "File name for an inline source.", "default": "Proof.lean"},
+        "lean_code": {"type": "string",
+                      "description": "Complete Lean 4 source, written to proofs/<theorem_name>.lean."},
+        "file_path": {"type": "string", "description": "Existing .lean file to verify instead."},
+        "theorem_name": {"type": "string",
+                         "description": "Stem for the written file and its receipt.",
+                         "default": "Proof"},
+        "timeout_s": {"type": "integer", "minimum": 1, "default": 60,
+                      "description": "Compilation timeout in seconds."},
+        "source": {"type": "string", "description": "Alias for lean_code."},
+        "path": {"type": "string", "description": "Alias for file_path."},
+        "name": {"type": "string", "description": "Alias for theorem_name."},
     }, "required": []}
 
     def __init__(self, workspace_root: str | Path | None = None, *,
                  toolchain: LeanToolchain | None = None, timeout_s: float = 300.0,
-                 audit_axioms: bool = True, lean_dir: str | None = "lean"):
+                 audit_axioms: bool = True, lean_dir: str | None = "lean",
+                 write_receipts: bool = True):
         self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
         self.verifier = LeanVerifier(toolchain, timeout_s=timeout_s, audit_axioms=audit_axioms)
         self.lean_dir = lean_dir
+        self.write_receipts = write_receipts
 
-    def execute(self, source: str | None = None, path: str | None = None,
-                name: str = "Proof.lean", **kwargs: Any) -> ToolResult:
+    def execute(self, lean_code: str | None = None, file_path: str | None = None,
+                theorem_name: str = "Proof", timeout_s: int | None = None,
+                source: str | None = None, path: str | None = None,
+                name: str | None = None, **kwargs: Any) -> ToolResult:
+        # Accept the short aliases so a caller can use either spelling.
+        code = lean_code if lean_code is not None else source
+        target_path = file_path if file_path is not None else path
+        stem = name or theorem_name or "Proof"
+        if timeout_s is not None:
+            self.verifier.timeout_s = float(timeout_s)
         if not self.verifier.toolchain.available:
             message = ("Lean 4 was not found on PATH, in ~/.elan/bin, or in ~/.local/bin. "
                        "Install it with `curl https://elan.lean-lang.org/elan-init.sh -sSf | sh`.")
@@ -474,26 +511,66 @@ class RunLeanProofTool(Tool):
                               metadata={"lean_available": False})
         directory = self.workspace_root / self.lean_dir if self.lean_dir else self.workspace_root
         try:
-            if path:
-                target = Path(path)
+            if target_path:
+                target = Path(target_path)
                 if not target.is_absolute():
                     target = self.workspace_root / target
                 result = self.verifier.verify(target)
-            elif source:
-                result = self.verifier.verify_source(source, name=name, directory=directory)
+            elif code:
+                filename = stem if stem.endswith(".lean") else f"{stem}.lean"
+                result = self.verifier.verify_source(code, name=filename, directory=directory)
             else:
                 return ToolResult(success=False, output="",
-                                  error="Provide either 'source' (Lean 4 text) or 'path' (a .lean file)")
+                                  error="Provide either 'lean_code' (Lean 4 text) or 'file_path' "
+                                        "(a .lean file)")
         except LeanError as exc:
             return ToolResult(success=False, output="", error=str(exc))
         except (OSError, ValueError) as exc:
             return ToolResult(success=False, output="",
                               error=f"Lean verification failed: {type(exc).__name__}: {exc}")
-        payload = json.dumps(result.to_dict(), ensure_ascii=False)
-        return ToolResult(success=result.success, output=payload, error=result.error,
+        receipt_path = self._write_receipt(result) if self.write_receipts else None
+        payload = result.to_dict()
+        if receipt_path is not None:
+            payload["receipt_path"] = str(receipt_path)
+        return ToolResult(success=result.success, output=json.dumps(payload, ensure_ascii=False),
+                          error=result.error,
                           metadata={"exit_code": result.exit_code,
                                     "lean_version": result.lean_version,
                                     "unsolved_goals": len(result.unsolved_goals),
                                     "sorry_dependencies": len(result.sorry_dependencies),
-                                    "axioms": [item.axiom for item in result.axioms]})
+                                    "axioms": [item.axiom for item in result.axioms],
+                                    "receipt_path": str(receipt_path) if receipt_path else None})
+
+    def _write_receipt(self, result: LeanVerification) -> Path | None:
+        """Persist the per-file receipt beside the proof, as a durable record.
+
+        The receipt is the artifact an auditor re-reads later, so it carries the
+        digest, the verdict, the compiler output, and the time of verification.
+        """
+        target = Path(result.source_path)
+        if not target.is_file():
+            return None
+        payload = {
+            "theorem_id": target.stem,
+            "path": str(target),
+            "sha256": result.sha256,
+            "verified": result.success,
+            "status": "LEAN_VERIFIED" if result.success else "LEAN_REJECTED",
+            "exit_code": result.exit_code,
+            "lean_version": result.lean_version,
+            "errors": [item.to_dict() for item in result.errors],
+            "unsolved_goals": list(result.unsolved_goals),
+            "placeholders": [{"line": line, "token": token} for line, token in result.placeholders],
+            "axioms": [item.to_dict() for item in result.axioms],
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "error": result.error,
+            "timestamp": _utc_now(),
+        }
+        receipt = target.with_name(target.name + ".receipt.json")
+        try:
+            receipt.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            return None
+        return receipt
 
