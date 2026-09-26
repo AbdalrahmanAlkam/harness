@@ -21,6 +21,15 @@ work in this push; earlier history is summarized in `git log`.
   socket` and failed. The guard is now installed by a launcher; the source under
   audit and the source executed are byte-identical, and connections are still
   blocked.
+- A worker's wall-clock budget now starts when its attempt starts, not when it was
+  recruited. A worker hired early and dispatched several cycles later was arriving
+  with its clock already spent, and could time out before making a single tool
+  call.
+- A deadline expiry is recorded as `timed_out`, attributed to the harness, and
+  retryable. It previously raised an unattributed self-cancellation that reached
+  no ledger entry, and the resulting `cancelled` state made the worker
+  permanently non-retryable — so one timeout ended that worker's involvement for
+  the rest of the run.
 - A skill whose completion checks are unreachable with the exposed tool set is no
   longer injected. The agent was handed checklists it had no instrument for — a
   research worker has no `run_pytest` — and then failed a gate it could never
@@ -59,6 +68,12 @@ work in this push; earlier history is summarized in `git log`.
 - **Live telemetry.** `adaptive-harness research` reports every worker's state,
   open tasks, unanswered requests, and who stopped the run; Ctrl-C stops every
   active worker and ends with an attributable `EXTERNAL_STOP`.
+- **Swarm-level supervision.** The per-agent `RuntimeOverseer`'s verdicts now
+  become actions rather than only trajectory entries: one escalation requests help
+  from the worker's escalation contact, and a repeat stops the worker with the
+  verdict as the recorded reason. A completed task is never stopped for stalling.
+- **Failure feedback across retries.** A re-dispatched worker is told why the
+  previous attempt at that exact artifact failed.
 - **Diagnostic unsolved report.** A run that did not converge now publishes which
   invariants failed and why, each claim's verdict, the formal-tier status, open
   tasks, unanswered requests, and any human stop — with model-authored text

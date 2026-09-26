@@ -779,3 +779,175 @@ def test_a_stale_but_compiling_draft_does_not_replace_the_diagnostic_report(tmp_
     assert swarm.workspace.root.joinpath("paper_draft.typ").read_text(
         encoding="utf-8") == draft
     assert not (swarm.workspace.root / "progress_report_build_error.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Swarm-level supervision of the per-agent overseer
+# ---------------------------------------------------------------------------
+
+def _stalled(count: int = 1) -> dict[str, Any]:
+    return {"ran": True, "success": False, "accepted": False, "tool_calls": count * 4,
+            "trajectory": [], "error": "no progress",
+            "state": WorkerState.FAILED.value,
+            "overseer": [{"state": "LOOPING_DETECTED", "directive": "stop circling",
+                          "confidence": 0.99} for _ in range(count)]}
+
+
+def test_a_single_overseer_flag_asks_for_help_rather_than_stopping(tmp_path: Path):
+    """One flagged step is normal friction on a hard proof, not a death sentence."""
+    swarm = _swarm(tmp_path, overseer_stop_threshold=3)
+    worker = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "prove it", ["read_file"])
+    task = _new_task(swarm)
+    swarm.board.lease(task.task_id, worker)
+    swarm.control.begin(worker, task_id=task.task_id)
+    assert swarm._supervise(Division.THEORY, worker, task, _stalled(1)) == "asked_for_help"
+    assert swarm.control.record(worker).state is WorkerState.RUNNING
+    pending = swarm.bus.unacknowledged()
+    assert len(pending) == 1 and pending[0].kind.value == "request_for_help"
+    assert pending[0].recipient == "theory_lead_01"
+
+
+def test_a_repeated_loop_stops_the_worker_with_the_overseer_as_the_reason(tmp_path: Path):
+    swarm = _swarm(tmp_path, overseer_stop_threshold=3)
+    worker = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "prove it", ["read_file"])
+    task = _new_task(swarm)
+    swarm.board.lease(task.task_id, worker)
+    swarm.control.begin(worker, task_id=task.task_id)
+    assert swarm._supervise(Division.THEORY, worker, task, _stalled(3)) == "stopped"
+    record = swarm.control.record(worker)
+    assert record.state is WorkerState.CANCELLED
+    assert record.stop_actor == "theory_lead_01"
+    assert "LOOPING_DETECTED" in record.stop_reason and "3 time(s)" in record.stop_reason
+    assert swarm.board.get(task.task_id).owner is None
+    assert any(entry.action == "STOP_REQUESTED"
+               and entry.sender["agent_id"] == "theory_lead_01"
+               for entry in swarm.ledger.by_action("STOP_REQUESTED"))
+
+
+def test_a_healthy_worker_is_left_alone(tmp_path: Path):
+    swarm = _swarm(tmp_path)
+    worker = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "prove it", ["read_file"])
+    task = _new_task(swarm)
+    swarm.board.lease(task.task_id, worker)
+    swarm.control.begin(worker, task_id=task.task_id)
+    assert swarm._supervise(Division.THEORY, worker, task, _stalled(0)) is None
+    assert swarm._supervise(
+        Division.THEORY, worker, task,
+        {"overseer": [{"state": "HEALTHY_PROGRESS", "directive": ""}]}) is None
+    assert swarm.control.record(worker).state is WorkerState.RUNNING
+    assert swarm.bus.unacknowledged() == ()
+
+
+def test_a_completed_task_is_never_stopped_for_stalling(tmp_path: Path):
+    """Finishing is not stalling, however many steps it took."""
+    swarm = _swarm(tmp_path, overseer_stop_threshold=1)
+    worker = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "prove it", ["read_file"])
+    task = _new_task(swarm)
+    swarm.board.lease(task.task_id, worker)
+    swarm.control.begin(worker, task_id=task.task_id)
+    swarm.board.complete(task.task_id, worker)
+    assert swarm._supervise(Division.THEORY, worker, task, _stalled(5)) is None
+    assert swarm.control.record(worker).state is WorkerState.RUNNING
+
+
+def test_supervision_outcomes_appear_in_the_leads_review(tmp_path: Path):
+    swarm = _swarm(tmp_path, overseer_stop_threshold=3)
+    worker = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "prove it", ["read_file"])
+    task = _new_task(swarm)
+    swarm.board.lease(task.task_id, worker)
+    swarm.control.begin(worker, task_id=task.task_id)
+    swarm._review(Division.THEORY, worker, task, _stalled(2))
+    review = [entry for entry in swarm.ledger.by_action("PROGRESS_SUMMARY")
+              if entry.sender["agent_id"] == "theory_lead_01"][0]
+    assert review.payload["supervision"] == "asked_for_help"
+    assert review.payload["overseer_verdicts"] == ["LOOPING_DETECTED"] * 2
+
+
+def test_a_worker_that_exceeds_its_budget_is_timed_out_and_retryable(tmp_path: Path):
+    """A deadline must be recorded as a timeout, not as an unattributed cancel."""
+    # Long enough for the run's early classifier events to pass, short enough that
+    # the budget lapses while the model is parked mid-attempt.
+    swarm = _swarm(tmp_path, worker_max_steps=200, worker_timeout_s=0.5)
+    agent_id = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "loop", ["run_bash"])
+    task = _new_task(swarm)
+    _write(swarm, task.artifact, PROOF_BODY)
+    swarm.board.lease(task.task_id, agent_id)
+    parked, release = threading.Event(), threading.Event()
+
+    def factory():
+        client = _BlockingClient(parked, release)
+        client.default_model = "stealth/space-bunny-alpha"
+        return client
+
+    swarm.config.llm_client_factory = factory
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            result.update(swarm._produce(Division.THEORY, swarm.agents[agent_id],
+                                         "mathematical_soundness", [], task=task))
+        except BaseException as exc:  # noqa: BLE001 - surfaced as an assertion below
+            result["exception"] = f"{type(exc).__name__}: {exc}"
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    try:
+        assert parked.wait(timeout=30)
+        time.sleep(0.8)  # let the budget lapse while the model is still parked
+    finally:
+        release.set()
+    worker.join(timeout=30)
+    assert not worker.is_alive()
+    assert "exception" not in result, result["exception"]
+
+    record = swarm.control.record(agent_id)
+    assert record.state is WorkerState.TIMED_OUT
+    assert record.stop_actor == "swarm_control" and record.stop_cause == "timeout"
+    assert record.retryable
+    # The attempt returns to the board rather than being written off.
+    assert swarm.board.get(task.task_id).owner is None
+    assert swarm.board.get(task.task_id).state is not WorkerState.CANCELLED
+    # And the reason is on the record, not lost.
+    assert "exceeded" in (record.error or record.stop_reason)
+    timeouts = [entry for entry in swarm.ledger.by_action("WORKER_STATE_CHANGE")
+                if entry.payload.get("cause") == "deadline_expiry"]
+    assert timeouts and timeouts[0].payload["retryable"] is True
+
+
+def test_a_retry_is_told_why_the_previous_attempt_failed(tmp_path: Path):
+    """A fresh agent has no memory of the run before it; without this it repeats
+    the same mistake and burns the same budget."""
+    seen: list[str] = []
+
+    swarm = _swarm(tmp_path, worker_max_steps=1)
+    worker = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "prove it",
+                                  ["write_file"])
+    task = _new_task(swarm)
+    original = swarm._run_worker
+
+    def capture(agent, division, directive, **kwargs):
+        seen.append(directive)
+        return original(agent, division, directive, **kwargs)
+
+    swarm._run_worker = capture  # type: ignore[method-assign]
+    try:
+        # First attempt: nothing to carry forward.
+        swarm.board.lease(task.task_id, worker)
+        _write(swarm, task.artifact, PROOF_BODY)
+        swarm._produce(Division.THEORY, swarm.agents[worker], "mathematical_soundness",
+                       [], task=task)
+        assert not any("previous attempt" in item for item in seen)
+
+        # Record a failure, then re-dispatch the same task.
+        swarm.board.lease(task.task_id, worker)
+        swarm.board.fail(task.task_id, worker, "sympy.has does not exist")
+        assert swarm.board.get(task.task_id).attempts == 2
+        _write(swarm, task.artifact, PROOF_BODY)
+        swarm._produce(Division.THEORY, swarm.agents[worker], "mathematical_soundness",
+                       [], task=task)
+    finally:
+        swarm._run_worker = original  # type: ignore[method-assign]
+    retried = [item for item in seen if "previous attempt" in item]
+    assert retried, "the retry never learned from the failure"
+    assert "attempt 2" in retried[0]
+    assert "sympy.has does not exist" in retried[0]

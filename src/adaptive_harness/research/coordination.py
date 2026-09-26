@@ -190,6 +190,7 @@ class CancellationToken:
         self.agent_id = agent_id
         self.deadline_s = deadline_s
         self.signal = StopSignal()
+        self._lock = threading.Lock()
         self._started = _monotonic()
 
     @property
@@ -206,6 +207,11 @@ class CancellationToken:
 
     def expired(self) -> bool:
         return self.deadline_s is not None and self.elapsed_s > self.deadline_s
+
+    def restart(self) -> None:
+        """Start the budget clock now, for a fresh attempt."""
+        with self._lock:
+            self._started = _monotonic()
 
     def request(self, kind: StopKind, actor: str, reason: str) -> bool:
         return self.signal.fire(kind, actor, reason)
@@ -876,10 +882,29 @@ class WorkerRecord:
     stop_kind: str = ""
     stop_actor: str = ""
     stop_reason: str = ""
+    # Why the worker stopped, when a stop is not the same as a verdict. A deadline
+    # expiry is retryable; a leader or operator cancelling is final. Without this
+    # distinction a timed-out worker can never be re-dispatched, or a deliberately
+    # stopped one keeps coming back.
+    stop_cause: str = ""
     tool_calls: int = 0
     error: str = ""
     artifact: str = ""
     evidence_ids: tuple[str, ...] = ()
+
+    @property
+    def retryable(self) -> bool:
+        """Whether this worker may be dispatched again.
+
+        A failed or timed-out attempt is a normal part of research. A cancellation
+        by a leader or an operator is a decision, and re-running the worker anyway
+        would override the decision that was just made.
+        """
+        if self.state is WorkerState.FAILED:
+            return True
+        if self.state is WorkerState.TIMED_OUT:
+            return True
+        return self.state is WorkerState.CANCELLED and self.stop_cause == "timeout"
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -1003,18 +1028,47 @@ class SwarmControl:
     def begin(self, agent_id: str, *, task_id: str = "", tool_calls: int = 0) -> WorkerRecord:
         """Start a worker's tool loop, requeueing it first if it is retryable.
 
-        A worker whose last attempt failed or timed out is dispatched again on the
-        next cycle, so ``begin`` has to move it out of its terminal state before
-        starting. That is done as an explicit, recorded requeue rather than by
-        quietly allowing FAILED to RUNNING, because the requeue is the moment a
-        retry begins and an audit needs to see it.
+        A worker whose last attempt failed, timed out, or was cancelled by a
+        deadline is dispatched again on a later cycle, so ``begin`` has to move it
+        out of its terminal state before starting. That is done as an explicit,
+        recorded requeue rather than by quietly allowing the transition, because the
+        requeue is the moment a retry begins and an audit needs to see it. A worker
+        a leader or an operator deliberately cancelled is *not* retryable.
+
+        The deadline is restarted here rather than at registration. The budget
+        belongs to the *attempt*: a worker recruited early and dispatched much later
+        must not arrive with its clock already spent.
         """
         with self._lock:
             record = self._workers.get(agent_id)
-        if record is not None and record.state in (WorkerState.FAILED, WorkerState.TIMED_OUT):
+        if record is not None and record.state.terminal:
+            if not record.retryable:
+                raise CoordinationError(
+                    f"{agent_id} was {record.state.value} by {record.stop_actor or 'the system'} "
+                    f"({record.stop_reason or 'no reason recorded'}) and is not retryable")
             self._transition(agent_id, WorkerState.QUEUED)
+        token = self.token(agent_id)
+        token.restart()
         return self._transition(agent_id, WorkerState.RUNNING, task_id=task_id,
                                 tool_calls=tool_calls)
+
+    def record_timeout(self, agent_id: str, reason: str) -> WorkerRecord:
+        """Record a deadline expiry, attributed and retryable.
+
+        A worker that runs out of wall clock has not been *cancelled* by anyone, so
+        it is recorded as TIMED_OUT with the harness as the actor rather than as an
+        unattributed cancellation.
+        """
+        record = self.settle_worker(agent_id, WorkerState.TIMED_OUT, reason=reason)
+        record.stop_cause = "timeout"
+        record.stop_actor = record.stop_actor or "swarm_control"
+        self.ledger.append(
+            "WORKER_STATE_CHANGE", {"agent_id": "swarm_control", "role": "Swarm Control"},
+            {"agent_id": agent_id, "role": record.role},
+            {"from": WorkerState.TIMED_OUT.value, "to": WorkerState.TIMED_OUT.value,
+             "cause": "deadline_expiry", "reason": reason[:300],
+             "retryable": True, "task_id": record.task_id})
+        return record
 
     def complete(self, agent_id: str, *, artifact: str = "",
                  evidence_ids: Sequence[str] = (), tool_calls: int | None = None) -> WorkerRecord:

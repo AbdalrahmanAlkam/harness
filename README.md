@@ -389,6 +389,16 @@ no further tool call, and the process groups it started are killed. Ctrl-C on
 `adaptive-harness research` stops every active worker and ends the run with an
 `EXTERNAL_STOP` naming you, rather than grinding on to a stagnation verdict.
 
+**Supervision.** Each worker is watched by the per-agent `RuntimeOverseer`, which
+detects looping, stalling, and drift outside the assignment. At the swarm level
+those verdicts become decisions: one escalation sends a request for help to the
+worker's escalation contact, and a repeat — `--overseer-stop` times, default 3 —
+stops the worker with the overseer's verdict as the recorded reason. A retry is
+told why the previous attempt at that exact artifact failed, because a fresh
+agent has no memory of the run before it. `--worker-timeout` bounds one attempt's
+wall clock; expiry is recorded as `timed_out`, attributed to the harness, and
+retryable — unlike a cancellation, which is a decision and is not retried.
+
 `task_board.json` and the ledger are the recovery state. Re-running the same
 command resumes: completed tasks are not re-dispatched, stale leases from a
 crashed worker are released, unanswered help requests stay visible, and the

@@ -304,8 +304,45 @@ def test_an_impossible_transition_is_refused_rather_than_silently_accepted(
     control.register("w1")
     control.begin("w1")
     control.complete("w1")
-    with pytest.raises(CoordinationError, match="cannot move from completed to running"):
+    # Completed work is not retryable, and the refusal says so.
+    with pytest.raises(CoordinationError, match="not retryable"):
         control.begin("w1")
+    assert control.record("w1").state is WorkerState.COMPLETED
+
+
+def test_a_failed_or_timed_out_worker_is_requeued_but_a_stopped_one_is_not(
+        control: SwarmControl):
+    for agent_id, terminal in (("failed_01", "fail"), ("slow_01", "timeout")):
+        control.register(agent_id)
+        control.begin(agent_id)
+        getattr(control, terminal)(agent_id, "attempt did not land")
+        assert control.record(agent_id).retryable
+        control.begin(agent_id)
+        assert control.record(agent_id).state is WorkerState.RUNNING
+    # A leader's cancellation is a decision, and re-running would override it.
+    control.register("stopped_01")
+    control.begin("stopped_01")
+    control.request_stop("stopped_01", actor="theory_lead_01", reason="diverted to Lean")
+    assert not control.record("stopped_01").retryable
+    with pytest.raises(CoordinationError, match="not retryable"):
+        control.begin("stopped_01")
+
+
+def test_a_deadline_expiry_is_attributed_to_the_harness_and_retryable(
+        ledger: CommLedger, control: SwarmControl):
+    """A timeout is not a cancellation by anyone, and must be recorded as such."""
+    control.register("slow_01", role="Lean Formalist")
+    control.begin("slow_01", task_id="TASK-0001")
+    record = control.record_timeout("slow_01", "exceeded 240s budget")
+    assert record.state is WorkerState.TIMED_OUT
+    assert record.stop_actor == "swarm_control"
+    assert record.stop_cause == "timeout"
+    assert record.retryable
+    entry = [item for item in ledger.by_action("WORKER_STATE_CHANGE")
+             if item.payload.get("cause") == "deadline_expiry"]
+    assert entry and entry[0].sender["agent_id"] == "swarm_control"
+    assert entry[0].payload["reason"] == "exceeded 240s budget"
+    assert control.begin("slow_01").state is WorkerState.RUNNING
 
 
 def test_every_transition_used_by_the_control_plane_is_declared():

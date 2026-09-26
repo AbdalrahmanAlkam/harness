@@ -215,6 +215,9 @@ class SwarmConfig:
     # A hard wall-clock ceiling for one worker's tool loop. Exceeding it moves
     # the worker to TIMED_OUT rather than letting it bill indefinitely.
     worker_timeout_s: float | None = None
+    # How many runtime-overseer escalations in one attempt before a lead stops the
+    # worker. One flag is normal friction on a hard proof; a repeat is a loop.
+    overseer_stop_threshold: int = 3
     # Reuse the persisted board and ledger from an interrupted run instead of
     # rebuilding the plan and re-running the Director and every lead.
     resume: bool = True
@@ -1189,14 +1192,17 @@ class ResearchSwarm:
 
         Recording only successes would make the audit read like a highlights reel;
         a leader that never acknowledges a failure cannot redirect the next cycle.
+        The review is also where supervisor verdicts turn into decisions.
         """
         lead_id = leader_agent_id(division)
         accepted = bool(summary.get("accepted"))
+        supervision = self._supervise(division, worker_id, task, summary)
         self.bus.send(sender=lead_id, recipient=worker_id, kind=MessageKind.REVIEW,
                       subject=f"{task.task_id} {'accepted' if accepted else 'rejected'}",
                       body=(f"artifact={task.artifact} success={summary.get('success')} "
                             f"tool_calls={summary.get('tool_calls', 0)} "
                             f"stop_reason={summary.get('stop_reason')} "
+                            f"supervision={supervision or 'none'} "
                             f"detail={(summary.get('error') or '')[:200]}"),
                       requires_ack=False)
         self.ledger.append(
@@ -1207,6 +1213,8 @@ class ResearchSwarm:
              "gap": task.gap, "artifact": task.artifact,
              "tool_calls": summary.get("tool_calls", 0),
              "state": summary.get("state"), "stop_reason": summary.get("stop_reason"),
+             "supervision": supervision,
+             "overseer_verdicts": [item.get("state") for item in summary.get("overseer", [])],
              "error": (summary.get("error") or "")[:300]})
 
     def _plan_cycle(self, report: Any) -> list[tuple[Division, str, Task, str]]:
@@ -1296,6 +1304,59 @@ class ResearchSwarm:
                      "cap": self.config.max_workers_per_division})
         return spawned
 
+    def _supervise(self, division: Division, worker_id: str, task: Task,
+                   summary: Mapping[str, Any]) -> str | None:
+        """Act on what the runtime overseer saw, at the swarm level.
+
+        The per-agent ``RuntimeOverseer`` already detects a worker looping, stalling,
+        or drifting outside its assignment, and injects corrective directives. It is
+        myopic by design — it sees one agent — and its verdict previously went only
+        into the trajectory. This is where a verdict becomes an *action*:
+
+        * a request for help goes to the worker's escalation contact and is
+          recorded as unanswered until somebody deals with it;
+        * a worker the overseer caught looping is stopped, with the overseer's
+          verdict as the reason, so its budget stops being spent on nothing.
+
+        Stopping is deliberately conservative: it needs a *repeat* of the same
+        verdict, because one flagged step is a normal part of a difficult proof
+        attempt, not grounds for termination.
+        """
+        verdicts = [item for item in summary.get("overseer", []) if item.get("state")]
+        if not verdicts:
+            return None
+        # Work that landed is not stalling, however many steps it took to get there.
+        if task.state is WorkerState.COMPLETED:
+            return None
+        states = [str(item.get("state")) for item in verdicts]
+        escalated = [state for state in states
+                     if state in ("LOOPING_DETECTED", "PROGRESS_STALLED", "SEMANTIC_DRIFT")]
+        if not escalated:
+            return None
+        repeated = len(escalated) >= self.config.overseer_stop_threshold
+        latest = escalated[-1]
+        if repeated:
+            self.control.request_stop(
+                worker_id, actor=leader_agent_id(division),
+                reason=(f"the runtime overseer flagged {latest} "
+                        f"{len(escalated)} time(s) in this attempt"))
+            self.bus.send(sender=worker_id, recipient=self.bus.contact_for(worker_id),
+                          kind=MessageKind.ESCALATION,
+                          subject=f"{task.task_id} stalled: {latest}",
+                          body=(f"The runtime overseer flagged {latest} "
+                                f"{len(escalated)} time(s). Artifact {task.artifact} "
+                                f"was left unverified. Tool calls: "
+                                f"{summary.get('tool_calls', 0)}."),
+                          requires_ack=True)
+            return "stopped"
+        self.bus.send(sender=worker_id, recipient=self.bus.contact_for(worker_id),
+                      kind=MessageKind.REQUEST_FOR_HELP,
+                      subject=f"{task.task_id} needs help: {latest}",
+                      body=(f"The runtime overseer flagged {latest}. Last directive: "
+                            f"{str(verdicts[-1].get('directive'))[:200]}"),
+                      requires_ack=True)
+        return "asked_for_help"
+
     def _execute_planned(self, planned: Sequence[tuple[Division, str, Task, str]]
                          ) -> list[Mapping[str, Any]]:
         """Run the leased units, at most ``max_parallel_workers`` at a time.
@@ -1325,12 +1386,16 @@ class ResearchSwarm:
     def _execute_one(self, unit: tuple[Division, str, Task, str]) -> Mapping[str, Any]:
         """Dispatch one leased unit to the right kind of work."""
         division, gap, task, worker_id = unit
-        agent = self.agents[worker_id]
-        self.control.begin(worker_id, task_id=task.task_id)
+        try:
+            self.control.begin(worker_id, task_id=task.task_id)
+        except CoordinationError as exc:
+            # The worker was deliberately stopped and must not be silently revived.
+            return {"ran": False, "success": False, "accepted": False,
+                    "state": WorkerState.CANCELLED.value, "error": str(exc), "tool_calls": 0}
         try:
             if division is Division.ADVERSARIAL and gap == Invariant.ADVERSARIAL_CLEARANCE.value:
-                return self._falsify(agent, spawned=[], task=task)
-            return self._produce(division, agent, gap, [], task=task)
+                return self._falsify(agent=self.agents[worker_id], spawned=[], task=task)
+            return self._produce(division, self.agents[worker_id], gap, [], task=task)
         except WorkerCancelled as exc:
             self._close_task(task, worker_id, WorkerState.CANCELLED, reason=str(exc))
             return {"ran": True, "success": False, "accepted": False,
@@ -1485,6 +1550,13 @@ class ResearchSwarm:
             # cancelled worker makes no further tool call; a tool already in flight
             # is allowed to return, and the process group was killed by
             # ``SwarmControl.request_stop`` so it cannot keep burning.
+            if token.expired():
+                # Recorded as a timeout, attributed to the harness, and retryable.
+                # An unattributed self-cancellation would leave the operator unable
+                # to tell a deadline from a decision.
+                budget = f"{token.deadline_s:g}s" if token.deadline_s is not None else "its budget"
+                self.control.record_timeout(agent.agent_id, f"exceeded {budget}")
+                raise WorkerCancelled(agent.agent_id, f"exceeded {budget}", "swarm_control")
             token.raise_if_stopped()
             if self.control.run_stopped:
                 raise WorkerCancelled(agent.agent_id, "the run was stopped",
@@ -1823,6 +1895,13 @@ class ResearchSwarm:
         if self._live_research_mode():
             criterion = task.acceptance if task is not None and task.acceptance \
                 else self._success_criterion(division, target)
+            # A retry must know why the last attempt failed. Without this the worker
+            # re-derives the same mistake, because a fresh agent has no memory of
+            # the run that preceded it.
+            prior = ""
+            if task is not None and task.attempts > 1 and task.note:
+                prior = (f"This is attempt {task.attempts}. The previous attempt at this "
+                         f"exact artifact ended with: {task.note[:400]} Do not repeat it.\n")
             if target.suffix in {".py", ".lean", ".typ"} and not target.is_file():
                 receipts = ""
                 if target.suffix == ".typ":
@@ -1848,6 +1927,7 @@ class ResearchSwarm:
                                        "Inspect existing files in your target area and continue "
                                        "from prior workers' results instead of repeating completed work. "
                                        f"Your directive: {agent.directive} "
+                                       + prior
                                        + (f"Claim: {prop.statement}. Hypotheses: "
                                           f"{'; '.join(prop.hypotheses)}. " if prop else "")
                                        + (f"The exact Lean proposition is: {prop.lean_statement}. "
@@ -1911,11 +1991,21 @@ class ResearchSwarm:
         if task is None:
             return result
         if cancelled or result.get("cancelled"):
-            self.control.settle_worker(agent.agent_id, WorkerState.CANCELLED,
-                                       reason=str(result.get("error") or "cancelled"))
-            self._close_task(task, agent.agent_id, WorkerState.CANCELLED,
-                             reason=str(result.get("error") or "cancelled"))
-            result.update({"accepted": False, "state": WorkerState.CANCELLED.value})
+            record = self.control.record(agent.agent_id)
+            timed_out = record is not None and record.state is WorkerState.TIMED_OUT
+            if timed_out:
+                # A deadline expiry is not a failure of the work; the attempt goes
+                # back on the board so a later cycle can try again.
+                self._close_task(task, agent.agent_id, WorkerState.FAILED,
+                                 reason=str(result.get("error") or "timed out; retryable"))
+            else:
+                self.control.settle_worker(agent.agent_id, WorkerState.CANCELLED,
+                                           reason=str(result.get("error") or "cancelled"))
+                self._close_task(task, agent.agent_id, WorkerState.CANCELLED,
+                                 reason=str(result.get("error") or "cancelled"))
+            result.update({"accepted": False,
+                           "state": WorkerState.TIMED_OUT.value if timed_out
+                           else WorkerState.CANCELLED.value})
             return result
         artifact = self._relpath(target) if target is not None else Path(task.artifact)
         evidence = self._artifact_evidence(artifact)

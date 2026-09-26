@@ -675,6 +675,9 @@ def research(
                                          help="Worker tool loops a division may run at once; 1 is serial"),
     worker_timeout: Optional[float] = typer.Option(None, "--worker-timeout",
                                                   help="Seconds a single worker tool loop may run before TIMED_OUT"),
+    overseer_stop: int = typer.Option(3, "--overseer-stop", min=1,
+                                      help="Runtime-overseer escalations in one attempt before a lead "
+                                           "stops the worker; 1 is aggressive, higher is patient"),
     resume: bool = typer.Option(True, "--resume/--no-resume",
                                 help="Recover the persisted task board and ledger from an interrupted run"),
     provider: str = typer.Option("openrouter", "--provider",
@@ -716,6 +719,7 @@ def research(
                          absolute_ceiling=absolute_ceiling, worker_max_steps=worker_steps,
                          max_parallel_workers=parallel_workers,
                          worker_timeout_s=worker_timeout, resume=resume,
+                         overseer_stop_threshold=overseer_stop,
                          seed=seed,
                          llm_client_factory=client_factory,
                          claim=claim,
