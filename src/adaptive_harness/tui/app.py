@@ -1015,7 +1015,7 @@ class AdaptiveHarnessApp(App):
 
         # Launch agent execution in non-blocking worker thread
         self._busy = True
-        self._activity = "Classifying task"
+        self._activity = "Analyzing request"
         self._last_agent_content = ""
         self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(memory_resolution=False)
         self._refresh_status()
@@ -1435,6 +1435,17 @@ class AdaptiveHarnessApp(App):
 
     def _swarm_status_changed(self, status: dict[str, str]) -> None:
         self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(swarm_status=status)
+        if status.get("coder:implement") == "running":
+            self._activity = "Working · coder implementing"
+        elif any(status.get(key) == "running" for key in ("qa:verify", "security:verify")):
+            self._activity = "Verifying · swarm review"
+        elif status.get("architect:plan") == "running":
+            self._activity = "Planning · architect"
+        elif all(value in {"done", "failed", "skipped"} for value in status.values()):
+            self._activity = "Finishing swarm task"
+        else:
+            self._activity = "Preparing swarm"
+        self._refresh_status()
 
     def _subagent_event(self, event) -> None:
         """Render subagent activity into the main log so it is never invisible."""
@@ -1461,6 +1472,8 @@ class AdaptiveHarnessApp(App):
                            style="dim cyan"))
 
     def _prepare_swarm_telemetry(self, task_text: str) -> None:
+        self._activity = "Preparing swarm"
+        self._refresh_status()
         classification = self.agent.skill_classifier.classify(task_text)
         probabilities = classification.probabilities
         entropy = -sum(value * math.log2(value) for value in probabilities.values() if value > 0)
@@ -1611,8 +1624,9 @@ class AdaptiveHarnessApp(App):
                 stage = p["stage"]
                 self._activity = {
                     "thinking": f"Thinking · step {p['step']} · {p.get('thinking_tokens', 0):,} budget tokens",
-                    "generating": f"Generating response · step {p['step']}",
-                    "tool_running": f"Running {p.get('tool', '')}",
+                    "model_processing": f"Processing with model · step {p['step']}",
+                    "generating": f"Writing response · step {p['step']}",
+                    "tool_running": f"Working · {p.get('tool', '')}",
                     "verifying": f"Verifying {p.get('tool', '')}",
                 }.get(stage, stage)
                 self._refresh_status()
@@ -1676,6 +1690,7 @@ class AdaptiveHarnessApp(App):
                 )
         elif et == "domain_mode":
                 telemetry.update_telemetry(domain_mode=p["mode"], domain_selection=p.get("selection", "auto"))
+                self._activity = "Preparing model and tools"
                 self._refresh_status()
         elif et == "thinking_budget":
                 telemetry.update_telemetry(thinking_level=p["level"], thinking_tokens=p["tokens"],
@@ -1700,7 +1715,7 @@ class AdaptiveHarnessApp(App):
         elif et == "classifier_fallback":
                 telemetry.update_telemetry(classifier_engine=p["backend"], classifier_model=p["model"])
         elif et == "clarification_needed":
-                self._activity = "Waiting for your choice"
+                self._activity = "Waiting for clarification"
                 self._refresh_status()
                 log.write(Text(f"Clarification needed: {p.get('reason') or p['question']}", style="yellow"))
         elif et == "clarification_answered":

@@ -589,7 +589,7 @@ class DeveloperAgent:
             request_messages, context_info = prepare_context(self._request_messages(), selected_model,
                 tool_schemas, provider=getattr(self.llm_client, "provider", "openrouter"), limit=context_limit)
             yield AgentEvent("context_status", context_info)
-            yield AgentEvent("agent_stage", {"stage": "thinking" if thinking_res.budget_tokens else "generating",
+            yield AgentEvent("agent_stage", {"stage": "thinking" if thinking_res.budget_tokens else "model_processing",
                                              "step": step, "model": selected_model,
                                              "thinking_tokens": thinking_res.budget_tokens})
             try:

@@ -344,7 +344,7 @@ def dev(
             console.print(f"  [yellow]Thinking:[/yellow] {p['level'].upper()} ({p['tokens']:,} token budget, {p['selection']})")
         elif et == "agent_stage":
             stage = p["stage"]
-            label = {"thinking": "Thinking", "generating": "Generating",
+            label = {"thinking": "Thinking", "model_processing": "Processing with model", "generating": "Generating",
                      "tool_running": f"Running {p.get('tool', '')}",
                      "verifying": f"Verifying {p.get('tool', '')}"}.get(stage, stage)
             console.print(f"  [dim]◦ {escape(label)}[/dim]")

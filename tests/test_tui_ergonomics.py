@@ -153,8 +153,24 @@ async def test_activity_and_safety_controls(tmp_path: Path):
             "agent_stage", {"stage": "thinking", "step": 1, "model": "test", "thinking_tokens": 1000}))
         assert "Thinking" in app._activity and "1,000 budget tokens" in app._activity
         app._render_event(AgentEvent(
+            "agent_stage", {"stage": "model_processing", "step": 1, "model": "test"}))
+        assert app._activity == "Processing with model · step 1"
+        app._render_event(AgentEvent(
             "agent_stage", {"stage": "tool_running", "step": 1, "tool": "run_bash"}))
-        assert "Running run_bash" in app._activity
+        assert app._activity == "Working · run_bash"
+        app._render_event(AgentEvent("clarification_needed", {"question": "Choose a path", "reason": "Needed"}))
+        assert app._activity == "Waiting for clarification"
+        app._render_event(AgentEvent("clarification_answered", {"answer": "Proceed"}))
+        assert app._activity == "Resuming task"
+        app._swarm_status_changed({"architect:plan": "running", "coder:implement": "queued",
+                                   "qa:verify": "queued", "security:verify": "queued"})
+        assert app._activity == "Planning · architect"
+        app._swarm_status_changed({"architect:plan": "done", "coder:implement": "running",
+                                   "qa:verify": "queued", "security:verify": "queued"})
+        assert app._activity == "Working · coder implementing"
+        app._swarm_status_changed({"architect:plan": "done", "coder:implement": "done",
+                                   "qa:verify": "running", "security:verify": "running"})
+        assert app._activity == "Verifying · swarm review"
         app._handle_slash_command("/safety cautious")
         assert app.agent.safety_profile == "cautious"
         assert app.session.settings["safety"] == "cautious"
