@@ -35,9 +35,9 @@ class Invariant(str, Enum):
     MATHEMATICAL_SOUNDNESS = "mathematical_soundness"
     EMPIRICAL_REPLICATION = "empirical_replication"
     ADVERSARIAL_CLEARANCE = "adversarial_clearance"
-    DOCUMENT_INTEGRITY = "document_integrity"
     CLAIM_ADJUDICATION = "claim_adjudication"
     LEAN_FORMAL_SOUNDNESS = "lean_formal_soundness"
+    DOCUMENT_INTEGRITY = "document_integrity"
 
 
 class StopReason(str, Enum):

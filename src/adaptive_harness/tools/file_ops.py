@@ -6,7 +6,7 @@ import ast
 import difflib
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from adaptive_harness.tools.base import Tool, ToolResult, workspace_path
 
@@ -106,14 +106,20 @@ class WriteFileTool(Tool):
         "required": ["path", "content"],
     }
 
-    def __init__(self, workspace_root: Optional[Path | str] = None):
+    def __init__(self, workspace_root: Optional[Path | str] = None,
+                 allowed_paths: Optional[Sequence[Path | str]] = None):
         self.workspace_root = Path(workspace_root or os.getcwd()).resolve()
+        self.allowed_paths = ({workspace_path(self.workspace_root, str(path))
+                               for path in allowed_paths} if allowed_paths is not None else None)
 
     def execute(self, path: str, content: str, **kwargs: Any) -> ToolResult:
         try:
             file_path = workspace_path(self.workspace_root, path)
         except ValueError as exc:
             return ToolResult(success=False, output="", error=str(exc))
+        if self.allowed_paths is not None and file_path not in self.allowed_paths:
+            return ToolResult(success=False, output="",
+                              error="Write is restricted to the assigned target file")
         syntax_error = _python_syntax_error(file_path, content)
         if syntax_error:
             return ToolResult(success=False, output="", error=syntax_error)

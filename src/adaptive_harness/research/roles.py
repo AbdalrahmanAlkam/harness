@@ -55,7 +55,8 @@ DIVISION_SPECS: Mapping[Division, DivisionSpec] = {
         "Convert the objective into exact, self-contained derivations whose scripts "
         "execute to exit code 0 with no floating-point approximation.",
         ("SymPy Prover", "Lean Formalist", "Lemma Hunter", "Bound Analyst"),
-        ("read_file", "write_file", "edit_file", "run_bash", "run_python_repl", "calculate")),
+        ("read_file", "write_file", "edit_file", "run_bash", "run_python_repl",
+         "run_lean_proof", "calculate")),
     Division.EMPIRICAL: DivisionSpec(
         Division.EMPIRICAL, "Empirical Lead",
         "Reproduce every theoretical prediction under a pinned seed and report the "
@@ -75,7 +76,8 @@ DIVISION_SPECS: Mapping[Division, DivisionSpec] = {
         "Formalise each proposition in Lean 4 and have the kernel machine-check it, so the "
         "published claim rests on a verified derivation and not only on symbolic computation.",
         ("Lean Formalist", "Tactic Specialist", "Axiom Auditor"),
-        ("read_file", "write_file", "edit_file", "run_bash", "run_lean_proof")),
+        ("read_file", "write_file", "edit_file", "run_python_repl", "run_bash",
+         "run_lean_proof")),
 }
 
 # Tool sets for the interactive subagent loop, per division. These differ from the
@@ -83,13 +85,15 @@ DIVISION_SPECS: Mapping[Division, DivisionSpec] = {
 # the instruments of its methodology, and the theorist additionally needs the Lean
 # prover so a formal proof can be machine-checked mid-iteration.
 WORKER_TOOLS: Mapping[Division, tuple[str, ...]] = {
-    Division.LITERATURE: ("read_file", "search_files", "list_directory", "write_file"),
+    Division.LITERATURE: ("read_file", "search_files", "list_directory", "write_file",
+                          "run_bash", "web_search", "compile_typst"),
     Division.THEORY: ("read_file", "write_file", "edit_file", "run_python_repl",
                       "run_bash", "run_lean_proof"),
     Division.EMPIRICAL: ("read_file", "write_file", "edit_file", "run_python_repl", "run_bash"),
-    Division.ADVERSARIAL: ("search_files", "read_file", "run_python_repl", "run_bash",
-                           "run_lean_proof"),
-    Division.FORMAL: ("read_file", "write_file", "edit_file", "run_bash", "run_lean_proof"),
+    Division.ADVERSARIAL: ("search_files", "read_file", "write_file", "edit_file",
+                           "run_python_repl", "run_bash", "run_lean_proof"),
+    Division.FORMAL: ("read_file", "write_file", "edit_file", "run_python_repl",
+                      "run_bash", "run_lean_proof"),
 }
 
 # A falsification attempt must return this shape. Prose alone is ambiguous: read

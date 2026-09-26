@@ -5,13 +5,27 @@ work in this push; earlier history is summarized in `git log`.
 
 ## [Unreleased]
 
+### Changed
+- Standalone `research` now uses separate live OpenRouter agents by default;
+  `--offline-legacy` preserves the earlier deterministic demonstration.
+  The live Director writes a claim manifest and explicit objective, division
+  leads write assignments, and workers iterate with file, shell, Lean, and
+  Typst tools. All research roles use `stealth/space-bunny-alpha`.
+- Live mathematical claims require a natural-language derivation and a
+  corresponding certified Lean file whose theorem states the Director's declared formal target. Live simulations require fresh raw CSV
+  data and explicit 95% prediction records. Lean receipts are written beside
+  each source and their hashes are linked into the communication ledger.
+- Live workers use a short write-first pass before iterative verification.
+  An unfinished run produces a labelled UNSOLVED progress PDF if no paper was
+  authored, preserving the objective and receipt trail without claiming proof.
+
 ### Added
 - **Autonomous hierarchical research swarm** (`adaptive-harness research "<topic>"`,
   `src/adaptive_harness/research/`). An Executive Director owns the objective and
-  the Relentless Convergence Loop; four Division Leaders (Literature, Theory,
-  Empirical, Adversarial) each spawn an unbounded worker pool on demand via
+  the Relentless Convergence Loop; five Division Leaders (Literature, Theory, Formal,
+  Empirical, Adversarial) each spawn a configurable worker pool on demand via
   `spawn_subagent(parent_id, role_name, directive, allowed_tools, budget_tokens)`.
-  A topic is reported `SOLVED` only when all four invariants hold simultaneously:
+  A topic is reported `SOLVED` only when all six invariants hold simultaneously:
   exact proofs exiting 0, seeded replications inside a 95% interval, red-team
   clearance, and a warning-free `paper.typ` → `paper.pdf` build.
 - **Proof receipts with mechanical exactness enforcement.** Every script in
@@ -37,8 +51,8 @@ work in this push; earlier history is summarized in `git log`.
   then the `typst` Python wrapper, then reported as unavailable. Compilation
   treats *any* Typst diagnostic as a build break, because a paper with an
   unresolved reference or a bad figure path is a defect, not a warning.
-  `paper.typ` is generated from receipts, so nothing can be typeset that was not
-  proven or measured.
+  The legacy paper builder renders from receipts; the live Typst Author must
+  cite every verified receipt tag, and the gate rejects missing tags or warnings.
 - **Deterministic vector figures** (`research/figures.py`) rendered as SVG, so
   the same receipts always yield byte-identical figures.
 - **Research division prompts** (`research.division.*`, `research.director`) in

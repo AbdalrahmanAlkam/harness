@@ -22,7 +22,7 @@ import textwrap
 from typing import Any, Callable, Mapping, Sequence
 
 from adaptive_harness.research.claim import (EXIT_COUNTEREXAMPLE, EXIT_HOLDS, ClaimLedger,
-                                              ParsedClaim, TopicPlan, Verdict, parse_claim)
+                                              ParsedClaim, Proposition, TopicPlan, Verdict, parse_claim)
 from adaptive_harness.research.experiment import ExperimentRunner, canonical_key
 from adaptive_harness.research.gate import (ConvergenceOutcome, Invariant, InvariantGate,
                                             RelentlessConvergenceLoop, StopReason,
@@ -162,13 +162,10 @@ class ResearchWorkspace:
 class SwarmConfig:
     """Operator-controlled limits for one research run.
 
-    ``author`` is ``None`` by default, which selects **mechanical mode**: the
-    Director still runs the full convergence loop, still recruits workers, and
-    still adjudicates every receipt, but no language model is called. All
-    verification is local and deterministic (SymPy, NumPy, Typst), so a run in
-    this mode makes zero network requests and costs nothing. Pass an authoring
-    callback to add a live model on top; that is the only thing that turns
-    network traffic on.
+    CLI research supplies ``llm_client_factory`` by default. Direct Python
+    callers that omit it retain the explicit offline compatibility path; this
+    path uses the historical fixed-topic derivation library and is never used
+    by the live API-driven swarm.
     """
 
     max_cycles: int | None = None
@@ -180,9 +177,8 @@ class SwarmConfig:
     experiment_timeout_s: float = 300.0
     seed: int = 20260926
     author: Callable[[Division, str, str], str] | None = None
-    # A factory for real per-worker LLM clients. When set, research workers run
-    # as multi-step tool-using subagents instead of one-shot completions; when
-    # absent the mechanical kernel remains the path and no model is called.
+    # A factory for independent per-agent LLM clients. Live runs never invoke
+    # fixed-topic synthesis or formalisation templates.
     llm_client_factory: Callable[[], Any] | None = None
     worker_max_steps: int | None = 24
     step_policy: str = "classifier"
@@ -256,16 +252,28 @@ class ResearchSwarm:
         self.workspace = ResearchWorkspace(Path(root).resolve() / self.slug)
         self.ledger = CommLedger(self.workspace.ledger_path, parent_id=None)
         self.proofs = ProofRunner(self.workspace.proof_dir, timeout_s=self.config.proof_timeout_s)
+        self._legacy_formulation = False
+        if self.config.llm_client_factory is not None:
+            try:
+                probe = self.config.llm_client_factory()
+                self._legacy_formulation = bool(getattr(probe, "is_mock", False) and
+                                                hasattr(probe, "payload"))
+            except Exception:
+                pass
         self.experiments = ExperimentRunner(self.workspace.experiment_dir,
-                                            timeout_s=self.config.experiment_timeout_s)
+                                            timeout_s=self.config.experiment_timeout_s,
+                                            require_predictions=self._live_research_mode())
         self.agents: dict[str, ResearchAgent] = {}
         self.spawned_total = 0
         self._counters: dict[Division, int] = {division: 0 for division in Division}
         self._compile_result: Any = None
         self._paper_digest: str | None = None
         self._recorded: set[tuple] = set()
+        self._objection_artifacts: dict[str, str] = {}
+        self._clearance_artifacts: dict[str, str] = {}
         self._last_report: Any = None
         self._last_outcome: ConvergenceOutcome | None = None
+        self._status_callback: Callable[[str], None] | None = None
         self.plan: TopicPlan = self._make_plan()
         self.claims: ClaimLedger = ClaimLedger()
         self.experiment_plan_notes: str = ""
@@ -284,6 +292,9 @@ class ResearchSwarm:
         claims become kernel-checked propositions; only the *claim* comes from the
         model, never the deciding script.
         """
+        if self._live_research_mode():
+            return TopicPlan(self.topic, strategy="llm-authored",
+                             notes="The Director and workers must author every claim and script.")
         from adaptive_harness.research.synthesis import plan_research
         claim: ParsedClaim | None = None
         if self.config.claim:
@@ -503,6 +514,8 @@ class ResearchSwarm:
 
     def _evaluate_claim(self) -> tuple[bool, str, tuple[str, ...]]:
         """The headline verdict must actually be decided, not merely attempted."""
+        if self._live_research_mode() and not self.workspace.objective_spec.is_file():
+            return False, "Director has not written 00_objective_spec.md", ()
         ledger = self.claims if self.claims.adjudications else self._adjudicate()
         if not ledger.adjudications:
             return False, ("no proposition was derived, so the claim was not tested; "
@@ -565,12 +578,15 @@ class ResearchSwarm:
         self.lean_gate.receipts = self.lean_gate.verify_all()
         self.lean_gate.to_index(self.workspace.root / "lean_receipts.json")
         for receipt in self.lean_gate.receipts:
+            sidecar = Path(receipt.path).with_name(Path(receipt.path).name + ".receipt.json")
+            receipt_hash = sha256_file(sidecar) if sidecar.is_file() else None
             if receipt.certified:
                 self.ledger.append(
                     "LEAN_PROOF_VERIFIED", {"agent_id": "lean_kernel", "role": "Lean Kernel"},
                     {"agent_id": leader_agent_id(Division.FORMAL), "role": "Formal Proof Lead"},
                     {"proof_id": receipt.proof_id, "name": receipt.name,
                      "status": receipt.status, "hash": receipt.sha256,
+                     "receipt_hash": receipt_hash,
                      "theorems": list(receipt.theorems), "axioms": list(receipt.axioms),
                      "lean_version": receipt.lean_version, "verified_at": receipt.verified_at})
             else:
@@ -578,10 +594,15 @@ class ResearchSwarm:
                     "LEAN_PROOF_REJECTED", {"agent_id": "lean_kernel", "role": "Lean Kernel"},
                     {"agent_id": leader_agent_id(Division.FORMAL), "role": "Formal Proof Lead"},
                     {"proof_id": receipt.proof_id, "name": receipt.name,
-                     "status": receipt.status, "errors": list(receipt.errors[:3])})
+                     "status": receipt.status, "receipt_hash": receipt_hash,
+                     "errors": list(receipt.errors[:3])})
 
         certified = [item for item in self.lean_gate.receipts if item.certified]
         checked = f"{len(certified)} of {len(self.lean_gate.receipts)} Lean file(s) certified"
+        failed = [item for item in self.lean_gate.receipts if not item.certified]
+        if failed:
+            return False, (f"{checked}; invalid formal file(s): "
+                           + ", ".join(item.name for item in failed)), ()
         verdict = self.claims.headline
         if verdict is Verdict.DISPROVEN:
             witness = self.claims.disproven[0].finding if self.claims.disproven else ""
@@ -590,12 +611,39 @@ class ResearchSwarm:
         if verdict is not Verdict.PROVEN:
             return True, (f"no theorem is published at verdict {verdict.value}, so the formal tier "
                           f"is not applicable. {checked}"), ()
+        if self._live_research_mode():
+            certified_names = {item.name.lower() for item in certified}
+            missing = [item.prop_id for item in self.claims.proven
+                       if item.prop_id.lower() not in certified_names]
+            if missing:
+                return False, ("no certified Lean file for claim(s): "
+                               + ", ".join(missing)), ()
+            from adaptive_harness.tools.lean import strip_lean_comments
+            for claim in self.claims.proven:
+                proposition = next((item for item in self.plan.propositions
+                                    if item.prop_id == claim.prop_id), None)
+                formal = proposition.lean_statement.strip() if proposition else ""
+                if not formal:
+                    return False, f"claim {claim.prop_id} has no declared Lean statement", ()
+                header = re.match(r"^(?:theorem|lemma|corollary)\s+\S+\s*:\s*(.+)$",
+                                  formal, flags=re.S)
+                if header:
+                    formal = header.group(1).strip()
+                    formal = formal.split(":=", 1)[0].strip()
+                source = (self.workspace.lean_dir / f"{claim.prop_id.lower()}.lean").read_text(
+                    encoding="utf-8", errors="replace")
+                normalized_source = " ".join(strip_lean_comments(source).split())
+                normalized_formal = " ".join(formal.split())
+                if f": {normalized_formal} :=" not in normalized_source:
+                    return False, (f"the certified Lean file for {claim.prop_id} does not "
+                                   "assert the Director's declared formal statement"), ()
         ok, detail, evidence = self.lean_gate.clearance()
         return ok, detail, evidence
 
     def _evaluate_proofs(self) -> tuple[bool, str, tuple[str, ...]]:
         scripts = self.proofs.scripts()
         if not scripts:
+            self._adjudicate()
             return False, "no proof script exists yet; the claim is unsubstantiated", ()
         receipts = self.proofs.run_all()
         evidence: list[str] = []
@@ -613,6 +661,17 @@ class ResearchSwarm:
             else:
                 failed.append(f"{receipt.theorem_id} {receipt.status}")
         self.proofs.receipts = receipts
+        # Worker edits can change the verdict between convergence cycles.
+        # Re-adjudicate after every proof pass so later gate evaluators see the
+        # current script hashes, rather than the first cycle's cached claim.
+        self._adjudicate()
+        if self._live_research_mode():
+            missing_explanations = [
+                item.prop_id for item in self.claims.proven
+                if not (self.workspace.proof_dir / f"{item.prop_id.lower()}.md").is_file()]
+            if missing_explanations:
+                failed.append("missing natural-language proof: "
+                              + ", ".join(missing_explanations))
         if failed:
             return False, f"{len(failed)} derivation(s) reached no verdict: {'; '.join(failed)}", tuple(evidence)
         return True, f"all {len(receipts)} derivation(s) reached a clean verdict", tuple(evidence)
@@ -656,6 +715,17 @@ class ResearchSwarm:
         """
         if not self.proofs.scripts():
             return False, "no claim exists to falsify; clearance would be vacuous", ()
+        if self._live_research_mode():
+            current = self._artifact_fingerprint()
+            for decisions in (self._objection_artifacts, self._clearance_artifacts):
+                for agent_id, digest in list(decisions.items()):
+                    if digest != current and agent_id in self.agents:
+                        self.agents[agent_id].clearance = Clearance.PENDING
+                        del decisions[agent_id]
+                        self.ledger.append(
+                            "STATUS_REPORT", {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
+                            {"agent_id": agent_id, "role": "Adversarial Worker"},
+                            {"status": "reassess_after_artifact_change", "artifact_fingerprint": current})
         counterexamples = [agent.agent_id for agent in self.agents.values()
                            if agent.clearance is Clearance.COUNTEREXAMPLE]
         if counterexamples:
@@ -686,6 +756,18 @@ class ResearchSwarm:
         return True, (f"{len(cleared)} red-team worker(s) cleared {len(self.proofs.scripts())} "
                       f"proved claim(s); audit log written"), tuple(cleared)
 
+    def _artifact_fingerprint(self) -> str:
+        """Bind an adversarial objection to the exact artifacts it examined."""
+        import hashlib
+        paths = [self.workspace.root / "claim_manifest.json"]
+        for directory in (self.workspace.proof_dir, self.workspace.lean_dir,
+                          self.workspace.experiment_dir):
+            paths.extend(sorted(directory.glob("*.py")))
+            paths.extend(sorted(directory.glob("*.lean")))
+        evidence = [(str(path.relative_to(self.workspace.root)), sha256_file(path))
+                    for path in paths if path.is_file()]
+        return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
+
     def _evaluate_document(self) -> tuple[bool, str, tuple[str, ...]]:
         """Render the paper from current receipts, then build it warning-free.
 
@@ -693,6 +775,16 @@ class ResearchSwarm:
         source actually changes, because document integrity is re-checked on
         every cycle while its inputs move far more slowly than that.
         """
+        if self._live_research_mode():
+            required = self._write_receipt_manifest()
+            if not self.workspace.paper_typ.is_file():
+                return False, "the Typst Author has not written paper.typ", ()
+            source = self.workspace.paper_typ.read_text(encoding="utf-8", errors="replace")
+            absent = [tag for tag in required if tag not in source]
+            if absent:
+                return False, f"paper.typ omits verified receipt tags: {', '.join(absent)}", ()
+            result = self._compile()
+            return self._document_verdict(result)
         builder = PaperBuilder(self.workspace.root, typst_root=self.config.typst_root,
                                allow_install_typst=self.config.auto_install_typst)
         try:
@@ -712,6 +804,38 @@ class ResearchSwarm:
             detail = result.error if result else "Typst could not be resolved"
             return False, f"paper.pdf did not build cleanly: {detail}", ()
         return True, f"paper.pdf built cleanly ({result.size_bytes} bytes, {result.typst_version})", ()
+
+    def _write_receipt_manifest(self) -> tuple[str, ...]:
+        """Give the Typst Author an exact list of citable, verified artifacts."""
+        entries: list[dict[str, str]] = []
+        for index, receipt in enumerate(self.proofs.receipts, 1):
+            if receipt.verified:
+                entries.append({"tag": f"[PROOF-{index:03d}]", "path": receipt.script,
+                                "hash": receipt.sha256})
+        for index, receipt in enumerate(self.lean_gate.receipts, 1):
+            if receipt.certified:
+                entries.append({"tag": f"[LEAN-{index:03d}]", "path": receipt.path,
+                                "hash": receipt.sha256})
+        for index, receipt in enumerate(self.experiments.receipts, 1):
+            if receipt.replicated:
+                entries.append({"tag": f"[EXP-{index:03d}]", "path": receipt.script,
+                                "hash": canonical_key(receipt.data_hashes)})
+        for index, record in enumerate(self.workspace.evidence_records(), 1):
+            key = ("evidence", canonical_key(record))
+            if key not in self._recorded:
+                self._recorded.add(key)
+                self.ledger.append("EVIDENCE_RECORDED",
+                                   {"agent_id": leader_agent_id(Division.LITERATURE),
+                                    "role": "Literature Lead"},
+                                   {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
+                                   {"evidence_id": record.get("id", f"EVID-{index:03d}"),
+                                    "source": record.get("source", ""),
+                                    "claim": record.get("claim", "")})
+            entries.append({"tag": f"[EVID-{index:03d}]", "path": str(record.get("source", "")),
+                            "hash": canonical_key(record)})
+        target = self.workspace.root / "receipt_manifest.json"
+        target.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
+        return tuple(item["tag"] for item in entries)
 
     def _lean_sources(self) -> dict[str, str]:
         """Read the formal sources for the paper's reproducibility appendix."""
@@ -742,7 +866,7 @@ class ResearchSwarm:
             outcome=self._last_outcome,
             ledger=self.ledger,
             figures=tuple(path.name for path in sorted(self.workspace.figure_dir.glob("*.svg"))),
-            lean_receipts=tuple(certified),
+            lean_receipts=tuple(receipts),
             lean_sources=self._lean_sources() if certified else None,
             lean_version=self.lean_gate.lean_version,
             mathlib_available=bool(certified) and self.lean_gate._mathlib_available())
@@ -817,8 +941,13 @@ class ResearchSwarm:
         """One research cycle: recruit workers, author artifacts, re-verify."""
         spawned: list[str] = []
         gaps = [status.invariant.value for status in report.gaps]
+        handled: set[Division] = set()
         for gap in gaps:
             division = GAP_ROUTING.get(gap, Division.THEORY)
+            if self._live_research_mode() and division in handled:
+                continue
+            handled.add(division)
+            self._current_cycle_index = index
             spec = DIVISION_SPECS[division]
             live = [agent for agent in self.agents.values()
                     if agent.division is division and not agent.is_leader]
@@ -827,6 +956,8 @@ class ResearchSwarm:
             target = min(budget, self.config.max_workers_per_division)
             if len(live) < target:
                 spawned.extend(self.scale_division(division, target))
+                live = [agent for agent in self.agents.values()
+                        if agent.division is division and not agent.is_leader]
             for agent in live[:target]:
                 if division is Division.ADVERSARIAL and gap == Invariant.ADVERSARIAL_CLEARANCE.value:
                     self._falsify(agent, spawned)
@@ -843,8 +974,14 @@ class ResearchSwarm:
         """Whether a real tool-using subagent can be launched for this run."""
         return self.config.llm_client_factory is not None
 
+    def _live_research_mode(self) -> bool:
+        """Use the live pipeline, except for the historical formulation fixture."""
+        return self._interactive_capable() and not self._legacy_formulation
+
     def _run_worker(self, agent: ResearchAgent, division: Division, directive: str,
-                    *, success_criterion: str, target: Path) -> dict[str, Any]:
+                    *, success_criterion: str, target: Path,
+                    tool_names_override: tuple[str, ...] | None = None,
+                    max_steps_override: int | None = None) -> dict[str, Any]:
         """Run one worker as a multi-step, tool-using subagent.
 
         This replaces a single-shot text completion. The worker is a real agent
@@ -858,12 +995,28 @@ class ResearchSwarm:
         """
         from adaptive_harness.agent.swarm import (DeveloperAgentWorker, SwarmAssignment,
                                                    SwarmPhase, SwarmRole, run_assignment)
+        from adaptive_harness.data.storage import ExperienceRepository
         from adaptive_harness.research.roles import WORKER_TOOLS
 
         if not self._interactive_capable():
             return {"ran": False, "reason": "no live model configured"}
 
-        tool_names = WORKER_TOOLS.get(division, ("read_file", "write_file", "edit_file", "run_bash"))
+        def role_client_factory() -> Any:
+            client = self.config.llm_client_factory()
+            client.default_model = "stealth/space-bunny-alpha"
+            return client
+
+        if tool_names_override is not None:
+            tool_names = tool_names_override
+        elif agent.agent_id == DIRECTOR_ID:
+            tool_names = agent.allowed_tools
+        elif agent.is_leader:
+            tool_names = (("read_file", "write_file", "web_search")
+                          if division is Division.LITERATURE else
+                          ("read_file", "write_file"))
+        else:
+            tool_names = WORKER_TOOLS.get(
+                division, ("read_file", "write_file", "edit_file", "run_bash"))
         trajectory: list[dict[str, Any]] = []
         outcome: dict[str, Any] = {}
 
@@ -873,25 +1026,40 @@ class ResearchSwarm:
             if kind == "tool_call":
                 trajectory.append({"tool": payload.get("name"),
                                    "args": _summarize_args(payload.get("arguments"))})
+                if self._status_callback is not None:
+                    self._status_callback(f"{agent.role_name}: calling {payload.get('name')}")
             elif kind == "tool_result":
                 if trajectory:
                     trajectory[-1]["ok"] = bool(payload.get("success"))
                     error = payload.get("error")
                     if error:
                         trajectory[-1]["error"] = str(error)[:300]
+                if self._status_callback is not None:
+                    self._status_callback(f"{agent.role_name}: {payload.get('name')} "
+                                          f"{'passed' if payload.get('success') else 'failed'}")
             elif kind == "response":
                 outcome.update({"summary": str(payload.get("content", ""))[:4000],
                                 "stop_reason": payload.get("stop_reason"),
                                 "success": bool(payload.get("success"))})
 
         worker = DeveloperAgentWorker(
-            llm_client_factory=self.config.llm_client_factory,
-            max_steps=self.config.worker_max_steps,
+            llm_client_factory=role_client_factory,
+            repository=ExperienceRepository(self.workspace.root / "experience.db"),
+            max_steps=(max_steps_override if max_steps_override is not None else
+                       4 if agent.agent_id == DIRECTOR_ID or agent.is_leader
+                       else self.config.worker_max_steps),
             step_policy=self.config.step_policy,
             safety_profile=self.config.safety_profile,
             tool_names=tool_names,
             forced_mode="coding" if "write_file" in tool_names else "research",
-            system_prompt=self._worker_prompt(division, success_criterion, target),
+            forced_thinking=("medium" if agent.agent_id == DIRECTOR_ID or agent.is_leader else
+                             "max" if division in (Division.THEORY, Division.FORMAL) else
+                             "medium" if division in (Division.EMPIRICAL, Division.ADVERSARIAL)
+                             or agent.role_name == "Typst Author" else "low"),
+            enable_skill_routing=not (agent.agent_id == DIRECTOR_ID or agent.is_leader),
+            write_target=(target if agent.is_leader or tool_names_override == ("write_file",)
+                          else None),
+            system_prompt=self._worker_prompt(agent, division, success_criterion, target),
             on_event=on_event)
         assignment = SwarmAssignment(SwarmRole.CODER, SwarmPhase.IMPLEMENT, directive,
                                      self.workspace.root)
@@ -916,14 +1084,16 @@ class ResearchSwarm:
         self._log_trajectory(agent, division, summary)
         return summary
 
-    def _worker_prompt(self, division: Division, success_criterion: str, target: Path) -> str:
+    def _worker_prompt(self, agent: ResearchAgent, division: Division,
+                       success_criterion: str, target: Path) -> str:
         """The worker's operating instructions, including its success test."""
         try:
             relative = target.relative_to(self.workspace.root)
         except ValueError:
             relative = target
         return (
-            f"You are a research worker in the {DIVISION_SPECS[division].leader_title}'s division. "
+            f"You are {agent.role_name}, an independent LLM research agent in the "
+            f"{DIVISION_SPECS[division].leader_title}'s division. "
             f"{DIVISION_SPECS[division].objective}\n"
             f"Write your artifact to {relative}. "
             f"{success_criterion} "
@@ -931,7 +1101,10 @@ class ResearchSwarm:
             "error or diagnostic, and revise until it passes. Do not report success you have not "
             "observed from a tool result. A proof script must contain no floating-point literal "
             "and no approximating call, because both are rejected before execution. A Lean proof "
-            "must contain no sorry, no admit, and no bare axiom declaration.")
+            "must contain no sorry, no admit, and no bare axiom declaration. "
+            "Keep exploratory scripts in scratch/, outside proofs/ and experiments/. "
+            "Every source left in proofs/ or experiments/ is checked by the final gate; "
+            "repair or remove failed probes before reporting completion.")
 
     def _log_trajectory(self, agent: ResearchAgent, division: Division,
                         summary: Mapping[str, Any]) -> None:
@@ -958,12 +1131,15 @@ class ResearchSwarm:
         clearance, so a chatty model cannot rubber-stamp a claim.
         """
         verdict: FalsificationVerdict
-        if self._interactive_capable():
+        if self._live_research_mode():
             outcome = self._run_worker(
                 agent, Division.ADVERSARIAL,
                 f"Attempt to falsify the current claim for topic '{self.topic}'. "
                 f"Your directive: {agent.directive} "
-                f"Inspect the proof and experiment scripts under proofs/ and experiments/.",
+                f"Inspect claim_manifest.json, every proof and Lean theorem under proofs/, "
+                f"and experiment scripts under experiments/. Compare each Lean statement "
+                f"against the natural-language claim and reject any weakened theorem or "
+                f"incorrect sampling distribution.",
                 success_criterion=(
                     "Success: either exhibit a concrete counterexample with the exact input that "
                     f"produced it, or state that the search was empty. Then reply with ONLY "
@@ -973,6 +1149,12 @@ class ResearchSwarm:
             if not outcome.get("tool_calls"):
                 verdict = FalsificationVerdict(Clearance.PENDING,
                                                "the falsification worker used no investigative tools")
+            elif verdict.status is Clearance.CLEARED and not any(
+                    item.get("tool") in {"run_bash", "run_python_repl", "run_lean_proof"}
+                    and item.get("ok") for item in outcome.get("trajectory", [])):
+                verdict = FalsificationVerdict(
+                    Clearance.PENDING,
+                    "clearance requires an executed boundary or counterexample check")
             if not verdict.conclusive and not outcome.get("success"):
                 verdict = FalsificationVerdict(
                     Clearance.PENDING,
@@ -985,6 +1167,8 @@ class ResearchSwarm:
         agent.clearance = verdict.status
 
         if verdict.status is Clearance.COUNTEREXAMPLE:
+            if self._live_research_mode():
+                self._objection_artifacts[agent.agent_id] = self._artifact_fingerprint()
             self.ledger.append("COUNTEREXAMPLE_FOUND",
                                {"agent_id": agent.agent_id, "role": agent.role_name},
                                {"agent_id": leader_agent_id(Division.ADVERSARIAL),
@@ -1005,6 +1189,8 @@ class ResearchSwarm:
                             "searched": ["boundary cases", "degenerate inputs",
                                          "unstated assumptions"]})
         if verdict.status is Clearance.CLEARED:
+            if self._live_research_mode():
+                self._clearance_artifacts[agent.agent_id] = self._artifact_fingerprint()
             self.ledger.append("CLEARANCE_GRANTED",
                                {"agent_id": leader_agent_id(Division.ADVERSARIAL),
                                 "role": "Adversarial Lead"},
@@ -1032,11 +1218,54 @@ class ResearchSwarm:
         elif division.value == "formal":
             target = self.workspace.lean_dir / f"{agent.agent_id}.lean"
 
-        if self._interactive_capable():
+        if self._live_research_mode():
+            propositions = self.plan.propositions
+            worker_index = int(agent.agent_id.rsplit("_", 1)[-1]) - 1
+            position = (worker_index + getattr(self, "_current_cycle_index", 1) - 1) % len(propositions) if propositions else 0
+            prop = propositions[position] if propositions else None
+            if division is Division.THEORY and prop:
+                target = self.workspace.proof_dir / f"{prop.prop_id.lower()}.py"
+            elif division is Division.FORMAL and prop:
+                target = self.workspace.lean_dir / f"{prop.prop_id.lower()}.lean"
+            elif division is Division.EMPIRICAL:
+                target = self.workspace.experiment_dir / f"exp-{position + 1:02d}.py"
+            elif gap == Invariant.DOCUMENT_INTEGRITY.value:
+                target = self.workspace.paper_typ
+                agent.role_name = "Typst Author"
+
+        if self._live_research_mode():
             criterion = self._success_criterion(division, target)
+            if target.suffix in {".py", ".lean", ".typ"} and not target.is_file():
+                receipts = ""
+                if target.suffix == ".typ":
+                    manifest = self.workspace.root / "receipt_manifest.json"
+                    if manifest.is_file():
+                        receipts = f" Verified receipt manifest: {manifest.read_text(encoding='utf-8')[:4000]}"
+                self._run_worker(
+                    agent, division,
+                    f"Author the first version of {target.relative_to(self.workspace.root)} now. "
+                    "Your FIRST and ONLY tool call in this stage must be write_file for that "
+                    "exact path. Do not inspect files or explain the task. "
+                    + (f"Claim: {prop.statement}. Hypotheses: {'; '.join(prop.hypotheses)}. "
+                       f"Exact Lean target: {prop.lean_statement}. " if prop else "")
+                    + receipts,
+                    success_criterion=f"The exact target file {target.name} exists.",
+                    target=target, tool_names_override=("write_file",), max_steps_override=2)
             outcome = self._run_worker(agent, division,
                                        f"Close the {gap} gap for topic '{self.topic}'. "
-                                       f"Your directive: {agent.directive}",
+                                       f"Read {division.value}_assignments.md, "
+                                       "00_objective_spec.md, and claim_manifest.json first. "
+                                       "Inspect existing files in your target area and continue "
+                                       "from prior workers' results instead of repeating completed work. "
+                                       f"Your directive: {agent.directive} "
+                                       + (f"Claim: {prop.statement}. Hypotheses: "
+                                          f"{'; '.join(prop.hypotheses)}. " if prop else "")
+                                       + (f"The exact Lean proposition is: {prop.lean_statement}. "
+                                          "Do not weaken or replace it. "
+                                          if prop and division is Division.FORMAL else "")
+                                       + ("Read receipt_manifest.json and cite every verified "
+                                          "tag in paper.typ. Run compile_typst and fix all warnings. "
+                                          if target == self.workspace.paper_typ else ""),
                                        success_criterion=criterion, target=target)
             self.ledger.append("STATUS_REPORT", {"agent_id": agent.agent_id, "role": agent.role_name},
                                {"agent_id": leader_agent_id(division),
@@ -1067,12 +1296,23 @@ class ResearchSwarm:
     def _success_criterion(self, division: Division, target: Path) -> str:
         """The observable condition a worker must reach, stated per division."""
         name = target.name
+        if target.suffix == ".typ":
+            return ("Success: paper.typ cites every tag in receipt_manifest.json and "
+                    "compile_typst produces paper.pdf with zero warnings.")
         if division is Division.FORMAL:
             return (f"Success: call run_lean_proof on {name} and observe exit code 0 with no "
                     f"sorry, no admit, and no axiom declaration.")
         if division in (Division.THEORY, Division.EMPIRICAL):
             extra = (" The script must also write a data artifact so the run can be replicated."
                      if division is Division.EMPIRICAL else "")
+            if division is Division.EMPIRICAL and self._live_research_mode():
+                extra += (f" Write a raw CSV and {target.stem}.predictions.json with a "
+                          "nonempty JSON array of claim_id, description, predicted, observed, "
+                          "half_width_95, and relative fields. Compute the interval from raw "
+                          "samples and fail if the prediction lies outside it.")
+            if division is Division.THEORY and self._live_research_mode():
+                extra += (f" Also write proofs/{target.stem}.md with hypotheses, a "
+                          "step-by-step exact derivation, and the scope of what was proved.")
             return (f"Success: {name} exists and running it with the Python REPL or run_bash exits "
                     f"0.{extra}")
         if division is Division.ADVERSARIAL:
@@ -1127,10 +1367,15 @@ class ResearchSwarm:
             if on_status is not None:
                 on_status(message)
 
-        self._write_objective_spec(objective)
-        self._synthesize()
-        self._synthesize_experiments()
-        self._formalise()
+        self._status_callback = emit
+
+        if self._live_research_mode():
+            self._prepare_live_research(objective)
+        else:
+            self._write_objective_spec(objective)
+            self._synthesize()
+            self._synthesize_experiments()
+            self._formalise()
         loop = RelentlessConvergenceLoop(
             gate=self.build_gate(),
             cycle_fn=lambda report, index, budget: self.cycle(report, index, budget),
@@ -1139,9 +1384,13 @@ class ResearchSwarm:
             absolute_ceiling=self.config.absolute_ceiling,
             on_cycle=lambda cycle: emit(
                 f"cycle {cycle.index}: gaps={list(cycle.gaps) or 'none'} "
-                f"spawned={len(cycle.workers_spawned)}"))
+                f"spawned={len(cycle.workers_spawned)} active={len(self.agents)} "
+                f"proofs={len(self.proofs.receipts)} lean={len(self.lean_gate.receipts)} "
+                f"experiments={len(self.experiments.receipts)}"))
         emit("convergence loop started")
-        outcome: ConvergenceOutcome = loop.run(max_cycles=self.config.max_cycles)
+        cycle_limit = (0 if self._live_research_mode() and not self.plan.propositions
+                       else self.config.max_cycles)
+        outcome: ConvergenceOutcome = loop.run(max_cycles=cycle_limit)
         emit(f"convergence loop finished: {outcome.stop_reason.value}")
         self._last_outcome = outcome
         self._last_report = outcome.final_report
@@ -1165,8 +1414,130 @@ class ResearchSwarm:
             pdf=str(self.workspace.paper_pdf) if self.workspace.paper_pdf.is_file() else None,
             agents=tuple(self.agents.values()))
 
+    def _prepare_live_research(self, objective: str) -> None:
+        """Let the Director and leads define a new topic before any worker writes proofs.
+
+        A model-authored manifest is deliberately data, never executable code.
+        Missing or malformed claims leave the gate unsatisfied. No built-in topic
+        library is consulted on this path.
+        """
+        from adaptive_harness.classifiers.ambiguity_classifier import AmbiguityClassifier
+        from adaptive_harness.classifiers.skill_classifier import SkillClassifier
+
+        assessment = AmbiguityClassifier().evaluate(
+            objective or self.topic, SkillClassifier().classify(objective or self.topic))
+        self.ledger.append(
+            "STATUS_REPORT", {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
+            {"agent_id": "all_leads", "role": "Division Leads"},
+            {"stage": "ambiguity_preflight", "assessment": assessment.to_dict()})
+        manifest_path = self.workspace.root / "claim_manifest.json"
+        imposed_claim = (f" Required user claim: {self.config.claim}. Declared symbols: "
+                         f"{', '.join(self.config.claim_symbols)}. Preserve its meaning exactly."
+                         if self.config.claim else "")
+        director = ResearchAgent(DIRECTOR_ID, "Executive Director", objective or self.topic,
+                                 ("write_file",), division=Division.THEORY)
+        self._run_worker(
+            director, Division.THEORY,
+            f"Research topic: {self.topic}. Objective: {objective or self.topic}."
+            f"{imposed_claim} "
+            "Use write_file to create 00_objective_spec.md with variable domains, boundary "
+            "cases, assumptions, and a falsifiable goal. Also write claim_manifest.json as "
+            "JSON with a nonempty 'claims' array. Each claim needs id (PROP-01 style), "
+            "name, statement, hypotheses (array), and kind. Include one central mathematical "
+                "claim and at most two supporting lemmas. Each mathematical claim needs a "
+                "lean_statement field containing the exact Lean proposition to be proved, "
+                "with the same scope and hypotheses as its natural-language statement. "
+                "Keep empirical predictions out of the "
+            "mathematical claims array. Use only claims you can assign to independent SymPy "
+            "and Lean workers. Set top-level 'empirical_required' to true when a simulation "
+            "can test the statement. Do not write proof scripts yourself.",
+            success_criterion="Both the objective specification and valid claim manifest exist.",
+            target=manifest_path)
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw_claims = payload["claims"]
+            if not isinstance(raw_claims, list) or not raw_claims:
+                raise ValueError("claims must be a nonempty array")
+            propositions: list[Proposition] = []
+            for item in raw_claims:
+                if not isinstance(item, dict) or not re.fullmatch(r"[A-Z][A-Z0-9_-]{2,40}", str(item.get("id", ""))):
+                    raise ValueError("claim id must be a short uppercase identifier")
+                statement = str(item.get("statement") or item.get("exact_statement") or "").strip()
+                if not statement:
+                    raise ValueError("each claim needs a statement")
+                hypotheses = item.get("hypotheses", [])
+                if not isinstance(hypotheses, list) or not all(isinstance(h, str) for h in hypotheses):
+                    raise ValueError("hypotheses must be an array of strings")
+                if item.get("kind") == "numerical_simulation":
+                    continue
+                propositions.append(Proposition(
+                    prop_id=item["id"], kind=str(item.get("kind", "theorem")),
+                    name=str(item.get("name", item["id"])),
+                    statement=statement, hypotheses=tuple(hypotheses),
+                    lean_statement=str(item.get("lean_statement", ""))))
+            if not propositions or len({item.prop_id for item in propositions}) != len(propositions):
+                raise ValueError("claim ids must be unique")
+            self.plan = TopicPlan(self.topic, tuple(propositions), strategy="llm-authored",
+                                  notes="Claims were authored by the Director LLM and await verification.")
+            self.planned_experiments = int(bool(payload.get("empirical_required",
+                any(bool(item.get("empirical_required")) for item in raw_claims))))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.plan = TopicPlan(self.topic, strategy="llm-authored",
+                                  notes=f"Director did not produce a valid claim manifest: {exc}")
+            self.planned_experiments = 1
+
+        if not self.plan.propositions:
+            return
+
+        for division, spec in DIVISION_SPECS.items():
+            lead = self.agents[leader_agent_id(division)]
+            target = self.workspace.root / f"{division.value}_assignments.md"
+            self._run_worker(
+                lead, division,
+                f"Topic: {self.topic}. Read 00_objective_spec.md and claim_manifest.json. "
+                f"As {spec.leader_title}, decompose the objective into specific assignments "
+                f"for your division and write {target.name}. Record assumptions and exact "
+                "success criteria. Do not claim a result without a tool receipt. "
+                + ("Search primary literature with web_search or a citable source. Write "
+                   "evidence/index.json as an array of records with id, claim, source URL, "
+                   "and citation. Cite only material you inspected. "
+                   if division is Division.LITERATURE else ""),
+                success_criterion=f"{target.name} contains actionable assignments.",
+                target=target)
+            if not target.is_file():
+                lines = [f"# {spec.leader_title} assignments", "", spec.objective, "",
+                         "The lead did not leave a written assignment. Continue from the "
+                         "Director's manifest and verified receipts; report this gap.", ""]
+                for claim in self.plan.propositions:
+                    lines.append(f"- {claim.prop_id}: {claim.statement}")
+                    if claim.lean_statement:
+                        lines.append(f"  Lean target: `{claim.lean_statement}`")
+                target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                self.ledger.append(
+                    "STATUS_REPORT", {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
+                    {"agent_id": lead.agent_id, "role": lead.role_name},
+                    {"status": "lead_assignment_missing", "fallback_path": target.name})
+
     def _republish(self, outcome: ConvergenceOutcome) -> None:
         """Build the final PDF from the terminal gate state, tolerating failure."""
+        if self._live_research_mode():
+            if not outcome.solved:
+                marker = "#align(center)[*Research status: UNSOLVED*]"
+                if self.workspace.paper_typ.is_file():
+                    source = self.workspace.paper_typ.read_text(encoding="utf-8")
+                else:
+                    source = (
+                        "= Research progress report\n\n"
+                        "The research swarm did not verify its objective. This document is a "
+                        "progress report, not a proof or a completed academic paper.\n\n"
+                        "The objective, exact claim manifest, attempted proof scripts, "
+                        "verification receipts, convergence history, and communication "
+                        "ledger are preserved beside this report for inspection.\n")
+                if marker not in source:
+                    self.workspace.paper_typ.write_text(marker + "\n\n" + source,
+                                                        encoding="utf-8")
+                self._compile()
+            return
         try:
             builder = PaperBuilder(self.workspace.root, typst_root=self.config.typst_root,
                                    allow_install_typst=self.config.auto_install_typst)

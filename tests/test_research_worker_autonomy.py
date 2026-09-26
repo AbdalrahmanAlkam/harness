@@ -121,6 +121,51 @@ def test_worker_iterates_in_a_tool_loop_and_logs_its_trajectory(tmp_path: Path):
     assert entries[0].recipient["role"] == "Theoretical Lead"
 
 
+def test_research_roles_use_space_bunny_alpha_only(tmp_path: Path):
+    swarm = _swarm(tmp_path, [])
+    agent_id = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "write a proof",
+                                    ["write_file"])
+    target = swarm.workspace.proof_dir / f"{agent_id}.py"
+    clients = []
+
+    def factory():
+        client = ScriptedClient([("write_file", {
+            "path": str(target.relative_to(swarm.workspace.root)), "content": PROOF_BODY})])
+        clients.append(client)
+        return client
+
+    swarm.config.llm_client_factory = factory
+    swarm._run_worker(swarm.agents[agent_id], Division.THEORY, "Write a proof.",
+                      success_criterion="File exists.", target=target)
+    assert clients
+    assert all(client.default_model == "stealth/space-bunny-alpha" for client in clients)
+
+
+def test_division_leads_only_author_assignments(tmp_path: Path):
+    swarm = _swarm(tmp_path, [])
+    clients = []
+
+    def factory():
+        client = ScriptedClient([
+            ("write_file", {"path": "proofs/lead_probe.lean", "content": "theorem x : True := by trivial\n"}),
+            ("write_file", {"path": "formal_assignments.md", "content": "# Assignments\n"}),
+        ])
+        clients.append(client)
+        return client
+
+    swarm.config.llm_client_factory = factory
+    lead = swarm.agents["formal_lead_01"]
+    swarm._run_worker(lead, Division.FORMAL, "Write assignments.",
+                      success_criterion="Assignment file exists.",
+                      target=swarm.workspace.root / "formal_assignments.md")
+    offered = {name for client in clients for call in client.calls for name in call["tools"]}
+    assert {"read_file", "write_file"} <= offered
+    assert "run_lean_proof" not in offered
+    assert "run_bash" not in offered
+    assert not (swarm.workspace.proof_dir / "lead_probe.lean").exists()
+    assert (swarm.workspace.root / "formal_assignments.md").is_file()
+
+
 def test_worker_records_a_failed_tool_call_in_its_trajectory(tmp_path: Path):
     script = [("run_bash", {"command": "definitely-not-a-command"})]
     swarm = _swarm(tmp_path, script)

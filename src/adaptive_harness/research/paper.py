@@ -75,7 +75,8 @@ def escape_math_free(text: str) -> str:
     return "".join(out)
 
 
-def proof_box(identifier: str, receipt: ProofReceipt, extra: str = "") -> str:
+def proof_box(identifier: str, receipt: ProofReceipt, extra: str = "",
+              tag: str = "") -> str:
     """Render a verification receipt as a self-contained Typst block.
 
     The block prints the script digest, the exit status, and the wall time, so
@@ -83,7 +84,8 @@ def proof_box(identifier: str, receipt: ProofReceipt, extra: str = "") -> str:
     the cited script.
     """
     body = [
-        f"  #text(weight: \"bold\")[{typst_escape(identifier)}] — "
+        f"  #text(weight: \"bold\")[{typst_escape(identifier)}] "
+        f"#raw(\"[{typst_escape_str(tag)}]\") — "
         f"`{typst_escape(Path(receipt.script).name)}`",
         f"  status `{typst_escape(receipt.status)}`, exit code `{receipt.exit_code}`, "
         f"{receipt.duration_ms:.0f} ms",
@@ -267,18 +269,11 @@ class PaperBuilder:
         claim = inputs.claim
         return "\n".join([
             "== Introduction", "",
-            "Routing decisions in delay-sensitive systems are usually justified by appealing to "
-            "the variance of the observed delay, and that appeal is only meaningful when the "
-            "delay distribution actually possesses a variance. Measurements of production "
-            "networks report delay distributions with power-law tails rather than exponential "
-            "ones, so the question is not academic: it determines whether the objective a "
-            "routing policy is asked to minimise is defined at all.", "",
-            "This paper takes that question seriously and answers it in two parts. The first "
-            "identifies the exact boundary of the regime in which a variance-based objective is "
-            "well posed, and shows that below the boundary the variance is infinite under "
-            "*every* allocation of work, so no policy can minimise it. The second identifies the "
-            "variance-minimising allocation in the regime where it does exist, and gives its "
-            "exact excess over the balanced ideal.", "",
+            f"Research question: {typst_escape(inputs.topic)}", "",
+            "The results below state the hypotheses and exact expressions that the derivation "
+            "scripts attempted to check. The verdict table distinguishes established identities "
+            "from refuted or undecided claims, while the formal section identifies precisely "
+            "which additional statements Lean checked.", "",
             "A methodological point precedes both. No statement in this paper is asserted on the "
             "authority of the text: each is a proposition whose statement is constructed from a "
             "definition inside a derivation script, and SymPy decides it. A proposition is "
@@ -315,6 +310,8 @@ class PaperBuilder:
                     "No proposition was derived for this topic, so there is nothing to state. "
                     "The appendix records which strategies were attempted.\n")
         adjudications = {item.prop_id: item for item in inputs.adjudications}
+        proof_tags = {Path(receipt.script).name: f"PROOF-{index:03d}"
+                      for index, receipt in enumerate(inputs.proofs, start=1)}
         lines = ["== Results", "",
                  "Each result is stated with its hypotheses, proved, and marked with the verdict "
                  "reached by its derivation script. Propositions are numbered in the order they "
@@ -335,14 +332,21 @@ class PaperBuilder:
             lines.append(f"  #text(weight: \"bold\")[Statement.] {escape_math_free(prop.statement)}")
             for equation in prop.display:
                 lines.append(f"  #block(width: 100%, above: 0.5em, below: 0.5em)[$ {equation} $]")
-            lines.append(f"  #text(weight: \"bold\")[Proof.] "
-                         f"{escape_math_free(prop.proof_sketch)} #qed")
+            proved = verdict == Verdict.PROVEN.value
+            heading = "Proof." if proved else "Derivation attempt."
+            lines.append(f"  #text(weight: \"bold\")[{heading}] "
+                         f"{escape_math_free(prop.proof_sketch)}"
+                         + (" #qed" if proved else ""))
             if prop.consequence:
                 lines.append("")
                 lines.append(f"  #text(weight: \"bold\")[Consequence.] "
                              f"{escape_math_free(prop.consequence)}")
             lines.append("")
             lines.append(f"  #receipt(label: [Verdict], [{typst_escape(verdict)}])")
+            if adjudication and adjudication.script:
+                tag = proof_tags.get(Path(adjudication.script).name)
+                if tag:
+                    lines.append(f"  #receipt(label: [SymPy receipt], [#raw(\"[{tag}]\")])")
             lines.append("]")
             lines.append("")
         return "\n".join(lines)
@@ -354,11 +358,10 @@ class PaperBuilder:
             return ""
         certified = [item for item in receipts if getattr(item, "certified", False)]
         lines = ["== Formal Foundations", "",
-                 "The results above are established twice over. Tier 1 is computational: a SymPy "
-                 "script reduces each expression to a closed form. Tier 2 is logical: the "
-                 "accompanying Lean 4 file is compiled by the Lean kernel, which checks the "
-                 "deduction itself. The two are independent, so an error in one is unlikely to be "
-                 "mirrored in the other.", ""]
+                 "The SymPy receipts check exact symbolic calculations. The Lean receipts below "
+                 "certify the named formal statements in their source files. A Lean receipt applies "
+                 "only to those statements; it does not automatically certify every symbolic "
+                 "result in this paper.", ""]
         if inputs.lean_version:
             env = "with Mathlib available" if inputs.mathlib_available else \
                   "against the Lean core library, with no external dependency"
@@ -372,14 +375,15 @@ class PaperBuilder:
             return "\n".join(lines)
         lines.append(f"{len(certified)} of {len(receipts)} formal proof file(s) are certified:")
         lines.append("")
-        for receipt in certified:
+        for index, receipt in enumerate(certified, start=1):
             theorems = typst_escape(", ".join(receipt.theorems) or "no named theorem")
             axioms = typst_escape(", ".join(receipt.axioms) or "none")
             digest = typst_escape(receipt.sha256[:23] + "…")
             path = f"proofs/lean/{Path(receipt.path).name}"
             # `raw` needs a string literal, so the path is quoted here; the
             # title and detail are content and are passed as content.
-            lines.append(f"#lean-box(title: [{typst_escape(receipt.name)}], "
+            lines.append(f"#lean-box(title: [#raw(\"[LEAN-{index:03d}]\") "
+                         f"{typst_escape(receipt.name)}], "
                          f"path: \"{typst_escape_str(path)}\", "
                          f"detail: [{theorems}; axioms: {axioms}; digest: {digest}])")
             lines.append("")
@@ -429,8 +433,9 @@ class PaperBuilder:
             "artifact, and has that artifact hashed after the run, so the numbers below can be "
             "reproduced and compared byte for byte.")
         lines.append("")
-        for receipt in inputs.experiments:
-            lines.append(f"*Experiment {typst_escape(receipt.experiment_id)}* — script "
+        for index, receipt in enumerate(inputs.experiments, start=1):
+            lines.append(f"*Experiment {typst_escape(receipt.experiment_id)}* "
+                         f"#raw(\"[EXP-{index:03d}]\") — script "
                          f"`{typst_escape(Path(receipt.script).name)}` at seed "
                          f"`{receipt.seed}`, status `{typst_escape(receipt.status)}`.")
             lines.append("")
@@ -536,7 +541,8 @@ class PaperBuilder:
             return "\n".join(lines)
         for index, record in enumerate(records, start=1):
             citation = escape_math_free(str(record.get("citation", "")))
-            lines.append(f"*{index}.* {citation} {typst_escape(str(record.get('id')))}.")
+            lines.append(f"*{index}.* #raw(\"[EVID-{index:03d}]\") "
+                         f"{citation} {typst_escape(str(record.get('id')))}.")
         lines.append("")
         return "\n".join(lines)
 
@@ -563,8 +569,9 @@ class PaperBuilder:
                       "Each proposition was decided by executing the script below in a subprocess "
                       "with networking disabled, after a static scan confirmed it contains no "
                       "floating-point literal and no approximating call.", ""]
-            for receipt in inputs.proofs:
-                lines.append(proof_box(receipt.theorem_id, receipt))
+            for index, receipt in enumerate(inputs.proofs, start=1):
+                lines.append(proof_box(receipt.theorem_id, receipt,
+                                       tag=f"PROOF-{index:03d}"))
                 lines.append("")
         if inputs.lean_sources:
             lines += ["== Appendix D: Lean 4 Listings", "",

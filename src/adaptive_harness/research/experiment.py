@@ -148,6 +148,7 @@ class ExperimentRunner:
     experiment_dir: Path
     timeout_s: float = 300.0
     python_executable: str = field(default=sys.executable)
+    require_predictions: bool = False
     receipts: list[ExperimentReceipt] = field(default_factory=list)
     _cache: dict[tuple[str, int], ExperimentReceipt] = field(default_factory=dict, repr=False)
 
@@ -234,6 +235,26 @@ class ExperimentRunner:
                                         "experiment produced no hashed data artifact")
             self._cache[cache_key] = receipt
             return receipt
+
+        if self.require_predictions:
+            prediction_name = f"{path.stem}.predictions.json"
+            if prediction_name not in hashes or not any(name.endswith(".csv") for name in hashes):
+                return ExperimentReceipt(identifier, str(path), seed, "REJECTED_NO_PREDICTIONS",
+                                         hashes, exit_code, duration_ms, (), (stdout + stderr)[-2000:],
+                                         "live experiments must write a fresh predictions JSON and raw CSV")
+            try:
+                payload = json.loads((self.experiment_dir / prediction_name).read_text(encoding="utf-8"))
+                if not isinstance(payload, list) or not payload:
+                    raise ValueError("predictions JSON must be a nonempty array")
+                predictions = tuple(Prediction(**item) for item in payload)
+                if any(item.observed is None or item.half_width_95 is None or
+                       not math.isfinite(item.half_width_95) or item.half_width_95 <= 0
+                       for item in predictions):
+                    raise ValueError("each prediction needs a finite observation and positive 95% half-width")
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                return ExperimentReceipt(identifier, str(path), seed, "REJECTED_NO_PREDICTIONS",
+                                         hashes, exit_code, duration_ms, (), (stdout + stderr)[-2000:],
+                                         f"invalid live prediction receipt: {exc}")
 
         evaluated: list[Mapping[str, Any]] = []
         all_hold = True

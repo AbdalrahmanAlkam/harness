@@ -314,8 +314,6 @@ def dev(
                            safety_profile=safety or "turbo", swarm_enabled=swarm,
                            step_policy=step_policy, max_steps=max_steps)
     if research_topic:
-        # Mechanical by default: the swarm's gates are local and deterministic,
-        # so attaching it costs nothing until a live model authors artifacts.
         research_swarm = agent.enable_research(research_topic, root=research_root)
         console.print(f"[dim]Research swarm attached: {research_swarm.workspace.root} "
                       f"(mode: {research_swarm.config.author_mode})[/dim]")
@@ -668,16 +666,22 @@ def research(
                                              help="Operator safety valve; the loop is not turn-limited by default"),
     patience: int = typer.Option(2, "--patience", help="No-progress cycles tolerated before escalating"),
     max_workers: int = typer.Option(8, "--max-workers", help="Per-division worker cap"),
-    author: bool = typer.Option(False, "--author",
-                               help="Run research workers as interactive tool-using subagents "
-                                    "against a live model (mechanical kernel otherwise)"),
+    worker_steps: int = typer.Option(24, "--worker-steps", min=1,
+                                     help="Maximum tool-loop steps per worker attempt"),
+    absolute_ceiling: int = typer.Option(64, "--absolute-ceiling",
+                                       min=1, help="Maximum convergence cycles, even without --max-cycles"),
+    provider: str = typer.Option("openrouter", "--provider",
+                                 help="Configured API provider for independent research agents"),
+    author: bool = typer.Option(True, "--author/--offline-legacy",
+                               help="Run the live LLM research swarm (default); "
+                                    "offline legacy mode is for reproducibility only"),
 ):
     """Runs the autonomous research swarm and publishes a paper with a verdict.
 
-    The kernel derives machine-checkable propositions from the topic, decides each
-    one by executing a self-adjudicating derivation script, and reports the
-    headline result as PROVEN, DISPROVEN, or INCONCLUSIVE. A paper is published
-    either way; the verdict is never inferred from the topic text.
+    The live Director and division agents author claims and artifacts through
+    separate LLM tool loops. SymPy, Lean, seeded experiments, and Typst then
+    verify the artifacts. Offline legacy mode keeps the historical fixed-topic
+    demonstration available explicitly.
 
     The loop is stagnation-limited rather than turn-limited: it exits on
     convergence, or when a cycle provably cannot change the verdict and the
@@ -688,13 +692,18 @@ def research(
     author_fn = None
     client_factory = None
     if author:
+        if provider.lower() != "openrouter":
+            raise typer.BadParameter("live research uses OpenRouter with stealth/space-bunny-alpha",
+                                     param_hint="--provider")
         try:
-            client_factory = _llm_client_factory()
+            client_factory = _llm_client_factory(provider=provider)
         except Exception as exc:  # noqa: BLE001 - surfaced to the operator
-            console.print(f"[yellow]Live authoring disabled: {type(exc).__name__}: {exc}[/yellow]")
+            raise typer.BadParameter(str(exc), param_hint="--author") from exc
 
     config = SwarmConfig(max_cycles=max_cycles, stagnation_patience=patience,
-                         max_workers_per_division=max_workers, seed=seed,
+                         max_workers_per_division=max_workers,
+                         absolute_ceiling=absolute_ceiling, worker_max_steps=worker_steps,
+                         seed=seed,
                          llm_client_factory=client_factory,
                          claim=claim,
                          claim_symbols=tuple(name.strip() for name in symbols.split(",") if name.strip()))
@@ -722,13 +731,14 @@ def research(
             mark = "[green]PASS[/green]" if status.satisfied else "[red]FAIL[/red]"
             console.print(f"  {mark} {status.invariant.value}: {status.detail}")
     if outcome.pdf:
-        console.print(f"\n[bold green]Paper:[/bold green] {outcome.pdf}")
+        label = "Paper" if outcome.solved else "Progress report"
+        console.print(f"\n[bold green]{label}:[/bold green] {outcome.pdf}")
     console.print(f"[dim]Ledger: {swarm.workspace.ledger_path}[/dim]")
     if not outcome.solved:
         raise typer.Exit(code=2)
 
 
-def _llm_client_factory():
+def _llm_client_factory(provider: str = "openrouter"):
     """Build a factory that mints a fresh LLM client per research worker.
 
     A new client per worker is deliberate: each subagent needs its own
@@ -736,11 +746,13 @@ def _llm_client_factory():
     their histories.
     """
     from adaptive_harness.llm.client import LLMClient
+    from adaptive_harness.data.credentials import CredentialsManager
 
-    probe = LLMClient()
+    saved_keys = CredentialsManager().load()
+    probe = LLMClient(provider=provider, provider_keys=saved_keys)
     if probe.is_mock:
-        raise RuntimeError("no live model is configured; rerun without --author, or set a "
-                           "provider key to enable interactive subagents")
+        raise RuntimeError(f"no live {provider} model is configured; use the harness credentials "
+                           "command or provider environment variable before research")
 
     def factory():
         return LLMClient(api_key=probe.api_key, base_url=probe.base_url,

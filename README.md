@@ -235,14 +235,23 @@ adaptive-harness dev "refactor the storage layer" --key $OPENROUTER_API_KEY --mo
 
 ### 1.1 Autonomous Research Swarm (`research`)
 
-Give it a topic. It derives propositions, decides each one by executing a
-self-adjudicating derivation script, and publishes a mathematical paper stating
-the result — `PROVEN`, `DISPROVEN`, or `INCONCLUSIVE`. It does not audit research
-you did yourself; it does the research.
+Give it a topic. By default, the command creates a separate OpenRouter LLM
+client for the Director, each division lead, and each worker. They write and
+revise artifacts through tool calls. The local SymPy, Lean, experiment, and
+Typst runners decide what can be reported as verified. Configure an OpenRouter
+key with the harness credentials command or `OPENROUTER_API_KEY` first. All
+research roles use `stealth/space-bunny-alpha`.
 
 ```bash
-# Derive, prove, corroborate, and publish. No network requests, no cost.
+# Director, leads, and workers author a new investigation using the API.
 adaptive-harness research "pareto heavy tailed network delay: critical index and variance-optimal balanced routing"
+
+# Give a hard problem more room to explore; artifacts are kept under research/.
+adaptive-harness research "your open problem" --objective "State the exact conjecture and assumptions" \
+    --max-workers 24 --absolute-ceiling 128
+
+# Bound a diagnostic run while still exercising live tool loops.
+adaptive-harness research "2 + 2 = 4" --max-cycles 1 --worker-steps 3
 
 # Settle a specific algebraic claim directly
 adaptive-harness research "quadratic expansion" \
@@ -250,16 +259,23 @@ adaptive-harness research "quadratic expansion" \
 
 # A claim that is false is refuted, and that is a success
 adaptive-harness research "bad claim" --claim "(x+y)**2 == x**2 + y**2" --symbols x,y
+
+# Reproduce the earlier fixed-topic demonstration without API calls.
+adaptive-harness research "quadratic expansion" --offline-legacy \
+    --claim "(x+y)**2 == x**2 + 2*x*y + y**2" --symbols x,y
 ```
 
-**How a claim is settled.** The kernel constructs a machine-checkable statement
-from a definition, writes a self-adjudicating script for it, and the exit code
-*is* the verdict:
+**How a claim is settled.** The live Director writes `claim_manifest.json` and
+`00_objective_spec.md`. Each manifest claim includes an explicit `lean_statement` so
+the gate can compare the certified theorem with the Director's formal target.
+Theory workers write a natural-language derivation and
+an exact Python script per mathematical claim; formal workers write a Lean file
+per proven claim. The script's exit code contributes to the verdict:
 
 | Exit | Verdict | Meaning |
 | --- | --- | --- |
-| `0` | `PROVEN` | the difference `lhs - rhs` is identically zero |
-| `3` | `DISPROVEN` | an exact rational witness makes the difference nonzero |
+| `0` | `PROVEN` | the claim script reports success; all other gates must still pass |
+| `3` | `DISPROVEN` | the script reports a counterexample; inspect its exact witness |
 | other | `INCONCLUSIVE` | the attempt could not decide — never treated as a refutation |
 
 Refutation requires an *exhibited* counterexample, not a failure to simplify:
@@ -310,6 +326,12 @@ compiled by a test, so the library cannot rot silently. The tool resolves
 `lake env lean` automatically when a `lakefile` is present, so a Mathlib
 environment works if one exists.
 
+Lean checks the theorem written in the `.lean` file. Matching it against a
+natural-language claim remains a semantic review task. The live gate requires
+the theorem to assert the Director's declared `lean_statement`, and the red team
+is tasked with checking its scope and assumptions. Treat an open problem as
+unsolved unless that correspondence is convincing.
+
 The paper gains a *Formal Foundations* section with a green certification box per
 proof (toolchain, theorem names, axiom set, digest) and an appendix listing the
 full Lean sources, so a reader can reproduce the check with
@@ -329,17 +351,20 @@ asserted `α·x_m²/((α−1)(α−2))` was wrong and SymPy's `α·x_m²/(α−2
 | `empirical_replication` | every seeded simulation reproduced its prediction at 95% |
 | `adversarial_clearance` | the *reported verdict* is certified — no open objection, and for a refutation an exact witness |
 | `claim_adjudication` | the headline claim reached a decided verdict |
-| `formal_verification` | every published theorem is backed by a Lean 4 proof the kernel checked, with zero `sorry` |
+| `lean_formal_soundness` | every proven live claim has a certified Lean 4 file with zero `sorry` |
 | `document_integrity` | `paper.typ` compiles to `paper.pdf` with **zero** Typst warnings |
 
 Artifacts land under `research/<topic-slug>/`: the hash-chained
-`comm_ledger.jsonl`, `00_objective_spec.md` (including the derivation plan),
+`comm_ledger.jsonl`, `00_objective_spec.md`, `claim_manifest.json`,
 `evidence/index.json`, `proofs/` and `experiments/` with their generated scripts
 and raw CSV, `figures/`, `03_adversarial_audit.md`, `bibliography.bib`,
 `convergence_history.json`, receipt indexes, and the generated `paper.typ` plus
 its `paper.pdf`.
+If live authoring fails before a paper exists, the final PDF is explicitly
+labelled an `UNSOLVED` progress report and directs readers to the receipts and
+ledger. It does not present an unverified proof as a paper.
 
-**The output is a real mathematical paper**, not a log: title, abstract,
+**The output is a mathematical paper**, not a log: title, abstract,
 introduction, a notation table, numbered theorems each with explicit hypotheses,
 a formal statement typeset in 2D math, a proof ending in □, a consequence, and a
 verdict line — followed by empirical corroboration, the adversarial audit, a
@@ -349,7 +374,7 @@ explicit `INCONCLUSIVE` paper saying so, rather than a confident-sounding paper
 about nothing.
 
 **The loop is stagnation-limited, not turn-limited.** It runs until it converges
-or until it can *prove* more identical work cannot help. Progress means reaching
+or until its configured stagnation and resource limits are reached. Progress means reaching
 a new *minimum* in outstanding gaps (a high-water mark), so a flapping invariant
 oscillating 4→3→4→3 cannot look like progress. After `--patience` no-progress
 cycles the worker budget doubles; when escalation cannot grow, the run concedes
@@ -358,7 +383,10 @@ with an honest `STAGNATION_ABORT` and UNSOLVED.
 ```python
 from adaptive_harness.research import ResearchSwarm, SwarmConfig
 
-swarm = ResearchSwarm("pareto heavy tailed network delay", root="research")
+from adaptive_harness.cli import _llm_client_factory
+
+swarm = ResearchSwarm("pareto heavy tailed network delay", root="research",
+    config=SwarmConfig(llm_client_factory=_llm_client_factory("openrouter")))
 swarm.run()
 print(swarm.claims.headline.value)   # PROVEN | DISPROVEN | INCONCLUSIVE
 print(swarm.claims.summary())
@@ -372,9 +400,9 @@ adaptive-harness dev "settle whether balanced routing minimises delay variance" 
 ```
 
 `--research TOPIC` exposes `spawn_subagent`, `scale_division`, `verify_proofs`,
-and `run_experiments`. Like the standalone command it defaults to mechanical
-mode and makes no network requests; the tools appear only in the investigative
-modes, never in `security`/audit.
+`run_experiments`, `run_lean_proof`, and `compile_typst`. With a live configured
+client it attaches the LLM research path. The tools appear only in the
+investigative modes, never in `security`/audit.
 
 ### 2. Algorithmic Routing & Recovery Benchmarks
 ```bash

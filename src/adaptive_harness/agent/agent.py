@@ -242,10 +242,18 @@ class DeveloperAgent:
         a topic re-uses the existing swarm; the returned object is the
         :class:`ResearchSwarm` driving it.
         """
-        from adaptive_harness.research.swarm import ResearchSwarm
+        from adaptive_harness.research.swarm import ResearchSwarm, SwarmConfig
         from adaptive_harness.tools.research_swarm import (RunExperimentTool, ScaleDivisionTool,
                                                            SpawnSubagentTool, VerifyProofTool)
 
+        if config is None and not getattr(self.llm_client, "is_mock", True):
+            def research_client_factory() -> LLMClient:
+                source = self.llm_client
+                return LLMClient(api_key=source.api_key, base_url=source.base_url,
+                    default_model=source.default_model, force_mock=False,
+                    provider=source.provider, provider_keys=source.provider_keys,
+                    backup_providers=source.backup_providers)
+            config = SwarmConfig(llm_client_factory=research_client_factory)
         if getattr(self, "research_swarm", None) is None or topic:
             self.research_swarm = ResearchSwarm(topic or "research", root=root, config=config)
         swarm = self.research_swarm

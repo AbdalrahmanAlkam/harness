@@ -46,12 +46,12 @@ The tool suite has local file search, bash, pytest, and restricted arithmetic. S
 
 ## Autonomous research swarm
 
-`adaptive-harness research "<topic>"` runs a self-scaling investigation that will not report a result until every claim is backed by an executable receipt. An Executive Director owns the objective and the convergence loop; Literature, Theory, Empirical, and Adversarial Leads each own a methodologically distinct line of attack and spawn as many workers as the outstanding gaps justify.
+`adaptive-harness research "<topic>"` runs a self-scaling investigation that only marks a result settled when the verification gates pass. An Executive Director owns the objective and the convergence loop; Literature, Theory, Formal, Empirical, and Adversarial Leads each own a methodologically distinct line of attack and recruit workers within the configured limits.
 
-The default is **mechanical mode**, which calls no language model: the Director, the divisions, the gates, and the paper are all local and deterministic, so a default run costs nothing and makes no network requests. Pass `--author` to have a live model draft the artifacts on top; the mechanical gates still adjudicate them either way. This is why a default run shows no OpenRouter traffic.
+The standalone `research` command defaults to live LLM agents. Use `--offline-legacy` for the older deterministic examples; that compatibility path makes no model calls. Verification gates remain local in both modes.
 
 ```bash
-# Zero-cost, zero-network run
+# Live OpenRouter run using Space Bunny Alpha
 adaptive-harness research "optimal routing under heavy-tailed network delay"
 
 # Pinned seed, explicit objective, live authoring
@@ -63,22 +63,22 @@ adaptive-harness research "variance-minimising routing policy" \
 adaptive-harness research "some topic" --max-cycles 3
 ```
 
-A topic is `SOLVED` only when all four invariants hold at once. `mathematical_soundness` requires every script in `proofs/` to be free of floating-point literals and approximating calls (`float`, `evalf`, `N`) and to exit 0 — the scan happens before execution, so an approximate "proof" is rejected without running. `empirical_replication` requires every script in `experiments/` to reproduce its prediction at a pinned seed and emit a hashed data artifact. `adversarial_clearance` requires no open red-team counterexample. `document_integrity` requires `paper.typ` to compile to `paper.pdf` with zero Typst warnings. Typst is resolved from `PATH`, then the `typst` Python wrapper, then reported unavailable; the `compile_typst` tool does the same from inside a task.
+A topic is `SOLVED` only when all six invariants hold at once, including claim adjudication and Lean formal soundness. `mathematical_soundness` requires every script in `proofs/` to be free of floating-point literals and approximating calls (`float`, `evalf`, `N`) and to exit 0 — the scan happens before execution, so an approximate "proof" is rejected without running. `empirical_replication` requires every script in `experiments/` to reproduce its prediction at a pinned seed and emit a hashed data artifact. `adversarial_clearance` requires no open red-team counterexample. `document_integrity` requires `paper.typ` to compile to `paper.pdf` with zero Typst warnings. Typst is resolved from `PATH`, then the `typst` Python wrapper, then reported unavailable; the `compile_typst` tool does the same from inside a task.
 
-The loop is not turn-limited. It is stagnation-limited: it keeps working until it converges or until it can prove that more identical work cannot help. Progress means reaching a new *minimum* in outstanding gaps, tracked as a high-water mark, so a flapping invariant that oscillates cannot masquerade as progress. After `--patience` no-progress cycles the worker budget doubles; when escalation can no longer grow, the run reports `STAGNATION_ABORT` and an honest **UNSOLVED** verdict. `--max-cycles` and the absolute ceiling likewise report `BUDGET_EXHAUSTED` and UNSOLVED — never a false success.
+The loop is not turn-limited. It is stagnation-limited: it keeps working until it converges or until its configured stagnation rule is reached. Progress means reaching a new *minimum* in outstanding gaps, tracked as a high-water mark, so a flapping invariant that oscillates cannot masquerade as progress. After `--patience` no-progress cycles the worker budget doubles; when escalation can no longer grow, the run reports `STAGNATION_ABORT` and an honest **UNSOLVED** verdict. `--max-cycles` and the absolute ceiling likewise report `BUDGET_EXHAUSTED` and UNSOLVED — never a false success.
 
-Artifacts land in `research/<topic-slug>/`: the hash-chained `comm_ledger.jsonl` message tree, `00_objective_spec.md`, evidence records, `proofs/`, `experiments/` with their raw CSV, vector `figures/`, `03_adversarial_audit.md`, `bibliography.bib` generated from evidence records only, `convergence_history.json`, the receipt indexes, and the generated `paper.typ` plus its `paper.pdf`. Because the paper is generated from receipts, nothing can be typeset that was not proven or measured, and a withdrawn receipt disappears on the next build. Opening a tampered ledger reports through `verify()` rather than raising, so an auditor can always inspect the evidence of tampering.
+Artifacts land in `research/<topic-slug>/`: the hash-chained `comm_ledger.jsonl` message tree, `00_objective_spec.md`, evidence records, `proofs/`, `experiments/` with their raw CSV, vector `figures/`, `03_adversarial_audit.md`, `bibliography.bib` generated from evidence records only, `convergence_history.json`, the receipt indexes, and the generated `paper.typ` plus its `paper.pdf`. In live mode the Typst Author writes the paper, and the gate requires every verified receipt tag to appear in it. A tag does not by itself prove that the prose matches the formal theorem. Opening a tampered ledger reports through `verify()` rather than raising, so an auditor can always inspect the evidence of tampering.
 
 The worked example in `research/routing-policy-under-heavy-tailed-delay/` derives a variance-minimising routing split for heavy-tailed delays and, more usefully, establishes the regime where that objective is even well-posed: the variance of a Pareto delay is infinite for tail index `alpha <= 2`, so a variance-minimising policy does not exist on part of the empirically observed range and must be replaced by a robust objective. Three exact SymPy derivations and two seeded experiments back that, and the run converges in two cycles.
 
 ## What a research run actually does
 
-`adaptive-harness research "<topic>"` does not audit research you already did; it does the research. The kernel reads the topic, constructs machine-checkable propositions from definitions, writes a self-adjudicating SymPy script for each, executes it, and reads the verdict off the exit code: `0` is PROVEN, `3` is DISPROVEN, anything else is INCONCLUSIVE. It then generates the seeded simulations that corroborate those propositions, runs a red team over the result, and publishes a paper.
+`adaptive-harness research "<topic>"` starts live OpenRouter agents by default. The Director writes the objective and claims; each lead and worker uses its own LLM tool loop to create and test artifacts. `stealth/space-bunny-alpha` is the research model. The local runners verify exact Python derivations, Lean files, seeded simulations, and the Typst build. Use `--offline-legacy` to reproduce the earlier fixed-topic examples below without API calls.
 
 Try it on a topic you already know the answer to:
 
 ```bash
-adaptive-harness research "pareto heavy tailed network delay: critical index and variance-optimal balanced routing"
+adaptive-harness research "pareto heavy tailed network delay: critical index and variance-optimal balanced routing" --offline-legacy
 ```
 
 Seven propositions are derived, all seven hold, and the run reports `PROVEN`. The interesting one is Theorem 4: for a Pareto delay of index at most two the second moment diverges, so the variance is infinite under *every* allocation and no variance-minimising routing policy exists at all. The paper says that, with the logarithmic divergence at the critical index shown exactly.
@@ -86,16 +86,16 @@ Seven propositions are derived, all seven hold, and the run reports `PROVEN`. Th
 To watch a claim fall, hand it a false identity:
 
 ```bash
-adaptive-harness research "quadratic expansion" --claim "(x+y)**2 == x**2 + y**2" --symbols x,y
+adaptive-harness research "quadratic expansion" --offline-legacy --claim "(x+y)**2 == x**2 + y**2" --symbols x,y
 ```
 
 This reports `DISPROVEN` with the witness `counterexample at x=1, y=1: lhs - rhs = 2`, and that is a *successful* run: settling the question either way is the goal, so the red team certifies the refutation rather than the claim. The witness matters — refutation requires an exhibited counterexample, not a failure to simplify. The probe set deliberately includes negative points, which is why `sqrt(x**2) == x` is caught at `x = -1` rather than surviving on positive probes.
 
 Every derived script is scanned for floating-point literals and approximating calls before it runs, so an "exact-looking" proof that secretly calls `N()` is rejected without executing. That check earned its place immediately: it caught a real error in the first draft of the Pareto second moment, where the asserted closed form was missing a factor that SymPy got right.
 
-A topic the kernel cannot formalise is not a failure to hide. `adaptive-harness research "zzz qqq unmatchable"` produces a paper that explicitly reports INCONCLUSIVE, states that no derivation strategy matched, and names what input would let it proceed. Prefer that to a confident paper about nothing.
+A topic the legacy kernel cannot formalise is not a failure to hide. `adaptive-harness research "zzz qqq unmatchable" --offline-legacy` produces a paper that explicitly reports INCONCLUSIVE. A live run can likewise end UNSOLVED when its agents fail to close the verification gaps.
 
-Artifacts land in `research/<topic-slug>/` — the hash-chained ledger, the derivation plan, the generated proof and experiment scripts with their raw data, the figures, the audit log, the bibliography, the convergence history, the receipts, and the paper. Because the paper is generated from receipts, nothing can be typeset that was not derived and checked.
+Artifacts land in `research/<topic-slug>/` — the hash-chained ledger, the derivation plan, the generated proof and experiment scripts with their raw data, the figures, the audit log, the bibliography, the convergence history, the receipts, and the paper. Receipt tags make the evidence auditable; inspect the formal statement and assumptions to check that the prose matches the Lean theorem.
 
 ## The two proof tiers, and why `sorry` is fatal
 
@@ -104,7 +104,7 @@ SymPy can tell you two expressions are equal. It cannot tell you a *deduction* i
 Try the acceptance example:
 
 ```bash
-adaptive-harness research "Formally prove that the sum of the first N natural numbers equals N*(N+1)/2 and verify both in SymPy and Lean 4"
+adaptive-harness research "Formally prove that the sum of the first N natural numbers equals N*(N+1)/2 and verify both in SymPy and Lean 4" --offline-legacy
 ```
 
 The kernel derives two SymPy propositions (the closed form is algebraically well formed; the induction step is polynomial and therefore exactly decidable) and pairs them with a Lean file that discharges the induction itself. The run reports `PROVEN`, and `paper.pdf` carries a *Formal Foundations* section with a green certification box per proof.
@@ -116,7 +116,7 @@ theorem gauss_two_mul (n : Nat) : 2 * sumFirst n = n * (n + 1) := by
   sorry
 ```
 
-and **exit 0**, emitting a `warning: declaration uses 'sorry'` rather than an error. Any verifier that reads the exit status would certify a false theorem. So three checks must all pass: no `sorry` token in the source (with comments and string literals stripped first, so prose cannot trip it), no "declaration uses 'sorry'" diagnostic, and — the strongest — no dependency on `sorryAx`, which the kernel asks Lean about directly via `#print axioms`. You can watch the difference yourself: replace the induction step in `proofs/lean/LEAN-GAUSS.lean` with `sorry`, run `lean` on it, note the exit code is still 0, then re-run the research command. `formal_verification` fails, the run reports `UNSOLVED`, and the paper is not published. That test is pinned as `test_tampered_lean_file_blocks_the_run`.
+and **exit 0**, emitting a `warning: declaration uses 'sorry'` rather than an error. Any verifier that reads the exit status would certify a false theorem. So three checks must all pass: no `sorry` token in the source (with comments and string literals stripped first, so prose cannot trip it), no "declaration uses 'sorry'" diagnostic, and — the strongest — no dependency on `sorryAx`, which the kernel asks Lean about directly via `#print axioms`. You can watch the difference yourself: replace the induction step in `proofs/lean/LEAN-GAUSS.lean` with `sorry`, run `lean` on it, note the exit code is still 0, then re-run the research command. `lean_formal_soundness` fails, the run reports `UNSOLVED`, and the paper is not published. That test is pinned as `test_tampered_lean_file_blocks_the_run`.
 
 What must be certified depends on the verdict, because the standard applies to asserted theorems. A `PROVEN` theorem needs its Lean file. A `DISPROVEN` result does not: the refutation is the result, and it is certified by an exact witness the kernel already checked — a Lean proof of a falsehood would be neither expected nor meaningful. An `INCONCLUSIVE` verdict publishes no theorem, so the tier does not apply and the paper says so rather than implying formal backing it lacks.
 

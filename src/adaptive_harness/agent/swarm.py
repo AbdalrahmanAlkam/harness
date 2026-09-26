@@ -269,6 +269,9 @@ class DeveloperAgentWorker:
                  safety_profile: str = "turbo",
                  tool_names: Sequence[str] | None = None,
                  forced_mode: str | None = None,
+                 forced_thinking: str | None = None,
+                 enable_skill_routing: bool = False,
+                 write_target: Path | None = None,
                  system_prompt: str | None = None,
                  on_event: Callable[[Any], None] | None = None) -> None:
         if max_steps is not None and max_steps < 1:
@@ -280,6 +283,9 @@ class DeveloperAgentWorker:
         self.safety_profile = safety_profile
         self.tool_names = tuple(tool_names) if tool_names else None
         self.forced_mode = forced_mode
+        self.forced_thinking = forced_thinking
+        self.enable_skill_routing = enable_skill_routing
+        self.write_target = write_target
         self.system_prompt = system_prompt
         self.on_event = on_event
 
@@ -288,6 +294,8 @@ class DeveloperAgentWorker:
         from adaptive_harness.tools.bash import RunBashTool
         from adaptive_harness.tools.file_ops import EditFileTool, ReadFileTool, WriteFileTool
         from adaptive_harness.tools.lean import RunLeanProofTool
+        from adaptive_harness.tools.research import WebSearchTool
+        from adaptive_harness.tools.research_swarm import CompileTypstTool
         from adaptive_harness.tools.python_repl import RunPythonReplTool
         from adaptive_harness.tools.testing import RunPytestTool
         from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
@@ -295,7 +303,9 @@ class DeveloperAgentWorker:
         if self.tool_names is not None:
             available = {
                 "read_file": lambda: ReadFileTool(workspace_root=root),
-                "write_file": lambda: WriteFileTool(workspace_root=root),
+                "write_file": lambda: WriteFileTool(
+                    workspace_root=root,
+                    allowed_paths=(self.write_target,) if self.write_target else None),
                 "edit_file": lambda: EditFileTool(workspace_root=root),
                 "list_directory": lambda: ListDirectoryTool(workspace_root=root),
                 "search_files": lambda: SearchFilesTool(workspace_root=root),
@@ -304,6 +314,8 @@ class DeveloperAgentWorker:
                 "run_python_repl": lambda: RunPythonReplTool(),
                 "run_lean_proof": lambda: RunLeanProofTool(workspace_root=root,
                                                             lean_dir="proofs/lean"),
+                "web_search": lambda: WebSearchTool(allow_public_metadata=True),
+                "compile_typst": lambda: CompileTypstTool(workspace_root=root),
             }
             unknown = [name for name in self.tool_names if name not in available]
             if unknown:
@@ -335,8 +347,9 @@ class DeveloperAgentWorker:
         agent = DeveloperAgent(llm_client=self.llm_client_factory() if self.llm_client_factory else None,
             tools=tools, workspace_root=root, repository=self.repository,
             forced_mode=self.forced_mode or ("security" if assignment.role is SwarmRole.SECURITY else "coding"),
+            forced_thinking=self.forced_thinking,
             require_file_changes=assignment.may_edit,
-            enable_skill_routing=False,
+            enable_skill_routing=self.enable_skill_routing,
             step_policy=self.step_policy,
             safety_profile=self.safety_profile,
             system_prompt=f"{role_prompt}\n{assignment.instruction}\n"
