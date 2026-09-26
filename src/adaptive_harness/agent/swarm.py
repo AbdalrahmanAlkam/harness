@@ -13,7 +13,7 @@ from enum import Enum
 import json
 from pathlib import Path
 import re
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 # A refusal is structural: explicit decline phrasing AND no completed tool work.
 _REFUSAL_PHRASES = re.compile(
@@ -255,6 +255,11 @@ class DeveloperAgentWorker:
 
     Only the coder receives file mutation and shell tools, and
     every file tool is rooted in the assigned workspace.
+
+    ``tool_names`` overrides the default set with an explicit list, which is how
+    the research swarm equips a division with the instruments its methodology
+    needs — a Lean formaliser needs ``run_lean_proof``, a simulator needs the
+    Python REPL — rather than the coder/reviewer split used for software work.
     """
 
     def __init__(self, *, llm_client_factory: Callable[[], Any] | None = None,
@@ -262,6 +267,9 @@ class DeveloperAgentWorker:
                  step_policy: str = "classifier",
                  repository: Any = None,
                  safety_profile: str = "turbo",
+                 tool_names: Sequence[str] | None = None,
+                 forced_mode: str | None = None,
+                 system_prompt: str | None = None,
                  on_event: Callable[[Any], None] | None = None) -> None:
         if max_steps is not None and max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -270,17 +278,38 @@ class DeveloperAgentWorker:
         self.step_policy = step_policy
         self.repository = repository
         self.safety_profile = safety_profile
+        self.tool_names = tuple(tool_names) if tool_names else None
+        self.forced_mode = forced_mode
+        self.system_prompt = system_prompt
         self.on_event = on_event
 
-    def __call__(self, assignment: SwarmAssignment) -> SwarmResult:
-        from adaptive_harness.agent.agent import DeveloperAgent
-        from adaptive_harness.prompts import PromptRegistry
+    def _build_tools(self, root: str, assignment: SwarmAssignment) -> list[Any]:
+        """Construct the tool list for one assignment."""
         from adaptive_harness.tools.bash import RunBashTool
         from adaptive_harness.tools.file_ops import EditFileTool, ReadFileTool, WriteFileTool
+        from adaptive_harness.tools.lean import RunLeanProofTool
+        from adaptive_harness.tools.python_repl import RunPythonReplTool
         from adaptive_harness.tools.testing import RunPytestTool
         from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 
-        root = str(assignment.workspace_root)
+        if self.tool_names is not None:
+            available = {
+                "read_file": lambda: ReadFileTool(workspace_root=root),
+                "write_file": lambda: WriteFileTool(workspace_root=root),
+                "edit_file": lambda: EditFileTool(workspace_root=root),
+                "list_directory": lambda: ListDirectoryTool(workspace_root=root),
+                "search_files": lambda: SearchFilesTool(workspace_root=root),
+                "run_bash": lambda: RunBashTool(workspace_root=root),
+                "run_pytest": lambda: RunPytestTool(workspace_root=root),
+                "run_python_repl": lambda: RunPythonReplTool(),
+                "run_lean_proof": lambda: RunLeanProofTool(workspace_root=root,
+                                                            lean_dir="proofs/lean"),
+            }
+            unknown = [name for name in self.tool_names if name not in available]
+            if unknown:
+                raise ValueError(f"Unsupported worker tools requested: {unknown}")
+            return [available[name]() for name in self.tool_names]
+
         tools = [ReadFileTool(workspace_root=root), ListDirectoryTool(workspace_root=root),
                  SearchFilesTool(workspace_root=root)]
         if assignment.may_edit:
@@ -290,13 +319,22 @@ class DeveloperAgentWorker:
             tools.append(RunBashTool(workspace_root=root, read_only=True))
             if (assignment.workspace_root / "tests").is_dir():
                 tools.append(RunPytestTool(workspace_root=root))
+        return tools
+
+    def __call__(self, assignment: SwarmAssignment) -> SwarmResult:
+        from adaptive_harness.agent.agent import DeveloperAgent
+        from adaptive_harness.prompts import PromptRegistry
+
+        root = str(assignment.workspace_root)
+        tools = self._build_tools(root, assignment)
         prompts = PromptRegistry.for_workspace(assignment.workspace_root)
-        role_prompt = (prompts.get("system.default") + "\n" + prompts.get("swarm.role.coder") if assignment.may_edit else
-                       prompts.get("swarm.role.security") if assignment.role is SwarmRole.SECURITY else
-                       prompts.get("swarm.role.read_only"))
+        role_prompt = self.system_prompt or (
+            prompts.get("system.default") + "\n" + prompts.get("swarm.role.coder") if assignment.may_edit else
+            prompts.get("swarm.role.security") if assignment.role is SwarmRole.SECURITY else
+            prompts.get("swarm.role.read_only"))
         agent = DeveloperAgent(llm_client=self.llm_client_factory() if self.llm_client_factory else None,
             tools=tools, workspace_root=root, repository=self.repository,
-            forced_mode="security" if assignment.role is SwarmRole.SECURITY else "coding",
+            forced_mode=self.forced_mode or ("security" if assignment.role is SwarmRole.SECURITY else "coding"),
             require_file_changes=assignment.may_edit,
             enable_skill_routing=False,
             step_policy=self.step_policy,

@@ -551,13 +551,15 @@ def test_live_author_writes_artifacts_and_records_them(tmp_path: Path):
     assert {call[0] for call in calls} == {Division.ADVERSARIAL}
     assert swarm.ledger.by_action("CLEARANCE_GRANTED")
 
-    # A producing division routes through _produce, which must persist the text.
+    # A producing division routes through _produce, which must persist the text
+    # at the division's own target. A theory worker writes a proof script rather
+    # than prose, so the target is proofs/<agent>.py, not a markdown note.
     theory = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "tighten the bound",
                                   ["read_file", "write_file"])
     swarm._produce(Division.THEORY, swarm.agents[theory], "mathematical_soundness", [])
-    written = list(swarm.workspace.root.rglob("*.md"))
-    assert written, "authored content was not written to the artifact tree"
-    assert any("Findings from" in path.read_text() for path in written)
+    target = swarm.workspace.proof_dir / f"{theory}.py"
+    assert target.is_file(), "the theory worker's artifact was not written"
+    assert "Findings from" in target.read_text()
     assert any("artifact" in entry.payload for entry in swarm.ledger.by_action("STATUS_REPORT"))
 
 

@@ -668,7 +668,9 @@ def research(
                                              help="Operator safety valve; the loop is not turn-limited by default"),
     patience: int = typer.Option(2, "--patience", help="No-progress cycles tolerated before escalating"),
     max_workers: int = typer.Option(8, "--max-workers", help="Per-division worker cap"),
-    author: bool = typer.Option(False, "--author", help="Let a live LLM author the artifacts"),
+    author: bool = typer.Option(False, "--author",
+                               help="Run research workers as interactive tool-using subagents "
+                                    "against a live model (mechanical kernel otherwise)"),
 ):
     """Runs the autonomous research swarm and publishes a paper with a verdict.
 
@@ -684,14 +686,16 @@ def research(
     from adaptive_harness.research.swarm import ResearchSwarm, SwarmConfig
 
     author_fn = None
+    client_factory = None
     if author:
         try:
-            author_fn = _llm_author()
+            client_factory = _llm_client_factory()
         except Exception as exc:  # noqa: BLE001 - surfaced to the operator
             console.print(f"[yellow]Live authoring disabled: {type(exc).__name__}: {exc}[/yellow]")
 
     config = SwarmConfig(max_cycles=max_cycles, stagnation_patience=patience,
-                         max_workers_per_division=max_workers, seed=seed, author=author_fn,
+                         max_workers_per_division=max_workers, seed=seed,
+                         llm_client_factory=client_factory,
                          claim=claim,
                          claim_symbols=tuple(name.strip() for name in symbols.split(",") if name.strip()))
     swarm = ResearchSwarm(topic, root=root, config=config)
@@ -724,25 +728,27 @@ def research(
         raise typer.Exit(code=2)
 
 
-def _llm_author():
-    """Build an authoring callback that drives a live model per artifact."""
+def _llm_client_factory():
+    """Build a factory that mints a fresh LLM client per research worker.
+
+    A new client per worker is deliberate: each subagent needs its own
+    conversation, tool set, and system prompt, and sharing one would interleave
+    their histories.
+    """
     from adaptive_harness.llm.client import LLMClient
-    from adaptive_harness.research.roles import Division
 
-    client = LLMClient()
-    if client.is_mock:
-        raise RuntimeError("no live model is configured; rerun without --author")
+    probe = LLMClient()
+    if probe.is_mock:
+        raise RuntimeError("no live model is configured; rerun without --author, or set a "
+                           "provider key to enable interactive subagents")
 
-    def author(division: Division, artefact: str, instruction: str) -> str:
-        from adaptive_harness.prompts import PromptRegistry
-        registry = PromptRegistry()
-        system = registry.get(f"research.division.{division.value}")
-        response = client.complete(messages=[{"role": "system", "content": system},
-                                            {"role": "user", "content": instruction}],
-                                   model=client.default_model)
-        return response.content or ""
+    def factory():
+        return LLMClient(api_key=probe.api_key, base_url=probe.base_url,
+                         default_model=probe.default_model, force_mock=False,
+                         provider=probe.provider, provider_keys=probe.provider_keys,
+                         backup_providers=probe.backup_providers)
 
-    return author
+    return factory
 
 
 if __name__ == "__main__":

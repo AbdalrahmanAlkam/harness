@@ -28,7 +28,7 @@ from adaptive_harness.research.gate import (ConvergenceOutcome, Invariant, Invar
                                             RelentlessConvergenceLoop, StopReason,
                                             write_cycle_history)
 from adaptive_harness.research.lean_gate import LEAN_DIRNAME, LeanProofGate
-from adaptive_harness.research.ledger import ACTIONS, CommLedger, sha256_file
+from adaptive_harness.research.ledger import CommLedger, sha256_file
 from adaptive_harness.research.paper import PaperBuilder
 from adaptive_harness.research.proof import ProofRunner
 from adaptive_harness.research.roles import (DIVISION_SPECS, FALSIFICATION_VERDICT, Clearance,
@@ -50,6 +50,26 @@ GAP_ROUTING: Mapping[str, Division] = {
 }
 
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
+
+
+def _summarize_args(arguments: Any, limit: int = 160) -> str:
+    """Compact, loggable rendering of a tool call's arguments.
+
+    A trajectory is written to an append-only ledger, so arguments are truncated
+    rather than copied wholesale: a worker pasting a whole proof into a log line
+    would bloat the audit without adding evidence.
+    """
+    if arguments is None:
+        return ""
+    if isinstance(arguments, str):
+        text = arguments
+    else:
+        try:
+            text = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            text = str(arguments)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def topic_slug(topic: str) -> str:
@@ -160,6 +180,13 @@ class SwarmConfig:
     experiment_timeout_s: float = 300.0
     seed: int = 20260926
     author: Callable[[Division, str, str], str] | None = None
+    # A factory for real per-worker LLM clients. When set, research workers run
+    # as multi-step tool-using subagents instead of one-shot completions; when
+    # absent the mechanical kernel remains the path and no model is called.
+    llm_client_factory: Callable[[], Any] | None = None
+    worker_max_steps: int | None = 24
+    step_policy: str = "classifier"
+    safety_profile: str = "turbo"
     typst_root: Path | None = None
     auto_install_typst: bool = True
     # A checkable claim stated as "lhs == rhs", which the kernel decides directly
@@ -174,6 +201,9 @@ class SwarmConfig:
 
     @property
     def author_mode(self) -> str:
+        """Whether a model is consulted at all, and in what capacity."""
+        if self.llm_client_factory is not None:
+            return "interactive"
         return "live" if self.author else "mechanical"
 
 
@@ -772,17 +802,146 @@ class ResearchSwarm:
                             "worker_budget": budget, "spawned": spawned})
         return tuple(spawned)
 
+    def _interactive_capable(self) -> bool:
+        """Whether a real tool-using subagent can be launched for this run."""
+        return self.config.llm_client_factory is not None
+
+    def _run_worker(self, agent: ResearchAgent, division: Division, directive: str,
+                    *, success_criterion: str, target: Path) -> dict[str, Any]:
+        """Run one worker as a multi-step, tool-using subagent.
+
+        This replaces a single-shot text completion. The worker is a real agent
+        with the division's instruments, so it can write a script, execute it,
+        read the failure, and revise — which is what closing a gap actually
+        requires. Its trajectory is recorded in the ledger, because a research
+        claim is only worth as much as the path that reached it.
+
+        Returns a summary dict; ``ran`` is False when no live model is available,
+        in which case the caller falls back to mechanical synthesis.
+        """
+        from adaptive_harness.agent.swarm import (DeveloperAgentWorker, SwarmAssignment,
+                                                   SwarmPhase, SwarmRole, run_assignment)
+        from adaptive_harness.research.roles import WORKER_TOOLS
+
+        if not self._interactive_capable():
+            return {"ran": False, "reason": "no live model configured"}
+
+        tool_names = WORKER_TOOLS.get(division, ("read_file", "write_file", "edit_file", "run_bash"))
+        trajectory: list[dict[str, Any]] = []
+        outcome: dict[str, Any] = {}
+
+        def on_event(event: Any) -> None:
+            kind = getattr(event, "event_type", "")
+            payload = getattr(event, "payload", {}) or {}
+            if kind == "tool_call":
+                trajectory.append({"tool": payload.get("name"),
+                                   "args": _summarize_args(payload.get("arguments"))})
+            elif kind == "tool_result":
+                if trajectory:
+                    trajectory[-1]["ok"] = bool(payload.get("success"))
+                    error = payload.get("error")
+                    if error:
+                        trajectory[-1]["error"] = str(error)[:300]
+            elif kind == "response":
+                outcome.update({"summary": str(payload.get("content", ""))[:4000],
+                                "stop_reason": payload.get("stop_reason"),
+                                "success": bool(payload.get("success"))})
+
+        worker = DeveloperAgentWorker(
+            llm_client_factory=self.config.llm_client_factory,
+            max_steps=self.config.worker_max_steps,
+            step_policy=self.config.step_policy,
+            safety_profile=self.config.safety_profile,
+            tool_names=tool_names,
+            forced_mode="coding" if "write_file" in tool_names else "research",
+            system_prompt=self._worker_prompt(division, success_criterion, target),
+            on_event=on_event)
+        assignment = SwarmAssignment(SwarmRole.CODER, SwarmPhase.IMPLEMENT, directive,
+                                     self.workspace.root)
+        try:
+            result = run_assignment(worker, assignment)
+        except Exception as exc:  # noqa: BLE001 - a worker failure must not kill the run
+            summary = {"ran": True, "success": False,
+                       "error": f"{type(exc).__name__}: {exc}"[:400], "trajectory": trajectory}
+            self._log_trajectory(agent, division, summary)
+            return summary
+
+        summary = {
+            "ran": True,
+            "success": bool(result.success),
+            "summary": result.summary,
+            "stop_reason": outcome.get("stop_reason"),
+            "error": result.error,
+            "trajectory": trajectory,
+            "tool_calls": len(trajectory),
+            "wrote_target": target.is_file(),
+        }
+        self._log_trajectory(agent, division, summary)
+        return summary
+
+    def _worker_prompt(self, division: Division, success_criterion: str, target: Path) -> str:
+        """The worker's operating instructions, including its success test."""
+        try:
+            relative = target.relative_to(self.workspace.root)
+        except ValueError:
+            relative = target
+        return (
+            f"You are a research worker in the {DIVISION_SPECS[division].leader_title}'s division. "
+            f"{DIVISION_SPECS[division].objective}\n"
+            f"Write your artifact to {relative}. "
+            f"{success_criterion} "
+            "Work iteratively: write the artifact, execute it with your tools, read the exact "
+            "error or diagnostic, and revise until it passes. Do not report success you have not "
+            "observed from a tool result. A proof script must contain no floating-point literal "
+            "and no approximating call, because both are rejected before execution. A Lean proof "
+            "must contain no sorry, no admit, and no bare axiom declaration.")
+
+    def _log_trajectory(self, agent: ResearchAgent, division: Division,
+                        summary: Mapping[str, Any]) -> None:
+        """Record what the worker actually did, so the audit shows the path."""
+        self.ledger.append(
+            "WORKER_TRAJECTORY",
+            {"agent_id": agent.agent_id, "role": agent.role_name},
+            {"agent_id": leader_agent_id(division), "role": DIVISION_SPECS[division].leader_title},
+            {"ran": bool(summary.get("ran")),
+             "success": bool(summary.get("success")),
+             "tool_calls": summary.get("tool_calls", 0),
+             "tools_used": [item.get("tool") for item in summary.get("trajectory", [])],
+             "trajectory": summary.get("trajectory", [])[:40],
+             "stop_reason": summary.get("stop_reason"),
+             "error": (summary.get("error") or "")[:400]})
+
     def _falsify(self, agent: ResearchAgent, spawned: list[str]) -> None:
         """Red-team pass: seek a counterexample, then record the disposition.
 
-        In live mode the author's reply is parsed as a structured verdict. An
-        ambiguous reply is recorded as inconclusive and grants *no* clearance,
-        so a chatty model cannot accidentally rubber-stamp a claim.
+        A falsification attempt is only worth something if it actually searched,
+        so when a live model is available the red team runs as a tool-using
+        subagent with the claim's artifacts in reach. Its verdict must still be a
+        structured JSON object: prose is recorded as inconclusive and grants no
+        clearance, so a chatty model cannot rubber-stamp a claim.
         """
-        raw = self._author(Division.ADVERSARIAL, "counterexample",
-                           f"{agent.directive} {FALSIFICATION_VERDICT}")
-        verdict = FalsificationVerdict.parse(raw) if self.config.author else FalsificationVerdict(
-            Clearance.CLEARED, "no live author configured; mechanical pass found nothing")
+        verdict: FalsificationVerdict
+        if self._interactive_capable():
+            outcome = self._run_worker(
+                agent, Division.ADVERSARIAL,
+                f"Attempt to falsify the current claim for topic '{self.topic}'. "
+                f"Your directive: {agent.directive} "
+                f"Inspect the proof and experiment scripts under proofs/ and experiments/.",
+                success_criterion=(
+                    "Success: either exhibit a concrete counterexample with the exact input that "
+                    f"produced it, or state that the search was empty. Then reply with ONLY "
+                    f"{FALSIFICATION_VERDICT}"),
+                target=self.workspace.root / "audit" / f"{agent.agent_id}.md")
+            verdict = FalsificationVerdict.parse(outcome.get("summary"))
+            if not verdict.conclusive and not outcome.get("success"):
+                verdict = FalsificationVerdict(
+                    Clearance.PENDING,
+                    outcome.get("error") or "the falsification worker did not return a verdict")
+        else:
+            raw = self._author(Division.ADVERSARIAL, "counterexample",
+                               f"{agent.directive} {FALSIFICATION_VERDICT}")
+            verdict = FalsificationVerdict.parse(raw) if self.config.author else FalsificationVerdict(
+                Clearance.CLEARED, "no live author configured; mechanical pass found nothing")
         agent.clearance = verdict.status
 
         if verdict.status is Clearance.COUNTEREXAMPLE:
@@ -815,14 +974,44 @@ class ResearchSwarm:
 
     def _produce(self, division: Division, agent: ResearchAgent, gap: str,
                  spawned: list[str]) -> None:
-        """Ask a worker to close ``gap``; a live author writes the artifact."""
+        """Close ``gap``, preferring a real tool-using worker over a text reply.
+
+        A one-shot completion can only restate a claim; closing a gap means
+        writing a script that executes, so when a live model is available the
+        division gets an agent with tools and a success criterion it must observe
+        from a tool result. Without one, the mechanical kernel remains the path.
+        """
+        artefact = {"literature": "evidence", "theory": "proofs",
+                    "empirical": "experiments", "adversarial": "audit",
+                    "formal": "proofs/lean"}.get(division.value, "proofs")
+        target = self.workspace.root / artefact / f"{agent.agent_id}.md"
+        if division.value == "theory":
+            target = self.workspace.proof_dir / f"{agent.agent_id}.py"
+        elif division.value == "empirical":
+            target = self.workspace.experiment_dir / f"{agent.agent_id}.py"
+        elif division.value == "formal":
+            target = self.workspace.lean_dir / f"{agent.agent_id}.lean"
+
+        if self._interactive_capable():
+            criterion = self._success_criterion(division, target)
+            outcome = self._run_worker(agent, division,
+                                       f"Close the {gap} gap for topic '{self.topic}'. "
+                                       f"Your directive: {agent.directive}",
+                                       success_criterion=criterion, target=target)
+            self.ledger.append("STATUS_REPORT", {"agent_id": agent.agent_id, "role": agent.role_name},
+                               {"agent_id": leader_agent_id(division),
+                                "role": DIVISION_SPECS[division].leader_title},
+                               {"gap": gap, "mode": "interactive-subagent",
+                                "success": outcome.get("success"),
+                                "tool_calls": outcome.get("tool_calls", 0),
+                                "artifact": str(target.relative_to(self.workspace.root))
+                                if target.is_file() else None})
+            return
+
         instruction = (f"Close the {gap} gap for topic '{self.topic}'. "
                        f"Your directive: {agent.directive}")
-        artefact = {"literature": "evidence", "theory": "proofs",
-                    "empirical": "experiments", "adversarial": "audit"}.get(division.value, "proofs")
         produced = self._author(division, artefact, instruction)
         if produced:
-            target = self.workspace.root / f"{artefact}/{agent.agent_id}.md"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(produced, encoding="utf-8")
             self.ledger.append("STATUS_REPORT", {"agent_id": agent.agent_id, "role": agent.role_name},
@@ -834,6 +1023,22 @@ class ResearchSwarm:
                                {"agent_id": leader_agent_id(division),
                                 "role": DIVISION_SPECS[division].leader_title},
                                {"gap": gap, "status": "no live author; awaiting artifact"})
+
+    def _success_criterion(self, division: Division, target: Path) -> str:
+        """The observable condition a worker must reach, stated per division."""
+        name = target.name
+        if division is Division.FORMAL:
+            return (f"Success: call run_lean_proof on {name} and observe exit code 0 with no "
+                    f"sorry, no admit, and no axiom declaration.")
+        if division in (Division.THEORY, Division.EMPIRICAL):
+            extra = (" The script must also write a data artifact so the run can be replicated."
+                     if division is Division.EMPIRICAL else "")
+            return (f"Success: {name} exists and running it with the Python REPL or run_bash exits "
+                    f"0.{extra}")
+        if division is Division.ADVERSARIAL:
+            return ("Success: report a concrete counterexample with the exact input that produced "
+                    "it, or state that the declared search returned empty.")
+        return f"Success: {name} exists and contains the evidence you relied on."
 
     def _write_bibliography(self) -> Path:
         """Emit BibTeX for every recorded evidence record.

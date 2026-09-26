@@ -28,14 +28,28 @@ class MockLLMClient:
 
     def __init__(self, default_model: str = "mock-llm"):
         self.default_model = default_model
+        # Parameters of the most recent call, for assertions in tests.
+        self.last_call: Dict[str, Any] = {}
 
     def complete(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         model: Optional[str] = None,
+        # The agent passes routing and reasoning parameters that a real provider
+        # uses. The mock has no notion of them, but it must accept them: without
+        # them every offline call raises TypeError and the run degrades to
+        # "Model request failed", which makes offline development useless.
+        **kwargs: Any,
     ) -> LLMResponse:
         """Generates realistic responses or tool calls based on user message content."""
+        # Record what the harness asked for so tests can assert the routing
+        # decision reached the provider boundary even in mock mode.
+        self.last_call = {"model": model, "tools": [t.get("function", {}).get("name")
+                                                    for t in (tools or [])],
+                          "tier": kwargs.get("tier"),
+                          "reasoning_effort": kwargs.get("reasoning_effort"),
+                          "reasoning_budget_tokens": kwargs.get("reasoning_budget_tokens")}
         # If last message is a tool result, synthesize completion
         if messages and messages[-1].get("role") == "tool":
             tool_content = str(messages[-1].get("content", ""))

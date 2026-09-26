@@ -669,8 +669,16 @@ class DeveloperAgent:
                     reasoning_budget_tokens=thinking_res.budget_tokens,
                 )
             except Exception as exc:
-                llm_resp = LLMResponse(content=f"Model request failed ({type(exc).__name__}). Retry the task or check the connection.",
-                    finish_reason="error", usage={"prompt_tokens": 0, "completion_tokens": 0})
+                # The message matters: without it every provider fault collapses
+                # to the same "provider_error", leaving an operator unable to
+                # tell a bad credential from a network outage or a bad signature.
+                detail = str(exc).strip().replace("\n", " ")[:300]
+                llm_resp = LLMResponse(
+                    content=(f"Model request failed ({type(exc).__name__}"
+                             + (f": {detail}" if detail else "")
+                             + "). Retry the task or check the connection."),
+                    finish_reason="error", usage={"prompt_tokens": 0, "completion_tokens": 0},
+                    metadata={"error_type": type(exc).__name__, "error_detail": detail})
             response_usage = llm_resp.usage or {}
             if (llm_resp.metadata or {}).get("failed_over_from"):
                 selected_model = llm_resp.model or self.llm_client.default_model

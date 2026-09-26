@@ -61,19 +61,35 @@ DIVISION_SPECS: Mapping[Division, DivisionSpec] = {
         "Reproduce every theoretical prediction under a pinned seed and report the "
         "95% interval, including the runs that contradict the theory.",
         ("Simulation Worker", "Benchmark Worker", "Statistics Auditor"),
-        ("read_file", "write_file", "edit_file", "run_bash", "run_python_repl", "plot_terminal")),
+        ("read_file", "write_file", "edit_file", "list_directory", "search_files",
+         "run_bash", "run_python_repl", "plot_terminal")),
     Division.ADVERSARIAL: DivisionSpec(
         Division.ADVERSARIAL, "Adversarial Lead",
         "Attempt to falsify every claim by constructing counterexamples, boundary "
         "cases, and unstated assumptions; grant clearance only when attempts fail.",
         ("Red Team Auditor", "Falsifier", "Assumption Hunter"),
-        ("read_file", "search_files", "list_directory", "run_bash", "run_python_repl")),
+        ("read_file", "search_files", "list_directory", "run_bash", "run_python_repl",
+         "run_lean_proof")),
     Division.FORMAL: DivisionSpec(
         Division.FORMAL, "Formal Proof Lead",
         "Formalise each proposition in Lean 4 and have the kernel machine-check it, so the "
         "published claim rests on a verified derivation and not only on symbolic computation.",
-        ("Lean Formaliser", "Tactic Specialist", "Axiom Auditor"),
+        ("Lean Formalist", "Tactic Specialist", "Axiom Auditor"),
         ("read_file", "write_file", "edit_file", "run_bash", "run_lean_proof")),
+}
+
+# Tool sets for the interactive subagent loop, per division. These differ from the
+# static DivisionSpec lists above: a *worker* that iterates in a tool loop needs
+# the instruments of its methodology, and the theorist additionally needs the Lean
+# prover so a formal proof can be machine-checked mid-iteration.
+WORKER_TOOLS: Mapping[Division, tuple[str, ...]] = {
+    Division.LITERATURE: ("read_file", "search_files", "list_directory", "write_file"),
+    Division.THEORY: ("read_file", "write_file", "edit_file", "run_python_repl",
+                      "run_bash", "run_lean_proof"),
+    Division.EMPIRICAL: ("read_file", "write_file", "edit_file", "run_python_repl", "run_bash"),
+    Division.ADVERSARIAL: ("search_files", "read_file", "run_python_repl", "run_bash",
+                           "run_lean_proof"),
+    Division.FORMAL: ("read_file", "write_file", "edit_file", "run_bash", "run_lean_proof"),
 }
 
 # A falsification attempt must return this shape. Prose alone is ambiguous: read
