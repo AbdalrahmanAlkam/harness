@@ -15,3 +15,5 @@ Red-team workers attempt to falsify every claim before clearance.
 - MSG-0097 adversarial_falsifier_02: no live author configured; mechanical pass found nothing (searched: boundary cases, degenerate inputs, unstated assumptions)
 - MSG-0114 adversarial_red_team_auditor_01: no live author configured; mechanical pass found nothing (searched: boundary cases, degenerate inputs, unstated assumptions)
 - MSG-0116 adversarial_falsifier_02: no live author configured; mechanical pass found nothing (searched: boundary cases, degenerate inputs, unstated assumptions)
+- MSG-0133 adversarial_red_team_auditor_01: no live author configured; mechanical pass found nothing (searched: boundary cases, degenerate inputs, unstated assumptions)
+- MSG-0135 adversarial_falsifier_02: no live author configured; mechanical pass found nothing (searched: boundary cases, degenerate inputs, unstated assumptions)

@@ -198,6 +198,10 @@ class SwarmConfig:
     # two-tier standard but skips the formal tier would be misleading, so the
     # opt-out is explicit and recorded in the run's verdict.
     formalize: bool = True
+    # When no library template covers the topic, ask the Director to formulate
+    # candidate claims instead of abandoning the investigation. Only the claim
+    # comes from the model; the deciding script is always kernel-generated.
+    formulate_unknown: bool = True
 
     @property
     def author_mode(self) -> str:
@@ -268,16 +272,41 @@ class ResearchSwarm:
         self.planned_experiments: int = 0
         self.planned_formalisations: int = 0
         self.formalisation_notes: str = ""
+        self.formulation: Any = None
         self.lean_gate = LeanProofGate(self.workspace.lean_dir)
         self._install_leaders()
 
     def _make_plan(self) -> TopicPlan:
-        """Decide up front what the kernel will attempt, so the run can report it."""
+        """Decide up front what the kernel will attempt, so the run can report it.
+
+        A topic the library does not cover is not abandoned. When a model is
+        available the Director is asked to formulate candidate claims, and those
+        claims become kernel-checked propositions; only the *claim* comes from the
+        model, never the deciding script.
+        """
         from adaptive_harness.research.synthesis import plan_research
         claim: ParsedClaim | None = None
         if self.config.claim:
             claim = parse_claim(self.config.claim, self.config.claim_symbols)
-        return plan_research(self.topic, claim)
+        plan = plan_research(self.topic, claim)
+        if plan.propositions or not self.config.formulate_unknown:
+            return plan
+
+        from adaptive_harness.research.formulate import formulate
+        client = None
+        if self.config.llm_client_factory is not None:
+            try:
+                client = self.config.llm_client_factory()
+            except Exception:  # noqa: BLE001 - fall back to the one-shot author
+                client = None
+        formulation = formulate(self.topic, client=client, author=self.config.author)
+        self.formulation = formulation
+        if formulation.empty:
+            return plan
+        return TopicPlan(
+            topic=self.topic, strategy="dynamic-formulation",
+            propositions=formulation.propositions,
+            notes=(f"{plan.notes} {formulation.notes}").strip())
 
     # -- organisation -------------------------------------------------------
     def _install_leaders(self) -> None:
@@ -631,21 +660,26 @@ class ResearchSwarm:
         cleared = [agent.agent_id for agent in self.agents.values()
                    if agent.division is Division.ADVERSARIAL and not agent.is_leader
                    and agent.clearance is Clearance.CLEARED]
-        if not cleared:
-            return False, "no red-team worker has returned a verdict yet", ()
-        if not self.workspace.audit.is_file():
-            return False, "adversarial audit log has not been written", ()
+
+        # A refutation is settled by its witness, so it is judged before any
+        # clearance is required: a red team that declined to return a verdict must
+        # not block publication of a result the kernel already certified exactly.
         if self.claims.headline is Verdict.DISPROVEN:
             refuted = [item for item in self.claims.disproven if item.finding]
             if not refuted:
                 return False, "the claim is reported refuted but no witness was exhibited", ()
             first = refuted[0]
             return True, (f"the reported verdict is a refutation certified by the exact witness "
-                          f"{first.finding[:120]}; {len(cleared)} red-team worker(s) raised no "
-                          f"objection to the disproof"), tuple(cleared)
+                          f"{first.finding[:120]}; {len(cleared)} red-team worker(s) cleared the "
+                          f"claim and none holds an objection to the disproof"), tuple(cleared)
+
         if self.claims.headline is not Verdict.PROVEN:
             return False, (f"verdict is {self.claims.headline.value}, so there is no settled result "
                            f"to certify"), ()
+        if not cleared:
+            return False, "no red-team worker has returned a verdict yet", ()
+        if not self.workspace.audit.is_file():
+            return False, "adversarial audit log has not been written", ()
         return True, (f"{len(cleared)} red-team worker(s) cleared {len(self.proofs.scripts())} "
                       f"proved claim(s); audit log written"), tuple(cleared)
 
@@ -1146,13 +1180,20 @@ class ResearchSwarm:
         if self.plan.notes:
             lines += [textwrap.fill(self.plan.notes, 92), ""]
         if self.plan.propositions:
-            lines.append("The kernel derived the following propositions:")
+            origin = ("formulated by the Director for an uncovered topic"
+                      if self.plan.strategy == "dynamic-formulation"
+                      else "derived by the kernel")
+            lines.append(f"The kernel will attempt the following propositions ({origin}):")
             lines.append("")
             for prop in self.plan.propositions:
                 lines.append(f"- `{prop.prop_id}` ({prop.kind}) — {prop.name}")
+                if prop.statement:
+                    lines.append(f"  - {prop.statement}")
             lines.append("")
         else:
             lines += ["No proposition could be constructed for this topic.", ""]
+            if self.formulation is not None and self.formulation.notes:
+                lines += ["### Formulation attempt", "", self.formulation.notes, ""]
         lines += ["## Definition of Solved", "",
                   "A result is settled only when all five invariants hold:", ""]
         for invariant, rationale in (

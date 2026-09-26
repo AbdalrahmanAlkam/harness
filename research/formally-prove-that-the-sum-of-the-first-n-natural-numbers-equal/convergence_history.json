@@ -6,7 +6,7 @@
   "gate": {
     "cycle": 2,
     "satisfied": true,
-    "fingerprint": "b7fc0bca02778d22",
+    "fingerprint": "9d9692ed9933a64d",
     "statuses": [
       {
         "invariant": "mathematical_soundness",
@@ -35,7 +35,7 @@
       {
         "invariant": "document_integrity",
         "satisfied": true,
-        "detail": "paper.pdf built cleanly (101685 bytes, typst 0.15.1 (9dfd3a08))",
+        "detail": "paper.pdf built cleanly (102780 bytes, typst 0.15.1 (9dfd3a08))",
         "evidence": []
       },
       {
@@ -48,7 +48,7 @@
         ]
       },
       {
-        "invariant": "formal_verification",
+        "invariant": "lean_formal_soundness",
         "satisfied": true,
         "detail": "all 1 Lean file(s) machine-checked by Lean (version 4.34.1, x86_64-unknown-linux-gnu, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release), covering 2 theorem(s), with no sorry and no sorryAx",
         "evidence": [
@@ -68,16 +68,16 @@
         "adversarial_red_team_auditor_01",
         "adversarial_falsifier_02"
       ],
-      "gate_fingerprint": "4e923c3061aaac86",
-      "elapsed_s": 3.34
+      "gate_fingerprint": "fd033c81548c6668",
+      "elapsed_s": 3.67
     },
     {
       "index": 2,
       "gaps": [],
       "diagnosis": "none",
       "workers_spawned": [],
-      "gate_fingerprint": "b7fc0bca02778d22",
-      "elapsed_s": 2.89
+      "gate_fingerprint": "9d9692ed9933a64d",
+      "elapsed_s": 3.12
     }
   ]
 }

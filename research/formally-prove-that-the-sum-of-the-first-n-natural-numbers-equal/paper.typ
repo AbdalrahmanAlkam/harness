@@ -144,8 +144,10 @@ No simulation was run, so the results above stand on exact computation alone and
 
 == 8. Adversarial Audit
 
-An independent red team filed 8 falsification attempt(s), surfaced 0 counterexample(s), and granted 8 clearance(s). Clearance is not awarded for want of a counterexample: it is recorded only when a declared search — boundary cases, degenerate inputs, unstated assumptions — returned empty, and an ambiguous reply is treated as inconclusive rather than as a pass.
+An independent red team filed 10 falsification attempt(s), surfaced 0 counterexample(s), and granted 10 clearance(s). Clearance is not awarded for want of a counterexample: it is recorded only when a declared search — boundary cases, degenerate inputs, unstated assumptions — returned empty, and an ambiguous reply is treated as inconclusive rather than as a pass.
 
+- `adversarial\_red\_team\_auditor\_01` (conclusive): no live author configured; mechanical pass found nothing (searched: boundary cases, degenerate inputs, unstated assumptions)
+- `adversarial\_falsifier\_02` (conclusive): no live author configured; mechanical pass found nothing (searched: boundary cases, degenerate inputs, unstated assumptions)
 - `adversarial\_red\_team\_auditor\_01` (conclusive): no live author configured; mechanical pass found nothing (searched: boundary cases, degenerate inputs, unstated assumptions)
 - `adversarial\_falsifier\_02` (conclusive): no live author configured; mechanical pass found nothing (searched: boundary cases, degenerate inputs, unstated assumptions)
 - `adversarial\_red\_team\_auditor\_01` (conclusive): no live author configured; mechanical pass found nothing (searched: boundary cases, degenerate inputs, unstated assumptions)
@@ -162,9 +164,9 @@ The investigation is reported as complete only when all four invariants hold sim
 - *mathematical\_soundness* — satisfied: all 2 derivation(s) reached a clean verdict
 - *empirical\_replication* — satisfied: no simulation applies to this claim, so the result rests on exact computation alone and no statistical claim is made
 - *adversarial\_clearance* — satisfied: 2 red-team worker(s) cleared 2 proved claim(s); audit log written
-- *document\_integrity* — satisfied: paper.pdf built cleanly (101685 bytes, typst 0.15.1 (9dfd3a08))
+- *document\_integrity* — satisfied: paper.pdf built cleanly (102780 bytes, typst 0.15.1 (9dfd3a08))
 - *claim\_adjudication* — satisfied: verdict PROVEN: Headline PROVEN of 2 proposition(s) (2 proven, 0 disproven, 0 inconclusive).
-- *formal\_verification* — satisfied: all 1 Lean file(s) machine-checked by Lean (version 4.34.1, x86\_64-unknown-linux-gnu, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release), covering 2 theorem(s), with no sorry and no sorryAx
+- *lean\_formal\_soundness* — satisfied: all 1 Lean file(s) machine-checked by Lean (version 4.34.1, x86\_64-unknown-linux-gnu, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release), covering 2 theorem(s), with no sorry and no sorryAx
 
 == 10. Conclusion
 
@@ -194,7 +196,7 @@ Each proposition was decided by executing the script below in a subprocess with 
   width: 100%,
   [
   #text(weight: "bold")[prop-gauss-step] — `prop-gauss-step.py`
-  status `VERIFIED\_EXIT\_0`, exit code `0`, 220 ms
+  status `VERIFIED\_EXIT\_0`, exit code `0`, 251 ms
   digest `sha256:4cfafadbfef39e821b89079b4bc847d58e88cd67a4d19732916264a9df4b061e`
   ],
 )
@@ -207,7 +209,7 @@ Each proposition was decided by executing the script below in a subprocess with 
   width: 100%,
   [
   #text(weight: "bold")[prop-gauss] — `prop-gauss.py`
-  status `VERIFIED\_EXIT\_0`, exit code `0`, 231 ms
+  status `VERIFIED\_EXIT\_0`, exit code `0`, 250 ms
   digest `sha256:36afb7c534c728c2b61befc979d6e98fe6a35b852f64c5d99e874633d6307abe`
   ],
 )
@@ -224,5 +226,5 @@ The complete verified Lean sources, so a reader can reproduce the verification i
 
 The loop is not turn-limited; it terminates on convergence or on *proven* stagnation, where a cycle changes nothing about the gate and the escalated worker budget cannot help.
 
-- cycle 1: gaps = adversarial\_clearance; spawned 2 worker(s); fingerprint `4e923c3061aaac86`; 3.34 s
-- cycle 2: gaps = none; spawned 0 worker(s); fingerprint `b7fc0bca02778d22`; 2.89 s
+- cycle 1: gaps = adversarial\_clearance; spawned 2 worker(s); fingerprint `fd033c81548c6668`; 3.67 s
+- cycle 2: gaps = none; spawned 0 worker(s); fingerprint `9d9692ed9933a64d`; 3.12 s

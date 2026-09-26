@@ -110,7 +110,33 @@ work in this push; earlier history is summarized in `git log`.
   covered by both tiers. SymPy discharges the algebra of the induction step;
   Lean discharges the induction itself, which SymPy cannot do.
 
+### Added
+- **Dynamic topic formulation** (`research/formulate.py`). A topic no library
+  template covers is no longer abandoned: the Director is asked to formulate
+  candidate claims, which are then decided by the kernel. The division of
+  labour is the point — the model states the claim, the kernel writes the script
+  that judges it, so no model-authored code is ever executed and a model
+  proposing a false identity gets it *refuted* rather than believed. Claims
+  that are not exact symbolic identities (float literals, `N()`, prose) are
+  dropped rather than admitted, and a declined or unusable reply is reported as
+  such rather than passed off as coverage.
+- **Research worker autonomy**: workers are now multi-step, tool-using
+  subagents rather than one-shot completions (see below).
+
 ### Fixed
+- **`MockLLMClient` was unusable by the agent.** Its `complete` did not accept
+  `tier`, `reasoning_effort`, or `reasoning_budget_tokens`, which the agent always
+  passes, so every offline call raised `TypeError` and degraded to "Model request
+  failed". The documented offline engine therefore never worked end to end. It
+  now accepts and records them, exposed as `last_call` for assertions.
+- **A provider fault reported only the exception type**, collapsing every
+  failure into the same `provider_error` and leaving an operator unable to
+  distinguish a bad credential from a network outage. The message is now
+  carried through.
+- **A declining red team blocked publication of a kernel-certified refutation.**
+  The clearance requirement was evaluated before the DISPROVEN branch, so an
+  inconclusive red team prevented a result the kernel had already certified with
+  an exact witness. The refutation is now judged first.
 - **`compile_typst` and `run_lean_proof` were unreachable from a task.** Both were
   absent from `domain_tool_names[DomainMode.RESEARCH]`, and `run_lean_proof` was
   not on the toolbelt at all, so a research agent could not build the paper it was

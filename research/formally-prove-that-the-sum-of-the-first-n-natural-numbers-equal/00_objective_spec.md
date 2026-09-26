@@ -9,10 +9,12 @@ in sympy and lean 4
 
 Strategy selected: `gauss`
 
-The kernel derived the following propositions:
+The kernel will attempt the following propositions (derived by the kernel):
 
 - `PROP-GAUSS` (theorem) — Gauss's sum in division-free form
+  - $2 S(n) = n (n + 1)$. The division-free form is used so that both proof tiers check identical content without a divisibility argument.
 - `PROP-GAUSS-STEP` (lemma) — The induction step of Gauss's sum
+  - $2 (S(k) + (k + 1)) = (k + 1) (k + 2)$, so the doubling identity is preserved by one step of the recursion.
 
 ## Definition of Solved
 
