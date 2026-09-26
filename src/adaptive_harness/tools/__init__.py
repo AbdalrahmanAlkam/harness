@@ -6,6 +6,8 @@ from adaptive_harness.tools.file_ops import ReadFileTool, WriteFileTool, EditFil
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 from adaptive_harness.tools.clarification import AskUserTool
 from adaptive_harness.tools.testing import RunPytestTool
+from adaptive_harness.tools.lean import (LeanDiagnostic, LeanToolchain, LeanVerification,
+                                    LeanVerifier, RunLeanProofTool)
 from adaptive_harness.tools.research_swarm import (CompileTypstTool, RunExperimentTool,
                                                    ScaleDivisionTool, SpawnSubagentTool,
                                                    VerifyProofTool)
@@ -26,4 +28,9 @@ __all__ = [
     "ScaleDivisionTool",
     "SpawnSubagentTool",
     "VerifyProofTool",
+    "RunLeanProofTool",
+    "LeanToolchain",
+    "LeanVerifier",
+    "LeanVerification",
+    "LeanDiagnostic",
 ]
