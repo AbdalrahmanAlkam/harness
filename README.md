@@ -360,9 +360,9 @@ Artifacts land under `research/<topic-slug>/`: the hash-chained
 and raw CSV, `figures/`, `03_adversarial_audit.md`, `bibliography.bib`,
 `convergence_history.json`, receipt indexes, and the generated `paper.typ` plus
 its `paper.pdf`.
-If live authoring fails before a paper exists, the final PDF is explicitly
-labelled an `UNSOLVED` progress report and directs readers to the receipts and
-ledger. It does not present an unverified proof as a paper.
+If live authoring fails or leaves an invalid Typst draft, the final PDF is
+explicitly labelled an `UNSOLVED` progress report and directs readers to the
+receipts and ledger. The failed source is preserved as `paper_draft.typ`.
 
 **The output is a mathematical paper**, not a log: title, abstract,
 introduction, a notation table, numbered theorems each with explicit hypotheses,

@@ -1523,20 +1523,28 @@ class ResearchSwarm:
         if self._live_research_mode():
             if not outcome.solved:
                 marker = "#align(center)[*Research status: UNSOLVED*]"
+                progress = (
+                    "= Research progress report\n\n"
+                    "The research swarm did not verify its objective. This document is a "
+                    "progress report, not a proof or a completed academic paper.\n\n"
+                    "The objective, exact claim manifest, attempted proof scripts, "
+                    "verification receipts, convergence history, and communication "
+                    "ledger are preserved beside this report for inspection.\n")
                 if self.workspace.paper_typ.is_file():
                     source = self.workspace.paper_typ.read_text(encoding="utf-8")
                 else:
-                    source = (
-                        "= Research progress report\n\n"
-                        "The research swarm did not verify its objective. This document is a "
-                        "progress report, not a proof or a completed academic paper.\n\n"
-                        "The objective, exact claim manifest, attempted proof scripts, "
-                        "verification receipts, convergence history, and communication "
-                        "ledger are preserved beside this report for inspection.\n")
+                    source = progress
                 if marker not in source:
                     self.workspace.paper_typ.write_text(marker + "\n\n" + source,
                                                         encoding="utf-8")
-                self._compile()
+                result = self._compile()
+                if result is None or not result.success:
+                    if source != progress:
+                        (self.workspace.root / "paper_draft.typ").write_text(
+                            source, encoding="utf-8")
+                    self.workspace.paper_typ.write_text(marker + "\n\n" + progress,
+                                                        encoding="utf-8")
+                    self._compile()
             return
         try:
             builder = PaperBuilder(self.workspace.root, typst_root=self.config.typst_root,

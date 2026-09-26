@@ -220,6 +220,16 @@ def test_failed_live_author_leaves_an_honest_progress_pdf(tmp_path: Path):
     assert swarm.workspace.paper_pdf.is_file()
 
 
+def test_invalid_live_draft_is_preserved_and_replaced_by_progress_pdf(tmp_path: Path):
+    swarm = ResearchSwarm("unfinished", root=tmp_path,
+                          config=SwarmConfig(llm_client_factory=lambda: object()))
+    swarm.workspace.paper_typ.write_text("#let =\n")
+    swarm._republish(SimpleNamespace(solved=False))
+    assert (swarm.workspace.root / "paper_draft.typ").read_text() == "#let =\n"
+    assert "Research status: UNSOLVED" in swarm.workspace.paper_typ.read_text()
+    assert swarm.workspace.paper_pdf.is_file()
+
+
 def test_missing_lead_assignment_is_visible_to_later_workers(tmp_path: Path, monkeypatch):
     swarm = ResearchSwarm("assignment", root=tmp_path,
                           config=SwarmConfig(llm_client_factory=lambda: object()))

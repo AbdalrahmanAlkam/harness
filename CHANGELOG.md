@@ -16,8 +16,8 @@ work in this push; earlier history is summarized in `git log`.
   data and explicit 95% prediction records. Lean receipts are written beside
   each source and their hashes are linked into the communication ledger.
 - Live workers use a short write-first pass before iterative verification.
-  An unfinished run produces a labelled UNSOLVED progress PDF if no paper was
-  authored, preserving the objective and receipt trail without claiming proof.
+  An unfinished run produces a labelled UNSOLVED progress PDF if no valid
+  paper was authored, preserving a failed Typst draft and the receipt trail.
 
 ### Added
 - **Autonomous hierarchical research swarm** (`adaptive-harness research "<topic>"`,
