@@ -253,7 +253,17 @@ def test_topic_slug_is_filesystem_safe():
 
 def test_spawn_subagent_scales_and_records_the_ledger(tmp_path: Path):
     swarm = ResearchSwarm("spawn test", root=tmp_path)
-    assert {agent.division for agent in swarm.agents.values()} == set(Division)
+    # The Director is a roster member above the divisions, so it is the only agent
+    # without one. Every agent that does have a division is that division's lead.
+    assert {agent.division for agent in swarm.agents.values()
+            if agent.division is not None} == set(Division)
+    director = swarm.agents["executive_director_01"]
+    assert director.division is None and director.parent_id is None
+    assert not director.is_leader
+    assert set(director.children) == {f"{division.value}_lead_01" for division in Division}
+    for division in Division:
+        lead = swarm.agents[f"{division.value}_lead_01"]
+        assert lead.is_leader and lead.division is division and lead.parent_id == director.agent_id
 
     agent_id = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "prove the bound",
                                     ["read_file", "run_bash"], 8000)

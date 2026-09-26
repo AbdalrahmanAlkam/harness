@@ -111,7 +111,7 @@ def test_live_director_authors_claims_without_builtin_synthesis(tmp_path: Path, 
     assert not swarm.plan.propositions
     visited = []
 
-    def fake_worker(agent, division, directive, *, success_criterion, target):
+    def fake_worker(agent, division, directive, *, success_criterion, target, **_kwargs):
         visited.append(agent.role_name)
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.name == "claim_manifest.json":
@@ -234,7 +234,7 @@ def test_missing_lead_assignment_is_visible_to_later_workers(tmp_path: Path, mon
     swarm = ResearchSwarm("assignment", root=tmp_path,
                           config=SwarmConfig(llm_client_factory=lambda: object()))
 
-    def only_director_writes(agent, division, directive, *, success_criterion, target):
+    def only_director_writes(agent, division, directive, *, success_criterion, target, **_kwargs):
         if agent.role_name == "Executive Director":
             swarm.workspace.objective_spec.write_text("# Objective\n")
             target.write_text(json.dumps({"claims": [{"id": "PROP-01", "name": "Claim",

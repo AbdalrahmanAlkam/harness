@@ -159,10 +159,10 @@ class ResearchAgent:
     division: Division | None = None
     clearance: Clearance = Clearance.PENDING
     children: list[str] = field(default_factory=list)
-
-    @property
-    def is_leader(self) -> bool:
-        return self.division is not None and self.role_name.endswith("Lead")
+    # Explicit rather than inferred from the role name. A title heuristic silently
+    # demoted any lead whose name did not happen to end in "Lead" — and promoted
+    # nothing, so the failure was a quiet loss of hierarchy, not a visible error.
+    is_leader: bool = False
 
     @property
     def depth(self) -> int:
@@ -176,6 +176,7 @@ class ResearchAgent:
                 "allowed_tools": list(self.allowed_tools),
                 "budget_tokens": self.budget_tokens,
                 "clearance": self.clearance.value,
+                "is_leader": self.is_leader,
                 "children": list(self.children)}
 
 

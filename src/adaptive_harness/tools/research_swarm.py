@@ -146,3 +146,74 @@ class CompileTypstTool(Tool):
                           error=result.error, metadata={"pdf_path": str(result.pdf_path),
                                                         "pages": result.pages,
                                                         "typst_version": result.typst_version})
+
+
+class StopWorkerTool(Tool):
+    """Cancel, pause, or resume one research worker, attributing the decision."""
+
+    name = "stop_worker"
+    description = (
+        "Stop, pause, or resume a named research worker. The actor and reason are required and are "
+        "recorded in the audit ledger, so a stop is always attributable. Cancelling also kills the "
+        "child processes that worker started and prevents any further tool call by it.")
+    parameters = {"type": "object", "properties": {
+        "agent_id": {"type": "string", "description": "The worker to act on."},
+        "action": {"type": "string", "enum": ["cancel", "pause", "resume"],
+                   "description": "cancel stops it for good; pause is resumable."},
+        "actor": {"type": "string",
+                  "description": "Who is issuing this, e.g. a lead's agent_id. Required."},
+        "reason": {"type": "string", "description": "Why. Recorded verbatim. Required."},
+    }, "required": ["agent_id", "action", "actor", "reason"]}
+
+    def __init__(self, swarm: Any):
+        self.swarm = swarm
+
+    def execute(self, agent_id: str, action: str, actor: str, reason: str,
+                **kwargs: Any) -> ToolResult:
+        from adaptive_harness.research.coordination import StopKind
+
+        verb = str(action).lower()
+        try:
+            if verb == "resume":
+                if not self.swarm.resume_worker(agent_id):
+                    return ToolResult(success=False, output="",
+                                      error=f"{agent_id} is not paused, so there is nothing to resume")
+                record = self.swarm.control.record(agent_id)
+                return ToolResult(success=True, output=json.dumps(record.to_dict(),
+                                                                   ensure_ascii=False))
+            if verb not in {"cancel", "pause"}:
+                return ToolResult(success=False, output="",
+                                  error="action must be cancel, pause, or resume")
+            applied = (self.swarm.stop_worker(agent_id, actor=actor, reason=reason)
+                       if verb == "cancel" else
+                       self.swarm.pause_worker(agent_id, actor=actor, reason=reason))
+        except ValueError as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+        if not applied:
+            record = self.swarm.control.record(agent_id)
+            state = record.state.value if record else "unregistered"
+            return ToolResult(success=False, output="",
+                              error=f"{agent_id} is {state}; only an active worker can be {verb}ed")
+        record = self.swarm.control.record(agent_id)
+        assert record is not None
+        return ToolResult(success=True, output=json.dumps(record.to_dict(), ensure_ascii=False),
+                          metadata={"kind": StopKind.CANCEL.value if verb == "cancel"
+                                    else StopKind.PAUSE.value})
+
+
+class SwarmStatusTool(Tool):
+    """Report the live state of the swarm: workers, tasks, gates, and open requests."""
+
+    name = "swarm_status"
+    description = (
+        "Report the current state of the research swarm: every worker's lifecycle state and "
+        "assignment, open board tasks with their owners and artifacts, unanswered help requests, "
+        "and how many ledger entries have been recorded. Read-only.")
+    parameters = {"type": "object", "properties": {}, "required": []}
+
+    def __init__(self, swarm: Any):
+        self.swarm = swarm
+
+    def execute(self, **kwargs: Any) -> ToolResult:
+        return ToolResult(success=True,
+                          output=json.dumps(self.swarm.swarm_status(), ensure_ascii=False, indent=2))

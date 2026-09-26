@@ -121,3 +121,55 @@ def test_audit_policy_allows_read_only_dependency_scanners():
     assert audit_command_is_read_only("safety check")
     assert not audit_command_is_read_only("pip-audit --output report.json")
     assert not audit_command_is_read_only("pip-audit; touch changed.txt")
+
+
+def test_a_skill_whose_checks_are_unreachable_is_skipped_with_a_reason(tmp_path: Path):
+    """A checklist the run cannot discharge must not be injected, and the skip
+    must be reported rather than passing silently.
+
+    ``symbolic_math_solver`` requires ``symbolic_checked``, which only
+    ``verify_equation`` can discharge. Audit mode does not expose that tool, so the
+    skill is inapplicable there — and injecting it anyway would make the agent fail
+    a gate it was never able to pass.
+    """
+    class Client:
+        def complete(self, **kwargs):
+            return LLMResponse(content="Draft.")
+
+    agent = DeveloperAgent(llm_client=Client(), workspace_root=str(tmp_path),
+                           forced_mode="audit")
+    agent.active_skills["symbolic_math_solver"] = agent.skill_catalog.read("symbolic_math_solver")
+    events = list(agent.run_stream("Symbolically prove the identity", max_steps=1))
+    skipped = [event.payload["error"] for event in events
+               if event.event_type == "storage_error" and "skipped" in str(event.payload)]
+    assert skipped, "dropping a skill silently would look like it was applied"
+    assert "symbolic_math_solver" in skipped[0] and "symbolic_checked" in skipped[0]
+    selected = next(event.payload for event in events if event.event_type == "specialized_skill")
+    assert "symbolic_math_solver" not in [item["name"] for item in selected["skills"]]
+    # And the same skill *is* usable where its instrument exists.
+    science = DeveloperAgent(llm_client=Client(), workspace_root=str(tmp_path),
+                             forced_mode="science")
+    science.active_skills["symbolic_math_solver"] = science.skill_catalog.read("symbolic_math_solver")
+    science_events = list(science.run_stream("Symbolically prove the identity", max_steps=1))
+    assert "symbolic_math_solver" in [item["name"] for item in next(
+        event.payload for event in science_events
+        if event.event_type == "specialized_skill")["skills"]]
+
+
+def test_applying_a_skill_never_removes_the_core_coding_tools(tmp_path: Path):
+    """Guidance may focus the tool set; it must not disarm the agent.
+
+    ``architecture_design`` binds inspection tools only, so applying it would strip
+    the write and test tools if the narrowing were not re-unioned with the core.
+    """
+    class Client:
+        def complete(self, **kwargs):
+            return LLMResponse(content="Draft.")
+
+    agent = DeveloperAgent(llm_client=Client(), workspace_root=str(tmp_path),
+                           forced_mode="coding")
+    agent.active_skills["architecture_design"] = agent.skill_catalog.read("architecture_design")
+    events = list(agent.run_stream("Design an architecture for these components", max_steps=1))
+    exposed = set(next(event.payload for event in events
+                       if event.event_type == "specialized_skill")["tools"])
+    assert {"edit_file", "write_file", "run_bash", "run_pytest"}.issubset(exposed)

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 import json
 import os
+import signal
 import typer
 from rich.console import Console
 from rich.markup import escape
@@ -670,6 +671,12 @@ def research(
                                      help="Maximum tool-loop steps per worker attempt"),
     absolute_ceiling: int = typer.Option(64, "--absolute-ceiling",
                                        min=1, help="Maximum convergence cycles, even without --max-cycles"),
+    parallel_workers: int = typer.Option(4, "--parallel-workers", min=1,
+                                         help="Worker tool loops a division may run at once; 1 is serial"),
+    worker_timeout: Optional[float] = typer.Option(None, "--worker-timeout",
+                                                  help="Seconds a single worker tool loop may run before TIMED_OUT"),
+    resume: bool = typer.Option(True, "--resume/--no-resume",
+                                help="Recover the persisted task board and ledger from an interrupted run"),
     provider: str = typer.Option("openrouter", "--provider",
                                  help="Configured API provider for independent research agents"),
     author: bool = typer.Option(True, "--author/--offline-legacy",
@@ -686,6 +693,10 @@ def research(
     The loop is stagnation-limited rather than turn-limited: it exits on
     convergence, or when a cycle provably cannot change the verdict and the
     escalated worker pool does not help.
+
+    Ctrl-C is safe: the first signal asks every active worker to stop and the run
+    reports EXTERNAL_STOP with the operator named, rather than leaving orphaned
+    child processes and a ledger that claims the loop converged.
     """
     from adaptive_harness.research.swarm import ResearchSwarm, SwarmConfig
 
@@ -703,6 +714,8 @@ def research(
     config = SwarmConfig(max_cycles=max_cycles, stagnation_patience=patience,
                          max_workers_per_division=max_workers,
                          absolute_ceiling=absolute_ceiling, worker_max_steps=worker_steps,
+                         max_parallel_workers=parallel_workers,
+                         worker_timeout_s=worker_timeout, resume=resume,
                          seed=seed,
                          llm_client_factory=client_factory,
                          claim=claim,
@@ -713,9 +726,56 @@ def research(
                   f"{len(swarm.plan.propositions)}[/dim]")
     if swarm.plan.notes:
         console.print(f"[dim]{swarm.plan.notes}[/dim]")
-    console.print(f"[dim]artifacts: {swarm.workspace.root}[/dim]\n")
-    outcome = swarm.run(objective=objective,
-                        on_status=lambda message: console.print(f"[dim]{message}[/dim]"))
+    recovered = swarm.recovery_report()
+    if recovered.get("resumed"):
+        console.print(f"[dim]resumed: {recovered['tasks']} task(s) restored, "
+                      f"{recovered['healed']} healed, "
+                      f"{recovered['messages']} message(s) replayed; "
+                      f"completed tasks are not re-run[/dim]")
+    console.print(f"[dim]artifacts: {swarm.workspace.root}[/dim]")
+    console.print(f"[dim]interrupt with Ctrl-C to stop every active worker; "
+                  f"state is preserved in {swarm.workspace.ledger_path.name}[/dim]\n")
+
+    def on_status(message: str) -> None:
+        console.print(f"[dim]{message}[/dim]")
+
+    def on_interrupt(*_args: object) -> None:
+        # The first Ctrl-C is a *request*: the control plane records the actor,
+        # cancels every live worker, and kills their process groups so the run ends
+        # with an attributable EXTERNAL_STOP instead of a torn-off traceback.
+        console.print("\n[yellow]interrupt received: stopping every active worker "
+                      "(press Ctrl-C again to abort immediately)[/yellow]")
+        swarm.stop_run(actor="operator", reason="SIGINT from the operator")
+
+    previous_handler = signal.getsignal(signal.SIGINT)
+    try:
+        signal.signal(signal.SIGINT, on_interrupt)
+    except ValueError:  # pragma: no cover - non-main thread
+        previous_handler = None
+    try:
+        outcome = swarm.run(objective=objective, on_status=on_status)
+    except KeyboardInterrupt:  # pragma: no cover - second Ctrl-C
+        swarm.stop_run(actor="operator", reason="operator forced an abort")
+        raise
+    finally:
+        if previous_handler is not None:
+            try:
+                signal.signal(signal.SIGINT, previous_handler)
+            except ValueError:  # pragma: no cover - non-main thread
+                pass
+
+    status = swarm.swarm_status()
+    console.print("\n[bold]Swarm state at exit[/bold]")
+    for line in swarm.render_status().splitlines():
+        console.print(line)
+    if status["open_tasks"]:
+        console.print(f"[dim]open tasks: "
+                      f"{', '.join(task['task_id'] for task in status['open_tasks'])}[/dim]")
+    if status["unacknowledged_requests"]:
+        console.print(f"[dim]unanswered help requests: "
+                      f"{len(status['unacknowledged_requests'])}[/dim]")
+    if status["stopped_by"]:
+        console.print(f"[yellow]run was stopped by {status['stopped_by']}[/yellow]")
 
     verdict = swarm.claims.headline
     color = {"PROVEN": "green", "DISPROVEN": "red"}.get(verdict.value, "yellow")
@@ -727,13 +787,14 @@ def research(
     for line in outcome.render().splitlines():
         console.print(line)
     if swarm._last_report is not None:
-        for status in swarm._last_report.statuses:
-            mark = "[green]PASS[/green]" if status.satisfied else "[red]FAIL[/red]"
-            console.print(f"  {mark} {status.invariant.value}: {status.detail}")
+        for item in swarm._last_report.statuses:
+            mark = "[green]PASS[/green]" if item.satisfied else "[red]FAIL[/red]"
+            console.print(f"  {mark} {item.invariant.value}: {item.detail}")
     if outcome.pdf:
         label = "Paper" if outcome.solved else "Progress report"
         console.print(f"\n[bold green]{label}:[/bold green] {outcome.pdf}")
     console.print(f"[dim]Ledger: {swarm.workspace.ledger_path}[/dim]")
+    console.print(f"[dim]Task board: {swarm.workspace.root / 'task_board.json'}[/dim]")
     if not outcome.solved:
         raise typer.Exit(code=2)
 

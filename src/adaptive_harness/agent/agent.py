@@ -244,7 +244,8 @@ class DeveloperAgent:
         """
         from adaptive_harness.research.swarm import ResearchSwarm, SwarmConfig
         from adaptive_harness.tools.research_swarm import (RunExperimentTool, ScaleDivisionTool,
-                                                           SpawnSubagentTool, VerifyProofTool)
+                                                           SpawnSubagentTool, StopWorkerTool,
+                                                           SwarmStatusTool, VerifyProofTool)
 
         if config is None and not getattr(self.llm_client, "is_mock", True):
             def research_client_factory() -> LLMClient:
@@ -263,13 +264,20 @@ class DeveloperAgent:
         self.tools["scale_division"] = ScaleDivisionTool(swarm)
         self.tools["verify_proofs"] = VerifyProofTool(swarm)
         self.tools["run_experiments"] = RunExperimentTool(swarm)
+        # Stop control and a status read-out. These give the interactive Director
+        # real authority over the control plane, which it could not previously
+        # exercise: it could hire and retire agents but had no way to halt one that
+        # was looping, nor to see what the board thought was outstanding.
+        self.tools["stop_worker"] = StopWorkerTool(swarm)
+        self.tools["swarm_status"] = SwarmStatusTool(swarm)
         return swarm
 
     def disable_research(self) -> None:
         """Detach the research swarm and its tools."""
         self.research_enabled = False
         self.research_swarm = None
-        for name in ("spawn_subagent", "scale_division", "verify_proofs", "run_experiments"):
+        for name in ("spawn_subagent", "scale_division", "verify_proofs", "run_experiments",
+                     "stop_worker", "swarm_status"):
             self.tools.pop(name, None)
 
     def _research_director_prompt(self) -> str:
@@ -288,7 +296,10 @@ class DeveloperAgent:
                   "and only exit code 0 is admitted. Write experiments into experiments/ as seeded "
                   "scripts that emit a CSV artifact. Use spawn_subagent to recruit a worker for one "
                   "specific gap and scale_division to resize a pool; use verify_proofs and "
-                  "run_experiments to adjudicate. Never claim a result that has no receipt.")
+                  "run_experiments to adjudicate. Use swarm_status to see each worker's state and "
+                  "the open board tasks, and stop_worker to cancel or pause a worker that is "
+                  "looping or stuck, naming yourself as the actor and stating why. "
+                  "Never claim a result that has no receipt.")
 
     def set_workspace(self, path: str | Path) -> None:
         target = Path(path).expanduser().resolve()
@@ -560,11 +571,13 @@ class DeveloperAgent:
             yield AgentEvent("storage_error", {"error": f"Skill {missing_skill} is no longer installed; resuming automatic routing."})
         skill_selection = self.skill_router.route(original_input, catalog,
             self.classifier_backend, tuple(self.active_skills))
-        selected_skills = skill_selection.skills if self.enable_skill_routing else ()
+        routed = skill_selection.skills if self.enable_skill_routing else ()
+        # Applicability is decided further down, once the exposed tool set is
+        # final; a skill is usable only if its completion checks are reachable then.
+        selected_skills = tuple(routed)
+
         security_skill_active = any(skill.name == "security_audit_scanner"
                                     for skill in selected_skills)
-        selected_tool_names = set().union(*(set(skill.tools) for skill in selected_skills)) if selected_skills else None
-
 
         # Add user message to history
         self.messages.append({"role": "user", "content": user_input})
@@ -617,18 +630,46 @@ class DeveloperAgent:
         }[domain_res.mode]
         if self.safety_profile == "turbo":
             domain_tool_names.discard("ask_user")
-        if selected_tool_names is not None:
-            domain_tool_names.intersection_update(selected_tool_names)
-        if domain_res.mode == DomainMode.CODING or (mutation_required and domain_res.mode != DomainMode.AUDIT):
-            # Skills add guidance; they must never remove the core coding tools.
-            domain_tool_names.update({"read_file", "list_directory", "search_files", "write_file",
-                                      "edit_file", "run_bash", "run_pytest"} & set(self.tools))
         if self.swarm_enabled and domain_res.mode != DomainMode.AUDIT:
             domain_tool_names.add("delegate_subagent")
         if research_active:
-            domain_tool_names.update({"spawn_subagent", "scale_division",
-                                      "verify_proofs", "run_experiments",
+            domain_tool_names.update({"spawn_subagent", "scale_division", "stop_worker",
+                                      "swarm_status", "verify_proofs", "run_experiments",
                                       "compile_typst", "run_lean_proof"} & set(self.tools))
+        core_coding = {"read_file", "list_directory", "search_files", "write_file",
+                       "edit_file", "run_bash", "run_pytest"} & set(self.tools)
+        # Two facts constrain each other, so they are settled together. A skill is
+        # usable only if its completion checks are reachable with the tools this run
+        # exposes; the exposed set in turn narrows to the skills' own tools, with
+        # the core coding tools always re-added because guidance must never remove
+        # them. Resolving that pair by iterating to a fixed point avoids both
+        # failures: a skill that could never pass its checks, and a skill that
+        # quietly took the write tools away.
+        for _pass in range(len(routed) + 2):
+            exposed = domain_tool_names & set(self.tools)
+            applicable = self.skill_verifier.applicable(selected_skills, exposed)
+            if applicable == selected_skills:
+                break
+            selected_skills = applicable
+            focused = set(domain_tool_names)
+            if selected_skills:
+                focused &= set().union(*(set(skill.tools) for skill in selected_skills))
+            # Skills add guidance; they must never remove the core coding tools.
+            if domain_res.mode == DomainMode.CODING or (
+                    mutation_required and domain_res.mode != DomainMode.AUDIT):
+                focused |= core_coding
+            domain_tool_names = focused
+        blocked_skills = {
+            name: checks
+            for name, checks in self.skill_verifier.unreachable(
+                routed, domain_tool_names & set(self.tools)).items()
+            if name not in {skill.name for skill in selected_skills}}
+        if blocked_skills:
+            yield AgentEvent("storage_error", {
+                "error": ("skipped " + ", ".join(
+                    f"{name} (unreachable checks: {', '.join(checks)})"
+                    for name, checks in sorted(blocked_skills.items()))
+                    + " — this run does not expose the tools those skills require")})
         tool_schemas = [t.to_openai_schema() for t in self.tools.values() if t.name in domain_tool_names]
         yield AgentEvent("specialized_skill", {
             "skills": [{"name": skill.name, "title": skill.title, "category": skill.category,

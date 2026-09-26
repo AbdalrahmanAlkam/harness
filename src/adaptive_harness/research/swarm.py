@@ -13,6 +13,7 @@ every run is auditable even if it aborts early.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -23,6 +24,10 @@ from typing import Any, Callable, Mapping, Sequence
 
 from adaptive_harness.research.claim import (EXIT_COUNTEREXAMPLE, EXIT_HOLDS, ClaimLedger,
                                               ParsedClaim, Proposition, TopicPlan, Verdict, parse_claim)
+from adaptive_harness.research.coordination import (TASK_BOARD_FILENAME, CoordinationError,
+                                                    MessageBus, MessageKind, StopKind,
+                                                    SwarmControl, Task, TaskBoard, WorkerCancelled,
+                                                    WorkerState)
 from adaptive_harness.research.experiment import ExperimentRunner, canonical_key
 from adaptive_harness.research.gate import (ConvergenceOutcome, Invariant, InvariantGate,
                                             RelentlessConvergenceLoop, StopReason,
@@ -198,6 +203,21 @@ class SwarmConfig:
     # candidate claims instead of abandoning the investigation. Only the claim
     # comes from the model; the deciding script is always kernel-generated.
     formulate_unknown: bool = True
+    # How long a worker may hold a task lease before another worker may take it.
+    # A lease that outlives its owner would strand the board, and a lease shorter
+    # than a single tool loop would let two workers share one artifact.
+    task_lease_s: float = 1800.0
+    max_task_attempts: int = 3
+    # How many workers of one division may run their tool loops at once. 1
+    # restores the historical serial behaviour; the default runs a division's
+    # workers concurrently while keeping one writer per artifact via leases.
+    max_parallel_workers: int = 4
+    # A hard wall-clock ceiling for one worker's tool loop. Exceeding it moves
+    # the worker to TIMED_OUT rather than letting it bill indefinitely.
+    worker_timeout_s: float | None = None
+    # Reuse the persisted board and ledger from an interrupted run instead of
+    # rebuilding the plan and re-running the Director and every lead.
+    resume: bool = True
 
     @property
     def author_mode(self) -> str:
@@ -282,7 +302,13 @@ class ResearchSwarm:
         self.formalisation_notes: str = ""
         self.formulation: Any = None
         self.lean_gate = LeanProofGate(self.workspace.lean_dir)
+        self.board = TaskBoard(lease_s=self.config.task_lease_s,
+                               max_attempts=self.config.max_task_attempts)
+        self.bus = MessageBus(self.ledger)
+        self.control = SwarmControl(self.ledger, board=self.board, bus=self.bus)
+        self._workers_per_division: dict[Division, int] = {division: 0 for division in Division}
         self._install_leaders()
+        self._recovered = self._recover_state()
 
     def _make_plan(self) -> TopicPlan:
         """Decide up front what the kernel will attempt, so the run can report it.
@@ -321,12 +347,26 @@ class ResearchSwarm:
 
     # -- organisation -------------------------------------------------------
     def _install_leaders(self) -> None:
+        # The Director is a real roster member, not a local variable. Making it
+        # addressable is what lets a leader escalate a stalled worker upward and
+        # lets the control plane accept a stop request aimed at the run itself.
+        self.agents[DIRECTOR_ID] = ResearchAgent(
+            agent_id=DIRECTOR_ID, role_name="Executive Director", directive=self.topic,
+            allowed_tools=("write_file",), budget_tokens=self.config.worker_budget_tokens,
+            parent_id=None, division=None)
+        self.control.register(DIRECTOR_ID, role="Executive Director", parent_id="")
         for division, spec in DIVISION_SPECS.items():
             agent_id = leader_agent_id(division)
             self.agents[agent_id] = ResearchAgent(
                 agent_id=agent_id, role_name=spec.leader_title, directive=spec.objective,
                 allowed_tools=spec.default_tools, budget_tokens=self.config.worker_budget_tokens,
-                parent_id=DIRECTOR_ID, division=division)
+                parent_id=DIRECTOR_ID, division=division, is_leader=True)
+            # A leader's escalation contact is the Director; a worker's is its lead.
+            self.bus.register_route(agent_id, DIRECTOR_ID)
+            self.control.register(agent_id, role=spec.leader_title,
+                                  division=division.value, parent_id=DIRECTOR_ID)
+            if agent_id not in self.agents[DIRECTOR_ID].children:
+                self.agents[DIRECTOR_ID].children.append(agent_id)
         self.ledger.append("OBJECTIVE_SET", {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
                            {"agent_id": "all_leads", "role": "Division Leads"},
                            {"topic": self.topic, "slug": self.slug,
@@ -375,12 +415,23 @@ class ResearchSwarm:
         if parent is not None:
             parent.children.append(agent_id)
         self.spawned_total += 1
+        # Every spawned worker is registered with the control plane and given a
+        # route to its nearest relevant lead, so a stop request and a help request
+        # both have somewhere to go.
+        self.control.register(agent_id, role=agent.role_name, division=division.value,
+                              parent_id=parent_id,
+                              deadline_s=self.config.worker_timeout_s)
+        if parent is not None and parent.is_leader:
+            self.bus.register_route(agent_id, parent_id)
+        else:
+            self.bus.register_route(agent_id, leader_agent_id(division))
         self.ledger.append("SPAWN_REQUEST",
                            {"agent_id": parent_id,
                             "role": parent.role_name if parent else "Chief Scientist"},
                            {"agent_id": agent_id, "role": agent.role_name},
                            {"directive": agent.directive, "allowed_tools": list(tools),
-                            "budget_tokens": budget_tokens, "division": division.value})
+                            "budget_tokens": budget_tokens, "division": division.value,
+                            "escalation_contact": self.bus.contact_for(agent_id)})
         return agent_id
 
     def scale_division(self, division: Division, size: int) -> tuple[str, ...]:
@@ -402,7 +453,15 @@ class ResearchSwarm:
             return tuple(spawned)
         retired: list[str] = []
         for agent_id in live[size:]:
-            agent = self.agents.pop(agent_id)
+            agent = self.agents[agent_id]
+            # A retired worker is stopped, not merely dropped from a dict: it may
+            # still hold a task lease and a running child process, and both would
+            # otherwise outlive the roster change.
+            if self.control.record(agent_id) is not None and \
+                    self.control.record(agent_id).state.active:
+                self.control.request_stop(agent_id, actor=leader_id,
+                                          reason="worker pool scaled down")
+            self.agents.pop(agent_id)
             parent = self.agents.get(agent.parent_id or "")
             if parent is not None and agent_id in parent.children:
                 parent.children.remove(agent_id)
@@ -937,42 +996,435 @@ class ResearchSwarm:
             return None
         return self.config.author(division, artefact, instruction)
 
-    def cycle(self, report: Any, index: int, budget: int) -> tuple[str, ...]:
-        """One research cycle: recruit workers, author artifacts, re-verify."""
+    # -- task board ---------------------------------------------------------
+    def _authorized_paths(self, target: Path) -> tuple[Path, ...]:
+        """The exact set of files a worker assigned to ``target`` may write.
+
+        Restricting writes is what turns "your artifact is X" from a
+        suggestion into a constraint. Two cases need more than the target path:
+        a proof worker's natural-language explanation is a separate file the
+        adjudication gate requires, and a Typst author must be able to save a
+        draft beside the paper it is trying to repair.
+        """
+        authorized = [target]
+        if target.suffix == ".py":
+            authorized.append(target.with_name(f"{target.stem}.md"))
+        if target == self.workspace.paper_typ:
+            authorized.append(self.workspace.root / "paper_draft.typ")
+        return tuple(dict.fromkeys(authorized))
+
+    def _task_artifact(self, division: Division, gap: str, slot: int) -> str:
+        """A unique artifact path for one (division, gap, slot) unit of work.
+
+        The previous scheme derived a target from the worker's index modulo the
+        claim count, so with more workers than claims two workers resolved to the
+        same file and raced on it. Deriving the path from the *task* instead makes
+        the collision impossible to express, and the board's artifact lease makes
+        it impossible to execute even if a path were reused.
+        """
+        if division is Division.THEORY and self.plan.propositions:
+            prop = self.plan.propositions[slot % len(self.plan.propositions)]
+            return f"proofs/{prop.prop_id.lower()}.py"
+        if division is Division.FORMAL and self.plan.propositions:
+            prop = self.plan.propositions[slot % len(self.plan.propositions)]
+            return f"proofs/lean/{prop.prop_id.lower()}.lean"
+        if division is Division.EMPIRICAL:
+            return f"experiments/exp-{slot + 1:02d}.py"
+        if gap == Invariant.DOCUMENT_INTEGRITY.value:
+            return "paper.typ"
+        if division is Division.ADVERSARIAL:
+            return f"audit/falsify-{slot + 1:02d}.md"
+        return f"evidence/{division.value}-{slot + 1:02d}.md"
+
+    def _task_dependencies(self, division: Division, gap: str) -> tuple[str, ...]:
+        """Which task ids must complete before this one is worth attempting.
+
+        Dependencies encode the actual research order rather than a blanket
+        serialisation: a paper cannot cite receipts that do not exist, and a
+        document-integrity task is therefore blocked on the division that produces
+        the evidence it must cite.
+        """
+        if gap == Invariant.DOCUMENT_INTEGRITY.value:
+            return tuple(task.task_id for task in self.board.all()
+                         if task.state is WorkerState.COMPLETED
+                         and task.division in (Division.THEORY.value, Division.FORMAL.value,
+                                               Division.EMPIRICAL.value))
+        return ()
+
+    def _ensure_task(self, division: Division, gap: str, slot: int) -> Task:
+        """Find or create the board task for one unit of work.
+
+        Idempotent on ``(division, gap, artifact)``, which is what makes a later
+        cycle reuse the same task — and its attempt count, evidence, and failure
+        history — instead of silently opening a fresh duplicate.
+        """
+        artifact = self._task_artifact(division, gap, slot)
+        for task in self.board.all():
+            if (task.division == division.value and task.gap == gap
+                    and task.artifact == artifact):
+                return task
+        criterion = self._success_criterion_for(division, gap, Path(artifact))
+        hypothesis = self._pre_registered_hypothesis(division, slot) if \
+            division is Division.EMPIRICAL else ""
+        task = self.board.create(
+            title=f"{division.value}: close {gap}", division=division.value, gap=gap,
+            created_by=DIRECTOR_ID, artifact=artifact,
+            dependencies=self._task_dependencies(division, gap), acceptance=criterion,
+            hypothesis=hypothesis,
+            contacts=(leader_agent_id(division),))
+        self.ledger.append(
+            "TASK_ASSIGNED", {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
+            {"agent_id": leader_agent_id(division),
+             "role": DIVISION_SPECS[division].leader_title},
+            {"task_id": task.task_id, "gap": gap, "artifact": artifact,
+             "acceptance": criterion, "dependencies": list(task.dependencies),
+             "hypothesis": hypothesis or None,
+             "seed": self.config.seed if division is Division.EMPIRICAL else None,
+             "division": division.value})
+        return task
+
+    def _pre_registered_hypothesis(self, division: Division, slot: int) -> str:
+        """The prediction a simulation must be tested against, fixed in advance.
+
+        The seed, the sampling model, and the acceptance band are written onto the
+        board before the script exists. That ordering is the point: a bound chosen
+        after seeing the samples is not a prediction, and the ledger entry for this
+        task predates the experiment receipt, so the two can be compared.
+        """
+        if division is not Division.EMPIRICAL:
+            return ""
+        claim = (self.plan.propositions[slot % len(self.plan.propositions)]
+                 if self.plan.propositions else None)
+        subject = f"{claim.prop_id}: {claim.statement}" if claim else \
+            "the Director's declared mathematical claim"
+        return (f"Test whether {subject}. Sampling model: independent draws from the "
+                f"distribution the script documents, n reported alongside the interval. "
+                f"Seed: {self.config.seed}, fixed. Expected bound: the observed statistic "
+                f"must lie inside a 95% interval computed from the raw samples. "
+                f"Acceptance: a non-empty {self.config.seed}-seeded prediction record whose "
+                f"interval is derived from the samples, and a non-zero exit if the "
+                f"prediction falls outside it. A prediction is not revised after seeing "
+                f"the data; a refuted prediction is reported as a refutation.")
+
+    def _success_criterion_for(self, division: Division, gap: str, target: Path) -> str:
+        """The acceptance criterion recorded on the board, phrased for the board."""
+        if self._live_research_mode():
+            return self._success_criterion(division, target)
+        return f"{target.name} exists and records the evidence relied upon."
+
+    def _task_slots(self, division: Division, worker_ids: Sequence[str]) -> int:
+        """How many distinct units of work this division has open this cycle.
+
+        The count follows the *artifact shape*, not the worker count, because the
+        artifact is what must be unique. A division that writes one file per claim
+        has one slot per claim; a division whose every worker writes its own file
+        has one slot per worker; a division that writes a single shared document
+        has exactly one, however many workers are idle.
+        """
+        if division in (Division.THEORY, Division.FORMAL) and self.plan.propositions:
+            return len(self.plan.propositions)
+        if division in (Division.EMPIRICAL, Division.ADVERSARIAL):
+            return max(1, len(worker_ids))
+        return 1
+
+    def _delegate(self, division: Division, gap: str, worker_ids: Sequence[str],
+                  spawned: list[str]) -> list[tuple[str, Task]]:
+        """Have the division lead lease tasks and hand them to specific workers.
+
+        Delegation is deterministic round-robin, not model-chosen: the lead's own
+        LLM pass already wrote its assignment file, and paying for a second
+        model call purely to pick which of its own workers runs first buys no
+        accuracy. What the lead *is* responsible for — the lease, the artifact
+        exclusivity, and the recorded hand-off — is real and is what stops two
+        workers from doing the same job.
+        """
+        slots = self._task_slots(division, worker_ids)
+        pairs: list[tuple[str, Task]] = []
+        lead_id = leader_agent_id(division)
+        for slot in range(slots):
+            try:
+                task = self._ensure_task(division, gap, slot)
+            except CoordinationError as exc:
+                # The artifact is already committed to a live task. That is the
+                # board doing its job, not an error to escalate.
+                self.ledger.append(
+                    "STATUS_REPORT", {"agent_id": lead_id,
+                                      "role": DIVISION_SPECS[division].leader_title},
+                    {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
+                    {"status": "task_exists", "detail": str(exc)})
+                continue
+            if task.terminal:
+                continue
+            if not worker_ids:
+                continue
+            worker_id = worker_ids[slot % len(worker_ids)]
+            try:
+                self.board.lease(task.task_id, worker_id)
+            except CoordinationError as exc:
+                self.ledger.append(
+                    "STATUS_REPORT", {"agent_id": lead_id,
+                                      "role": DIVISION_SPECS[division].leader_title},
+                    {"agent_id": worker_id, "role": self.agents[worker_id].role_name},
+                    {"status": "lease_refused", "task_id": task.task_id,
+                     "detail": str(exc)})
+                self.bus.send(sender=worker_id, recipient=self.bus.contact_for(worker_id),
+                              kind=MessageKind.ESCALATION, subject=f"cannot take {task.task_id}",
+                              body=str(exc))
+                continue
+            self.ledger.append(
+                "TASK_LEASED", {"agent_id": lead_id, "role": DIVISION_SPECS[division].leader_title},
+                {"agent_id": worker_id, "role": self.agents[worker_id].role_name},
+                {"task_id": task.task_id, "gap": gap, "artifact": task.artifact,
+                 "acceptance": task.acceptance, "attempt": task.attempts,
+                 "lease_expires_in_s": round(self.config.task_lease_s, 1)})
+            self.bus.send(sender=lead_id, recipient=worker_id, kind=MessageKind.DIRECTIVE,
+                          subject=f"{task.task_id}: {task.title}", body=task.acceptance,
+                          requires_ack=False)
+            pairs.append((worker_id, task))
+        return pairs
+
+    def _review(self, division: Division, worker_id: str, task: Task,
+                summary: Mapping[str, Any]) -> None:
+        """The lead's post-hoc review of one worker's outcome, recorded either way.
+
+        Recording only successes would make the audit read like a highlights reel;
+        a leader that never acknowledges a failure cannot redirect the next cycle.
+        """
+        lead_id = leader_agent_id(division)
+        accepted = bool(summary.get("accepted"))
+        self.bus.send(sender=lead_id, recipient=worker_id, kind=MessageKind.REVIEW,
+                      subject=f"{task.task_id} {'accepted' if accepted else 'rejected'}",
+                      body=(f"artifact={task.artifact} success={summary.get('success')} "
+                            f"tool_calls={summary.get('tool_calls', 0)} "
+                            f"stop_reason={summary.get('stop_reason')} "
+                            f"detail={(summary.get('error') or '')[:200]}"),
+                      requires_ack=False)
+        self.ledger.append(
+            "PROGRESS_SUMMARY", {"agent_id": lead_id,
+                                 "role": DIVISION_SPECS[division].leader_title},
+            {"agent_id": worker_id, "role": self.agents[worker_id].role_name},
+            {"task_id": task.task_id, "review": "accepted" if accepted else "rejected",
+             "gap": task.gap, "artifact": task.artifact,
+             "tool_calls": summary.get("tool_calls", 0),
+             "state": summary.get("state"), "stop_reason": summary.get("stop_reason"),
+             "error": (summary.get("error") or "")[:300]})
+
+    def _plan_cycle(self, report: Any) -> list[tuple[Division, str, Task, str]]:
+        """Director: choose the open work, then have each lead delegate it.
+
+        Returns ``(division, gap, task, worker_id)`` quadruples. Every unit of
+        work in a cycle is lease-protected before a single worker starts, so
+        concurrency below cannot produce two writers for one artifact.
+        """
         spawned: list[str] = []
+        planned: list[tuple[Division, str, Task, str]] = []
         gaps = [status.invariant.value for status in report.gaps]
         handled: set[Division] = set()
+        self._current_cycle_index = getattr(self, "_current_cycle_index", 1)
         for gap in gaps:
+            if self.control.run_stopped:
+                break
             division = GAP_ROUTING.get(gap, Division.THEORY)
             if self._live_research_mode() and division in handled:
                 continue
             handled.add(division)
-            self._current_cycle_index = index
-            spec = DIVISION_SPECS[division]
-            live = [agent for agent in self.agents.values()
+            live = [agent.agent_id for agent in self.agents.values()
                     if agent.division is division and not agent.is_leader]
             # The Director's budget is advisory; the per-division cap is the hard
             # limit, so escalation stops growing rather than overflowing the pool.
-            target = min(budget, self.config.max_workers_per_division)
+            target = min(getattr(self, "_cycle_budget", 2), self.config.max_workers_per_division)
             if len(live) < target:
                 spawned.extend(self.scale_division(division, target))
-                live = [agent for agent in self.agents.values()
+                live = [agent.agent_id for agent in self.agents.values()
                         if agent.division is division and not agent.is_leader]
-            for agent in live[:target]:
-                if division is Division.ADVERSARIAL and gap == Invariant.ADVERSARIAL_CLEARANCE.value:
-                    self._falsify(agent, spawned)
-                else:
-                    self._produce(division, agent, gap, spawned)
+            for worker_id, task in self._delegate(division, gap, live[:target], spawned):
+                planned.append((division, gap, task, worker_id))
+        return planned
+
+    def cycle(self, report: Any, index: int, budget: int) -> tuple[str, ...]:
+        """One research cycle: plan, delegate, run workers, re-verify.
+
+        Planning is sequential because it mutates the board; execution is
+        concurrent because the leased units are provably disjoint — each owns a
+        distinct artifact, and the artifact is the only thing these workers write.
+        """
+        self._current_cycle_index = index
+        self._cycle_budget = budget
+        spawned = self.scale_for_cycle(report, budget)
+        planned = self._plan_cycle(report)
+        results: list[Mapping[str, Any]] = []
+        if planned:
+            self._emit_status(f"cycle {index}: dispatching {len(planned)} leased task(s)")
+            results = self._execute_planned(planned)
+            for (division, gap, task, worker_id), summary in zip(planned, results):
+                self._review(division, worker_id, task, summary)
+        self.control.progress_summary(cycle=index)
+        self.board.save(self.workspace.root / TASK_BOARD_FILENAME)
         self.ledger.append("GATE_EVALUATION",
                            {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
                            {"agent_id": "invariants", "role": "Invariant Gate"},
-                           {"cycle": index, "gaps": gaps, "fingerprint": report.fingerprint,
-                            "worker_budget": budget, "spawned": spawned})
+                           {"cycle": index, "gaps": [status.invariant.value
+                                                      for status in report.gaps],
+                            "fingerprint": report.fingerprint,
+                            "worker_budget": budget, "spawned": spawned,
+                            "leased_tasks": [task.task_id for _, _, task, _ in planned],
+                            "parallelism": min(len(planned), self.config.max_parallel_workers)})
         return tuple(spawned)
+
+    def scale_for_cycle(self, report: Any, budget: int) -> list[str]:
+        """Grow each division's pool to the escalated budget. Returns new agent ids.
+
+        Scaling is recorded even when it grows nothing, because "the Director
+        decided not to hire anyone" is a decision an audit should be able to see
+        rather than infer from silence.
+        """
+        spawned: list[str] = []
+        for status in report.gaps:
+            division = GAP_ROUTING.get(status.invariant.value, Division.THEORY)
+            live = [agent for agent in self.agents.values()
+                    if agent.division is division and not agent.is_leader]
+            target = min(budget, self.config.max_workers_per_division)
+            if len(live) < target:
+                added = self.scale_division(division, target)
+                spawned.extend(added)
+                self.ledger.append(
+                    "SWARM_SCALED", {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
+                    {"agent_id": leader_agent_id(division),
+                     "role": DIVISION_SPECS[division].leader_title},
+                    {"division": division.value, "gap": status.invariant.value,
+                     "before": len(live), "target": target, "added": list(added),
+                     "cap": self.config.max_workers_per_division})
+        return spawned
+
+    def _execute_planned(self, planned: Sequence[tuple[Division, str, Task, str]]
+                         ) -> list[Mapping[str, Any]]:
+        """Run the leased units, at most ``max_parallel_workers`` at a time.
+
+        The Director's escalation is a *worker-count* signal, not a licence to
+        spend N times the tokens at once, so the executor caps the fan-out
+        independently of how many units were leased.
+        """
+        if self.config.max_parallel_workers <= 1 or len(planned) == 1:
+            return [self._execute_one(unit) for unit in planned]
+        limit = max(1, int(self.config.max_parallel_workers))
+        summaries: list[Mapping[str, Any]] = [{} for _ in planned]
+        with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="research-worker") as pool:
+            futures = {pool.submit(self._execute_one, unit): index
+                       for index, unit in enumerate(planned)}
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    summaries[index] = future.result()
+                except Exception as exc:  # noqa: BLE001 - one unit must not sink the cycle
+                    summaries[index] = {"ran": True, "success": False, "accepted": False,
+                                        "state": WorkerState.FAILED.value,
+                                        "error": f"{type(exc).__name__}: {exc}"[:400],
+                                        "tool_calls": 0}
+        return summaries
+
+    def _execute_one(self, unit: tuple[Division, str, Task, str]) -> Mapping[str, Any]:
+        """Dispatch one leased unit to the right kind of work."""
+        division, gap, task, worker_id = unit
+        agent = self.agents[worker_id]
+        self.control.begin(worker_id, task_id=task.task_id)
+        try:
+            if division is Division.ADVERSARIAL and gap == Invariant.ADVERSARIAL_CLEARANCE.value:
+                return self._falsify(agent, spawned=[], task=task)
+            return self._produce(division, agent, gap, [], task=task)
+        except WorkerCancelled as exc:
+            self._close_task(task, worker_id, WorkerState.CANCELLED, reason=str(exc))
+            return {"ran": True, "success": False, "accepted": False,
+                    "state": WorkerState.CANCELLED.value, "error": str(exc), "tool_calls": 0}
+
+    def _close_task(self, task: Task, worker_id: str, state: WorkerState, *,
+                    reason: str = "", evidence_ids: Sequence[str] = (),
+                    artifact: str = "") -> None:
+        """Write the task's terminal state to both the board and the ledger."""
+        if state is WorkerState.COMPLETED:
+            self.board.complete(task.task_id, worker_id, evidence_ids=evidence_ids,
+                                artifact=artifact or task.artifact, note=reason)
+            action = "TASK_COMPLETED"
+        elif state is WorkerState.BLOCKED:
+            self.board.block(task.task_id, worker_id, reason or "blocked")
+            action = "TASK_BLOCKED"
+        else:
+            self.board.fail(task.task_id, worker_id, reason or state.value)
+            action = "TASK_FAILED"
+        # The owner may be a worker from a previous process, so the roster is
+        # consulted defensively: a lost attribution is recoverable, a lost task
+        # transition is not.
+        agent = self.agents.get(worker_id)
+        division = Division(task.division)
+        self.ledger.append(
+            action, {"agent_id": worker_id, "role": agent.role_name if agent else "former worker"},
+            {"agent_id": leader_agent_id(division),
+             "role": DIVISION_SPECS[division].leader_title},
+            {"task_id": task.task_id, "state": state.value, "gap": task.gap,
+             "artifact": task.artifact, "reason": reason[:300],
+             "evidence_ids": list(evidence_ids)})
 
     def _interactive_capable(self) -> bool:
         """Whether a real tool-using subagent can be launched for this run."""
         return self.config.llm_client_factory is not None
+
+    # -- operator control ---------------------------------------------------
+    def _emit_status(self, message: str) -> None:
+        if self._status_callback is not None:
+            self._status_callback(message)
+
+    def stop_worker(self, agent_id: str, *, actor: str, reason: str) -> bool:
+        """Stop one worker on behalf of a leader or an operator.
+
+        This is the public seam an operator or a TUI drives. It returns whether a
+        live worker was actually reached, so a caller can tell "stopped" apart from
+        "there was nothing running", and it refuses to invent an actor — a stop
+        with no attribution is not an auditable stop.
+        """
+        if agent_id not in self.agents and self.control.record(agent_id) is None:
+            return False
+        record = self.control.record(agent_id)
+        if record is None or not record.state.active:
+            return False
+        self.control.request_stop(agent_id, actor=actor, reason=reason, kind=StopKind.CANCEL)
+        return True
+
+    def pause_worker(self, agent_id: str, *, actor: str, reason: str) -> bool:
+        record = self.control.record(agent_id)
+        if record is None or not record.state.active:
+            return False
+        self.control.request_stop(agent_id, actor=actor, reason=reason, kind=StopKind.PAUSE)
+        return True
+
+    def resume_worker(self, agent_id: str) -> bool:
+        token = self.control.token(agent_id)
+        if not token.signal.requested or token.signal.kind is not StopKind.PAUSE:
+            return False
+        token.signal.clear()
+        return True
+
+    def stop_run(self, *, actor: str, reason: str) -> None:
+        """End the run now, cancelling every active worker."""
+        self.control.stop_run(actor=actor, reason=reason)
+
+    def pause_run(self, *, actor: str, reason: str) -> None:
+        self.control.pause_run(actor=actor, reason=reason)
+
+    def resume_run(self, *, actor: str) -> None:
+        self.control.resume_run(actor=actor)
+
+    def swarm_status(self) -> dict[str, Any]:
+        """Everything an operator needs to see mid-run, in one JSON-ready dict."""
+        snapshot = self.control.snapshot()
+        snapshot["recovery"] = self._recovered
+        snapshot["open_tasks"] = [task.to_dict() for task in self.board.open_tasks()]
+        snapshot["gaps"] = [status.detail for status in
+                            (self._last_report.gaps if self._last_report is not None else ())]
+        snapshot["ledger_entries"] = self.ledger.count
+        snapshot["ledger_actions"] = self.ledger.actions_used()
+        return snapshot
+
+    def render_status(self) -> str:
+        return self.control.render()
 
     def _live_research_mode(self) -> bool:
         """Use the live pipeline, except for the historical formulation fixture."""
@@ -981,7 +1433,8 @@ class ResearchSwarm:
     def _run_worker(self, agent: ResearchAgent, division: Division, directive: str,
                     *, success_criterion: str, target: Path,
                     tool_names_override: tuple[str, ...] | None = None,
-                    max_steps_override: int | None = None) -> dict[str, Any]:
+                    max_steps_override: int | None = None,
+                    extra_writes: Sequence[Path] = ()) -> dict[str, Any]:
         """Run one worker as a multi-step, tool-using subagent.
 
         This replaces a single-shot text completion. The worker is a real agent
@@ -1017,10 +1470,27 @@ class ResearchSwarm:
         else:
             tool_names = WORKER_TOOLS.get(
                 division, ("read_file", "write_file", "edit_file", "run_bash"))
+        # Two streams, kept apart on purpose: ``trajectory`` is the worker's own
+        # tool steps and nothing else, so existing consumers keep working, while
+        # ``overseer_log`` holds the supervisor's verdicts about those steps.
         trajectory: list[dict[str, Any]] = []
+        overseer_log: list[dict[str, Any]] = []
         outcome: dict[str, Any] = {}
+        token = self.control.token(agent.agent_id)
 
         def on_event(event: Any) -> None:
+            # The stop check lives on the event stream, which the tool loop yields
+            # from before every tool call. Raising here unwinds the generator, so a
+            # cancelled worker makes no further tool call; a tool already in flight
+            # is allowed to return, and the process group was killed by
+            # ``SwarmControl.request_stop`` so it cannot keep burning.
+            token.raise_if_stopped()
+            if self.control.run_stopped:
+                raise WorkerCancelled(agent.agent_id, "the run was stopped",
+                                      self.control.stopped_by or "operator")
+            if self.control.run_paused and not self.control.wait_while_paused():
+                raise WorkerCancelled(agent.agent_id, "the run was stopped while paused",
+                                      self.control.stopped_by or "operator")
             kind = getattr(event, "event_type", "")
             payload = getattr(event, "payload", {}) or {}
             if kind == "tool_call":
@@ -1037,11 +1507,20 @@ class ResearchSwarm:
                 if self._status_callback is not None:
                     self._status_callback(f"{agent.role_name}: {payload.get('name')} "
                                           f"{'passed' if payload.get('success') else 'failed'}")
+            elif kind == "overseer":
+                # The per-agent RuntimeOverseer is the thing that spots a worker
+                # looping or stalling. Surfacing its verdicts is what lets a lead
+                # see *why* a worker burned its whole budget.
+                overseer_log.append({"state": payload.get("state"),
+                                     "directive": _summarize_args(payload.get("directive"), 200),
+                                     "confidence": payload.get("confidence")})
             elif kind == "response":
                 outcome.update({"summary": str(payload.get("content", ""))[:4000],
                                 "stop_reason": payload.get("stop_reason"),
                                 "success": bool(payload.get("success"))})
 
+        authorized = tuple(dict.fromkeys((*self._authorized_paths(target),
+                                          *(Path(item) for item in extra_writes))))
         worker = DeveloperAgentWorker(
             llm_client_factory=role_client_factory,
             repository=ExperienceRepository(self.workspace.root / "experience.db"),
@@ -1057,17 +1536,27 @@ class ResearchSwarm:
                              "medium" if division in (Division.EMPIRICAL, Division.ADVERSARIAL)
                              or agent.role_name == "Typst Author" else "low"),
             enable_skill_routing=not (agent.agent_id == DIRECTOR_ID or agent.is_leader),
-            write_target=(target if agent.is_leader or tool_names_override == ("write_file",)
-                          else None),
+            # Every worker, not just leaders, is confined to its authorized paths.
+            # An unrestricted worker could overwrite a sibling's leased artifact,
+            # which is exactly the duplicate work the board exists to prevent.
+            write_target=authorized,
             system_prompt=self._worker_prompt(agent, division, success_criterion, target),
             on_event=on_event)
         assignment = SwarmAssignment(SwarmRole.CODER, SwarmPhase.IMPLEMENT, directive,
                                      self.workspace.root)
         try:
             result = run_assignment(worker, assignment)
+        except WorkerCancelled as exc:
+            summary = {"ran": True, "success": False, "cancelled": True,
+                       "state": WorkerState.CANCELLED.value,
+                       "error": str(exc), "trajectory": trajectory, "tool_calls": len(trajectory),
+                       "overseer": overseer_log}
+            self._log_trajectory(agent, division, summary)
+            return summary
         except Exception as exc:  # noqa: BLE001 - a worker failure must not kill the run
-            summary = {"ran": True, "success": False,
-                       "error": f"{type(exc).__name__}: {exc}"[:400], "trajectory": trajectory}
+            summary = {"ran": True, "success": False, "state": WorkerState.FAILED.value,
+                       "error": f"{type(exc).__name__}: {exc}"[:400], "trajectory": trajectory,
+                       "tool_calls": len(trajectory), "overseer": overseer_log}
             self._log_trajectory(agent, division, summary)
             return summary
 
@@ -1078,25 +1567,49 @@ class ResearchSwarm:
             "stop_reason": outcome.get("stop_reason"),
             "error": result.error,
             "trajectory": trajectory,
+            "overseer": overseer_log,
             "tool_calls": len(trajectory),
             "wrote_target": target.is_file(),
+            "state": WorkerState.COMPLETED.value if result.success else WorkerState.FAILED.value,
         }
         self._log_trajectory(agent, division, summary)
         return summary
 
     def _worker_prompt(self, agent: ResearchAgent, division: Division,
                        success_criterion: str, target: Path) -> str:
-        """The worker's operating instructions, including its success test."""
+        """The worker's operating instructions: what to build, where, and how to pass.
+
+        The four things a worker needs and historically lacked are stated
+        explicitly: its assignment, the exact paths it may write, the condition
+        that constitutes success, and who to escalate to. A worker told only
+        "close the gap" flails; a worker told these four can decide on its own
+        whether it is finished and who to ask when it is not.
+        """
         try:
             relative = target.relative_to(self.workspace.root)
         except ValueError:
             relative = target
+        authorized = ", ".join(str(self._relpath(path)) for path in self._authorized_paths(target))
+        contact = self.bus.contact_for(agent.agent_id)
+        assignment = ""
+        record = self.control.record(agent.agent_id)
+        if record is not None and record.task_id:
+            task = self.board.get(record.task_id)
+            if task is not None:
+                assignment = (f"Your assignment is {task.task_id} (attempt {task.attempts} of "
+                              f"{self.config.max_task_attempts}), leased to you alone. "
+                              f"No other worker may write {task.artifact} while you hold it. ")
         return (
             f"You are {agent.role_name}, an independent LLM research agent in the "
             f"{DIVISION_SPECS[division].leader_title}'s division. "
             f"{DIVISION_SPECS[division].objective}\n"
+            f"{assignment}"
             f"Write your artifact to {relative}. "
+            f"You are authorized to write exactly these paths and nothing else: {authorized}. "
+            f"Any other write will be refused, so do not attempt to touch a sibling's file. "
             f"{success_criterion} "
+            f"If you are blocked and cannot make progress within your step budget, stop and say "
+            f"what you tried and what error you hit; your {contact} can reassign or escalate. "
             "Work iteratively: write the artifact, execute it with your tools, read the exact "
             "error or diagnostic, and revise until it passes. Do not report success you have not "
             "observed from a tool result. A proof script must contain no floating-point literal "
@@ -1106,9 +1619,22 @@ class ResearchSwarm:
             "Every source left in proofs/ or experiments/ is checked by the final gate; "
             "repair or remove failed probes before reporting completion.")
 
+    def _relpath(self, path: Path) -> Path:
+        try:
+            return path.relative_to(self.workspace.root)
+        except ValueError:
+            return path
+
     def _log_trajectory(self, agent: ResearchAgent, division: Division,
                         summary: Mapping[str, Any]) -> None:
-        """Record what the worker actually did, so the audit shows the path."""
+        """Record what the worker actually did, so the audit shows the path.
+
+        This records observable actions — tool names, success flags, the overseer's
+        verdicts — and not the model's private reasoning. A ledger that claimed to
+        capture a model's thinking would be attesting to something it cannot see.
+        """
+        steps = list(summary.get("trajectory", []))
+        overseer = list(summary.get("overseer", []))
         self.ledger.append(
             "WORKER_TRAJECTORY",
             {"agent_id": agent.agent_id, "role": agent.role_name},
@@ -1116,12 +1642,16 @@ class ResearchSwarm:
             {"ran": bool(summary.get("ran")),
              "success": bool(summary.get("success")),
              "tool_calls": summary.get("tool_calls", 0),
-             "tools_used": [item.get("tool") for item in summary.get("trajectory", [])],
-             "trajectory": summary.get("trajectory", [])[:40],
+             "tools_used": [item.get("tool") for item in steps],
+             "trajectory": steps[:40],
+             "overseer_verdicts": overseer[:12],
+             "state": summary.get("state"),
              "stop_reason": summary.get("stop_reason"),
+             "cancelled": bool(summary.get("cancelled")),
              "error": (summary.get("error") or "")[:400]})
 
-    def _falsify(self, agent: ResearchAgent, spawned: list[str]) -> None:
+    def _falsify(self, agent: ResearchAgent, spawned: list[str],
+                 task: Task | None = None) -> Mapping[str, Any]:
         """Red-team pass: seek a counterexample, then record the disposition.
 
         A falsification attempt is only worth something if it actually searched,
@@ -1130,6 +1660,8 @@ class ResearchSwarm:
         structured JSON object: prose is recorded as inconclusive and grants no
         clearance, so a chatty model cannot rubber-stamp a claim.
         """
+        target = (self.workspace.root / task.artifact if task is not None
+                  else self.workspace.root / "audit" / f"{agent.agent_id}.md")
         verdict: FalsificationVerdict
         if self._live_research_mode():
             outcome = self._run_worker(
@@ -1144,7 +1676,7 @@ class ResearchSwarm:
                     "Success: either exhibit a concrete counterexample with the exact input that "
                     f"produced it, or state that the search was empty. Then reply with ONLY "
                     f"{FALSIFICATION_VERDICT}"),
-                target=self.workspace.root / "audit" / f"{agent.agent_id}.md")
+                target=target)
             verdict = FalsificationVerdict.parse(outcome.get("summary"))
             if not outcome.get("tool_calls"):
                 verdict = FalsificationVerdict(Clearance.PENDING,
@@ -1164,7 +1696,35 @@ class ResearchSwarm:
                                f"{agent.directive} {FALSIFICATION_VERDICT}")
             verdict = FalsificationVerdict.parse(raw) if self.config.author else FalsificationVerdict(
                 Clearance.CLEARED, "no live author configured; mechanical pass found nothing")
+            outcome = {"ran": False, "success": True, "tool_calls": 0, "trajectory": []}
         agent.clearance = verdict.status
+        summary: dict[str, Any] = {
+            "ran": bool(outcome.get("ran")), "tool_calls": outcome.get("tool_calls", 0),
+            "stop_reason": outcome.get("stop_reason"), "trajectory": outcome.get("trajectory", []),
+            "success": verdict.conclusive, "accepted": verdict.status is not Clearance.PENDING,
+            "error": None if verdict.conclusive else verdict.finding,
+            "clearance": verdict.status.value}
+
+        # An inconclusive red-team pass is not a failed falsification, it is an
+        # unanswered request for a stronger search: it goes back on the board as a
+        # blocked task rather than being recorded as an attempt that happened.
+        if task is not None:
+            if verdict.status is Clearance.PENDING:
+                self.control.settle_worker(agent.agent_id, WorkerState.BLOCKED,
+                                           reason=verdict.finding[:200])
+                self._close_task(task, agent.agent_id, WorkerState.BLOCKED,
+                                 reason=verdict.finding[:200])
+                summary["state"] = self.control.record(agent.agent_id).state.value
+            else:
+                self.control.settle_worker(agent.agent_id, WorkerState.COMPLETED,
+                                           artifact=task.artifact, reason=verdict.finding[:200],
+                                           evidence_ids=("COUNTEREXAMPLE_FOUND",),
+                                           tool_calls=outcome.get("tool_calls"))
+                self._close_task(task, agent.agent_id, WorkerState.COMPLETED,
+                                 reason=verdict.finding[:200],
+                                 evidence_ids=("COUNTEREXAMPLE_FOUND",),
+                                 artifact=task.artifact)
+                summary["state"] = WorkerState.COMPLETED.value
 
         if verdict.status is Clearance.COUNTEREXAMPLE:
             if self._live_research_mode():
@@ -1173,12 +1733,17 @@ class ResearchSwarm:
                                {"agent_id": agent.agent_id, "role": agent.role_name},
                                {"agent_id": leader_agent_id(Division.ADVERSARIAL),
                                 "role": "Adversarial Lead"},
-                               {"finding": verdict.finding[:600]})
-            self.ledger.append("SELF_PIVOT", {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
+                               {"finding": verdict.finding[:600],
+                                "task_id": task.task_id if task else None})
+            self.ledger.append("SELF_PIVOT",
+                               {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
                                {"agent_id": leader_agent_id(Division.THEORY),
                                 "role": "Theoretical Lead"},
-                               {"reason": "counterexample reported; revising the claim"})
-            return
+                               {"reason": "counterexample reported; revising the claim",
+                                "kind": "revise_claim",
+                                "task_id": task.task_id if task else None,
+                                "raised_by": agent.agent_id})
+            return summary
 
         self.ledger.append("FALSIFICATION_ATTEMPT",
                            {"agent_id": agent.agent_id, "role": agent.role_name},
@@ -1186,6 +1751,7 @@ class ResearchSwarm:
                             "role": "Adversarial Lead"},
                            {"outcome": verdict.finding,
                             "conclusive": verdict.conclusive,
+                            "task_id": task.task_id if task else None,
                             "searched": ["boundary cases", "degenerate inputs",
                                          "unstated assumptions"]})
         if verdict.status is Clearance.CLEARED:
@@ -1195,17 +1761,23 @@ class ResearchSwarm:
                                {"agent_id": leader_agent_id(Division.ADVERSARIAL),
                                 "role": "Adversarial Lead"},
                                {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
-                               {"cleared": agent.agent_id})
+                               {"cleared": agent.agent_id,
+                                "task_id": task.task_id if task else None})
         self._write_audit()
+        return summary
 
     def _produce(self, division: Division, agent: ResearchAgent, gap: str,
-                 spawned: list[str]) -> None:
+                 spawned: list[str], task: Task | None = None) -> Mapping[str, Any]:
         """Close ``gap``, preferring a real tool-using worker over a text reply.
 
         A one-shot completion can only restate a claim; closing a gap means
         writing a script that executes, so when a live model is available the
         division gets an agent with tools and a success criterion it must observe
         from a tool result. Without one, the mechanical kernel remains the path.
+
+        When the work is board-backed, the target comes from the leased task
+        rather than from the worker's index, so a worker's artifact cannot depend
+        on how many siblings happen to exist.
         """
         artefact = {"literature": "evidence", "theory": "proofs",
                     "empirical": "experiments", "adversarial": "audit",
@@ -1217,8 +1789,17 @@ class ResearchSwarm:
             target = self.workspace.experiment_dir / f"{agent.agent_id}.py"
         elif division.value == "formal":
             target = self.workspace.lean_dir / f"{agent.agent_id}.lean"
+        prop = None
 
-        if self._live_research_mode():
+        if task is not None:
+            target = self.workspace.root / task.artifact
+            if division in (Division.THEORY, Division.FORMAL) and self.plan.propositions:
+                stem = Path(task.artifact).stem
+                prop = next((item for item in self.plan.propositions
+                             if item.prop_id.lower() == stem), None)
+            if gap == Invariant.DOCUMENT_INTEGRITY.value:
+                agent.role_name = "Typst Author"
+        elif self._live_research_mode():
             propositions = self.plan.propositions
             worker_index = int(agent.agent_id.rsplit("_", 1)[-1]) - 1
             position = (worker_index + getattr(self, "_current_cycle_index", 1) - 1) % len(propositions) if propositions else 0
@@ -1234,16 +1815,17 @@ class ResearchSwarm:
                 agent.role_name = "Typst Author"
 
         if self._live_research_mode():
-            criterion = self._success_criterion(division, target)
+            criterion = task.acceptance if task is not None and task.acceptance \
+                else self._success_criterion(division, target)
             if target.suffix in {".py", ".lean", ".typ"} and not target.is_file():
                 receipts = ""
                 if target.suffix == ".typ":
                     manifest = self.workspace.root / "receipt_manifest.json"
                     if manifest.is_file():
                         receipts = f" Verified receipt manifest: {manifest.read_text(encoding='utf-8')[:4000]}"
-                self._run_worker(
+                bootstrap = self._run_worker(
                     agent, division,
-                    f"Author the first version of {target.relative_to(self.workspace.root)} now. "
+                    f"Author the first version of {self._relpath(target)} now. "
                     "Your FIRST and ONLY tool call in this stage must be write_file for that "
                     "exact path. Do not inspect files or explain the task. "
                     + (f"Claim: {prop.statement}. Hypotheses: {'; '.join(prop.hypotheses)}. "
@@ -1251,6 +1833,8 @@ class ResearchSwarm:
                     + receipts,
                     success_criterion=f"The exact target file {target.name} exists.",
                     target=target, tool_names_override=("write_file",), max_steps_override=2)
+                if bootstrap.get("cancelled"):
+                    return self._settle(task, agent, bootstrap, cancelled=True)
             outcome = self._run_worker(agent, division,
                                        f"Close the {gap} gap for topic '{self.topic}'. "
                                        f"Read {division.value}_assignments.md, "
@@ -1263,6 +1847,9 @@ class ResearchSwarm:
                                        + (f"The exact Lean proposition is: {prop.lean_statement}. "
                                           "Do not weaken or replace it. "
                                           if prop and division is Division.FORMAL else "")
+                                       + (f"Your pre-registered hypothesis, fixed before you "
+                                          f"start: {task.hypothesis} "
+                                          if task is not None and task.hypothesis else "")
                                        + ("Read receipt_manifest.json and cite every verified "
                                           "tag in paper.typ. Run compile_typst and fix all warnings. "
                                           if target == self.workspace.paper_typ else ""),
@@ -1271,11 +1858,16 @@ class ResearchSwarm:
                                {"agent_id": leader_agent_id(division),
                                 "role": DIVISION_SPECS[division].leader_title},
                                {"gap": gap, "mode": "interactive-subagent",
+                                "task_id": task.task_id if task else None,
                                 "success": outcome.get("success"),
                                 "tool_calls": outcome.get("tool_calls", 0),
-                                "artifact": str(target.relative_to(self.workspace.root))
+                                "artifact": str(self._relpath(target))
                                 if target.is_file() else None})
-            return
+            return self._settle(task, agent, outcome, target=target)
+        summary: dict[str, Any] = {"ran": False, "success": False, "tool_calls": 0,
+                                   "trajectory": []}
+        if task is not None:
+            return self._settle(task, agent, summary, target=target)
 
         instruction = (f"Close the {gap} gap for topic '{self.topic}'. "
                        f"Your directive: {agent.directive}")
@@ -1292,6 +1884,86 @@ class ResearchSwarm:
                                {"agent_id": leader_agent_id(division),
                                 "role": DIVISION_SPECS[division].leader_title},
                                {"gap": gap, "status": "no live author; awaiting artifact"})
+        return {"ran": False, "success": bool(produced), "tool_calls": 0,
+                "trajectory": [], "state": WorkerState.COMPLETED.value if produced
+                else WorkerState.FAILED.value}
+
+    def _settle(self, task: Task | None, agent: ResearchAgent,
+                summary: Mapping[str, Any], *, target: Path | None = None,
+                cancelled: bool = False) -> dict[str, Any]:
+        """Decide a task's fate from its worker's outcome and record it once.
+
+        The acceptance decision is deliberately conservative. A worker that reports
+        success but left no artifact does not get a completion, and a worker whose
+        artifact exists but whose run was cancelled or errored does not either.
+        Optimism here would turn the board into a rubber stamp, and the board is
+        what the gate later reads to decide whether work remains.
+        """
+        result = dict(summary)
+        result.setdefault("trajectory", [])
+        result.setdefault("tool_calls", 0)
+        if task is None:
+            return result
+        if cancelled or result.get("cancelled"):
+            self.control.settle_worker(agent.agent_id, WorkerState.CANCELLED,
+                                       reason=str(result.get("error") or "cancelled"))
+            self._close_task(task, agent.agent_id, WorkerState.CANCELLED,
+                             reason=str(result.get("error") or "cancelled"))
+            result.update({"accepted": False, "state": WorkerState.CANCELLED.value})
+            return result
+        artifact = self._relpath(target) if target is not None else Path(task.artifact)
+        evidence = self._artifact_evidence(artifact)
+        produced = bool(target is not None and target.is_file())
+        if produced and result.get("success"):
+            self.control.settle_worker(agent.agent_id, WorkerState.COMPLETED,
+                                       reason=result.get("error") or "",
+                                       artifact=str(artifact), evidence_ids=evidence,
+                                       tool_calls=result.get("tool_calls"))
+            self._close_task(task, agent.agent_id, WorkerState.COMPLETED,
+                             reason="artifact produced and verified by the tool loop",
+                             evidence_ids=evidence, artifact=str(artifact))
+            result.update({"accepted": True, "state": WorkerState.COMPLETED.value,
+                           "evidence_ids": list(evidence)})
+            return result
+        if not produced:
+            self.control.settle_worker(agent.agent_id, WorkerState.FAILED,
+                                       reason=result.get("error") or "no artifact was written",
+                                       tool_calls=result.get("tool_calls"))
+            self._close_task(task, agent.agent_id, WorkerState.FAILED,
+                             reason=result.get("error") or "no artifact was written")
+        else:
+            # The file is there but the worker's own run did not succeed. That is a
+            # retryable attempt, not a completion: an unverified file must not be
+            # promoted to evidence.
+            self.control.settle_worker(agent.agent_id, WorkerState.FAILED,
+                                       reason=result.get("error") or "artifact unverified",
+                                       tool_calls=result.get("tool_calls"))
+            self._close_task(task, agent.agent_id, WorkerState.FAILED,
+                             reason=result.get("error") or "artifact exists but is unverified")
+        result.update({"accepted": False, "state": WorkerState.FAILED.value,
+                       "evidence_ids": []})
+        return result
+
+    def _artifact_evidence(self, artifact: Path) -> tuple[str, ...]:
+        """Receipt ids the gates already issued for a specific artifact.
+
+        A task is only completed with the receipts that a verifier minted for
+        *that* file. Attributing a proof receipt to the wrong script would let an
+        unverified file inherit another's standing, which is the failure mode the
+        per-claim Lean gate exists to prevent. Only certified receipts count: a
+        rejected receipt is evidence of a failure, not evidence of a proof.
+        """
+        name = artifact.name
+        if artifact.suffix == ".lean":
+            return tuple(receipt.proof_id for receipt in self.lean_gate.receipts
+                         if receipt.name == name and receipt.certified)
+        if artifact.suffix == ".py" and artifact.parent.name == "proofs":
+            return tuple(receipt.theorem_id for receipt in self.proofs.receipts
+                         if Path(receipt.script).name == name and receipt.verified)
+        if artifact.suffix == ".py" and artifact.parent.name == "experiments":
+            return tuple(receipt.experiment_id for receipt in self.experiments.receipts
+                         if Path(receipt.script).name == name and receipt.replicated)
+        return ()
 
     def _success_criterion(self, division: Division, target: Path) -> str:
         """The observable condition a worker must reach, stated per division."""
@@ -1361,6 +2033,53 @@ class ResearchSwarm:
                          f"(searched: {', '.join(entry.payload.get('searched', []))})")
         self.workspace.audit.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    # -- recovery -----------------------------------------------------------
+    def _recover_state(self) -> dict[str, Any]:
+        """Rebuild coordination state after an interrupted run.
+
+        Three things are recovered, in order of authority:
+
+        1. the persisted task board, so a task keeps its id, attempt count and
+           evidence rather than being reopened as a fresh duplicate;
+        2. the ledger, which overrides the board — a task the ledger shows
+           completed is completed, whatever the board file says;
+        3. the inbox, so a help request made before the interruption is still
+           unanswered rather than silently dropped.
+
+        Deliberately *not* recovered: the worker roster. Agents are cheap to
+        re-create and their ids are derived, so a restart re-hires the pool rather
+        than trusting a serialized record of who used to exist.
+        """
+        summary = {"resumed": False, "tasks": 0, "healed": 0, "messages": 0}
+        if not self.config.resume:
+            return summary
+        board_path = self.workspace.root / TASK_BOARD_FILENAME
+        restored = TaskBoard.load(board_path)
+        if restored is not None:
+            self.board = restored
+            self.control.board = restored
+            summary["tasks"] = len(restored.all())
+            summary["healed"] = restored.recovered_from(self.ledger)
+        self.bus.load(self.ledger.read_raw())
+        summary["messages"] = len(self.bus.all())
+        if not summary["tasks"] and not summary["messages"]:
+            return summary
+        summary["resumed"] = True
+        # Anything the previous run left mid-flight is now stale: its worker no
+        # longer exists in this process, so its lease must not block a new one.
+        self.ledger.append(
+            "RUN_RESUMED_FROM_STATE", {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
+            {"agent_id": "archive", "role": "Recovery"},
+            {"tasks_restored": summary["tasks"], "tasks_healed": summary["healed"],
+             "messages_restored": summary["messages"],
+             "unacknowledged_requests": len(self.bus.unacknowledged()),
+             "note": "completed tasks are not re-run; stale leases were released"})
+        return summary
+
+    def recovery_report(self) -> dict[str, Any]:
+        """What recovery restored, for the CLI banner and the run log."""
+        return dict(self._recovered)
+
     def run(self, *, objective: str = "", on_status: Callable[[str], None] | None = None) -> ResearchOutcome:
         """Execute the relentless loop to convergence (or proven stagnation)."""
         def emit(message: str) -> None:
@@ -1368,6 +2087,7 @@ class ResearchSwarm:
                 on_status(message)
 
         self._status_callback = emit
+        self.control.on_status = emit
 
         if self._live_research_mode():
             self._prepare_live_research(objective)
@@ -1390,10 +2110,16 @@ class ResearchSwarm:
         emit("convergence loop started")
         cycle_limit = (0 if self._live_research_mode() and not self.plan.propositions
                        else self.config.max_cycles)
-        outcome: ConvergenceOutcome = loop.run(max_cycles=cycle_limit)
+        # The control plane is the stop authority. Passing it here is what makes a
+        # leader's stop request end the run with EXTERNAL_STOP and a named actor,
+        # instead of the loop grinding on to stagnation and implying it ran out of
+        # options on its own.
+        outcome: ConvergenceOutcome = loop.run(max_cycles=cycle_limit,
+                                               should_stop=self.control.should_stop)
         emit(f"convergence loop finished: {outcome.stop_reason.value}")
         self._last_outcome = outcome
         self._last_report = outcome.final_report
+        self.board.save(self.workspace.root / TASK_BOARD_FILENAME)
         # Re-render once with the terminal state so the delivered PDF reports
         # the verdict it was published under, not the previous cycle's.
         self._republish(outcome)
@@ -1404,6 +2130,9 @@ class ResearchSwarm:
                            {"agent_id": "archive", "role": "Publication"},
                            {"solved": outcome.solved, "stop_reason": outcome.stop_reason.value,
                             "cycles": outcome.cycles, "pdf": str(self.workspace.paper_pdf),
+                            "stopped_by": self.control.stopped_by or None,
+                            "open_tasks": [task.task_id for task in self.board.open_tasks()],
+                            "unacknowledged_requests": len(self.bus.unacknowledged()),
                             "pdf_hash": sha256_file(self.workspace.paper_pdf)
                             if self.workspace.paper_pdf.is_file() else None})
         return ResearchOutcome(
@@ -1433,26 +2162,43 @@ class ResearchSwarm:
         manifest_path = self.workspace.root / "claim_manifest.json"
         imposed_claim = (f" Required user claim: {self.config.claim}. Declared symbols: "
                          f"{', '.join(self.config.claim_symbols)}. Preserve its meaning exactly."
-                         if self.config.claim else "")
+                          if self.config.claim else "")
         director = ResearchAgent(DIRECTOR_ID, "Executive Director", objective or self.topic,
                                  ("write_file",), division=Division.THEORY)
-        self._run_worker(
-            director, Division.THEORY,
-            f"Research topic: {self.topic}. Objective: {objective or self.topic}."
-            f"{imposed_claim} "
-            "Use write_file to create 00_objective_spec.md with variable domains, boundary "
-            "cases, assumptions, and a falsifiable goal. Also write claim_manifest.json as "
-            "JSON with a nonempty 'claims' array. Each claim needs id (PROP-01 style), "
-            "name, statement, hypotheses (array), and kind. Include one central mathematical "
-                "claim and at most two supporting lemmas. Each mathematical claim needs a "
-                "lean_statement field containing the exact Lean proposition to be proved, "
-                "with the same scope and hypotheses as its natural-language statement. "
-                "Keep empirical predictions out of the "
-            "mathematical claims array. Use only claims you can assign to independent SymPy "
-            "and Lean workers. Set top-level 'empirical_required' to true when a simulation "
-            "can test the statement. Do not write proof scripts yourself.",
-            success_criterion="Both the objective specification and valid claim manifest exist.",
-            target=manifest_path)
+        # A resumed run keeps the Director's own artifacts. Re-authoring them would
+        # re-bill the most expensive call in the run and could silently *change* the
+        # claim set, invalidating every proof and receipt already on disk.
+        reusing = self.config.resume and manifest_path.is_file() and \
+            self.workspace.objective_spec.is_file()
+        if not reusing:
+            self._run_worker(
+                director, Division.THEORY,
+                f"Research topic: {self.topic}. Objective: {objective or self.topic}."
+                f"{imposed_claim} "
+                "Use write_file to create 00_objective_spec.md with variable domains, boundary "
+                "cases, assumptions, and a falsifiable goal. Also write claim_manifest.json as "
+                "JSON with a nonempty 'claims' array. Each claim needs id (PROP-01 style), "
+                "name, statement, hypotheses (array), and kind. Include one central mathematical "
+                    "claim and at most two supporting lemmas. Each mathematical claim needs a "
+                    "lean_statement field containing the exact Lean proposition to be proved, "
+                    "with the same scope and hypotheses as its natural-language statement. "
+                    "Keep empirical predictions out of the "
+                "mathematical claims array. Use only claims you can assign to independent SymPy "
+                "and Lean workers. Set top-level 'empirical_required' to true when a simulation "
+                "can test the statement. Do not write proof scripts yourself.",
+                success_criterion="Both the objective specification and valid claim manifest exist.",
+                target=manifest_path,
+                # The Director produces two files, not one; both are named here so
+                # the write allow-list covers the assignment it was actually given.
+                extra_writes=(self.workspace.objective_spec,))
+        else:
+            self._emit_status("resuming: reusing the Director's existing objective spec "
+                              "and claim manifest")
+            self.ledger.append(
+                "STATUS_REPORT", {"agent_id": DIRECTOR_ID, "role": "Chief Scientist"},
+                {"agent_id": "archive", "role": "Recovery"},
+                {"status": "reused_director_artifacts", "manifest": manifest_path.name})
+
         try:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             raw_claims = payload["claims"]
@@ -1492,18 +2238,22 @@ class ResearchSwarm:
         for division, spec in DIVISION_SPECS.items():
             lead = self.agents[leader_agent_id(division)]
             target = self.workspace.root / f"{division.value}_assignments.md"
-            self._run_worker(
-                lead, division,
-                f"Topic: {self.topic}. Read 00_objective_spec.md and claim_manifest.json. "
-                f"As {spec.leader_title}, decompose the objective into specific assignments "
-                f"for your division and write {target.name}. Record assumptions and exact "
-                "success criteria. Do not claim a result without a tool receipt. "
-                + ("Search primary literature with web_search or a citable source. Write "
-                   "evidence/index.json as an array of records with id, claim, source URL, "
-                   "and citation. Cite only material you inspected. "
-                   if division is Division.LITERATURE else ""),
-                success_criterion=f"{target.name} contains actionable assignments.",
-                target=target)
+            # Same reasoning as the Director: a lead's decomposition is expensive
+            # and stable. Re-deriving it every restart would burn budget and could
+            # contradict the manifest the proofs were written against.
+            if not (self.config.resume and target.is_file()):
+                self._run_worker(
+                    lead, division,
+                    f"Topic: {self.topic}. Read 00_objective_spec.md and claim_manifest.json. "
+                    f"As {spec.leader_title}, decompose the objective into specific assignments "
+                    f"for your division and write {target.name}. Record assumptions and exact "
+                    "success criteria. Do not claim a result without a tool receipt. "
+                    + ("Search primary literature with web_search or a citable source. Write "
+                       "evidence/index.json as an array of records with id, claim, source URL, "
+                       "and citation. Cite only material you inspected. "
+                       if division is Division.LITERATURE else ""),
+                    success_criterion=f"{target.name} contains actionable assignments.",
+                    target=target)
             if not target.is_file():
                 lines = [f"# {spec.leader_title} assignments", "", spec.objective, "",
                          "The lead did not leave a written assignment. Continue from the "

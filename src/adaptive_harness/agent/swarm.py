@@ -123,6 +123,13 @@ def _invoke(worker: SwarmWorker, assignment: SwarmAssignment) -> SwarmResult:
         json.dumps(result.to_dict(), ensure_ascii=False)
         return result
     except Exception as exc:
+        # An abort is not a failure. A cancellation raised by a leader means "stop
+        # now"; converting it into a failed result would both hide the stop and
+        # trigger run_assignment's retry, which would re-run the very worker that
+        # was just told to stop. The flag keeps this layer free of any dependency
+        # on whoever raises the abort.
+        if getattr(exc, "abort_subagent", False):
+            raise
         return SwarmResult(assignment.role, assignment.phase, False, "Subagent failed",
                            error=f"{type(exc).__name__}: {exc}")
 
@@ -271,7 +278,7 @@ class DeveloperAgentWorker:
                  forced_mode: str | None = None,
                  forced_thinking: str | None = None,
                  enable_skill_routing: bool = False,
-                 write_target: Path | None = None,
+                 write_target: Path | Sequence[Path] | None = None,
                  system_prompt: str | None = None,
                  on_event: Callable[[Any], None] | None = None) -> None:
         if max_steps is not None and max_steps < 1:
@@ -285,9 +292,21 @@ class DeveloperAgentWorker:
         self.forced_mode = forced_mode
         self.forced_thinking = forced_thinking
         self.enable_skill_routing = enable_skill_routing
+        # One path, or the small set of paths this assignment is authorized to
+        # write. The research swarm uses the set form: a proof worker's decider
+        # script *and* its natural-language explanation are both required, so
+        # authorising only the script would block the explanation the gate needs.
         self.write_target = write_target
         self.system_prompt = system_prompt
         self.on_event = on_event
+
+    def _authorized_writes(self) -> tuple[Path, ...] | None:
+        """The write allow-list for this assignment, or None when unrestricted."""
+        if self.write_target is None:
+            return None
+        if isinstance(self.write_target, (str, Path)):
+            return (Path(self.write_target),)
+        return tuple(Path(item) for item in self.write_target)
 
     def _build_tools(self, root: str, assignment: SwarmAssignment) -> list[Any]:
         """Construct the tool list for one assignment."""
@@ -301,11 +320,10 @@ class DeveloperAgentWorker:
         from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 
         if self.tool_names is not None:
+            authorized = self._authorized_writes()
             available = {
                 "read_file": lambda: ReadFileTool(workspace_root=root),
-                "write_file": lambda: WriteFileTool(
-                    workspace_root=root,
-                    allowed_paths=(self.write_target,) if self.write_target else None),
+                "write_file": lambda: WriteFileTool(workspace_root=root, allowed_paths=authorized),
                 "edit_file": lambda: EditFileTool(workspace_root=root),
                 "list_directory": lambda: ListDirectoryTool(workspace_root=root),
                 "search_files": lambda: SearchFilesTool(workspace_root=root),
