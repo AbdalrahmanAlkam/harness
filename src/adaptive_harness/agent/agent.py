@@ -38,6 +38,7 @@ from adaptive_harness.tools.plotting import PlotTerminalTool
 from adaptive_harness.agent.compaction import rank_search_results
 from adaptive_harness.data.preferences import ClarificationMemory
 from adaptive_harness.tools.research import WebSearchTool
+from adaptive_harness.tools.lean import RunLeanProofTool
 from adaptive_harness.tools.research_swarm import CompileTypstTool
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 from adaptive_harness.tools.delegation import DelegateSubagentTool
@@ -195,6 +196,7 @@ class DeveloperAgent:
             VerifyEquationTool(),
             AskUserTool(callback=self._handle_clarification),
             CompileTypstTool(workspace_root=workspace_root, allow_install=False),
+            RunLeanProofTool(workspace_root=workspace_root, lean_dir="proofs/lean"),
         ]
         if WebSearchTool().api_key:
             default_tools.append(WebSearchTool())
@@ -599,8 +601,10 @@ class DeveloperAgent:
             "step": 0})
         domain_tool_names = {
             DomainMode.CODING: set(self.tools) - {"check_convergence"},
-            DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "run_bash", "calculate", "plot_terminal", "ask_user"},
-            DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "plot_terminal", "ask_user", "compile_typst"},
+            # Research mode must be able to typeset and build its own paper, and
+            # to machine-check a formal proof, or it cannot deliver either.
+            DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "run_bash", "calculate", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof"},
+            DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof"},
             DomainMode.AUDIT: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user"},
         }[domain_res.mode]
         if self.safety_profile == "turbo":
@@ -615,7 +619,8 @@ class DeveloperAgent:
             domain_tool_names.add("delegate_subagent")
         if research_active:
             domain_tool_names.update({"spawn_subagent", "scale_division",
-                                      "verify_proofs", "run_experiments"} & set(self.tools))
+                                      "verify_proofs", "run_experiments",
+                                      "compile_typst", "run_lean_proof"} & set(self.tools))
         tool_schemas = [t.to_openai_schema() for t in self.tools.values() if t.name in domain_tool_names]
         yield AgentEvent("specialized_skill", {
             "skills": [{"name": skill.name, "title": skill.title, "category": skill.category,
