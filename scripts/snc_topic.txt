@@ -1,0 +1,18 @@
+Counterexample search for Seymour's Second Neighborhood Conjecture.
+
+Let D = (V, E) be a finite simple digraph with no directed 2-cycles: for all u, v
+in V, (u, v) in E implies (v, u) not in E. For a vertex v define the first
+out-neighbourhood N+(v) = {u in V : (u, v) in V and (v, u) in E} and the second
+out-neighbourhood N++(v) = {w in V \ (N+(v) union {v}) : exists u in N+(v) with
+(u, w) in E}. Seymour's Second Neighborhood Conjecture asserts that every such
+digraph has at least one vertex v with |N++(v)| >= |N+(v)|.
+
+Task: search for and construct an explicit counterexample, i.e. a 2-cycle-free
+digraph in which EVERY vertex strictly violates the inequality, so that
+|N++(v)| < |N+(v)| holds for all v in V. Report the result as a binary adjacency
+matrix A with A[i][j] = 1 exactly when (v_i, v_j) in E, together with the
+verified pair (|N+(v)|, |N++(v)|) for every vertex, and state n = |V|.
+
+Verification is mandatory and machine-checked: for every vertex, the reported
+counts must be recomputed from the adjacency matrix, not asserted. A candidate
+whose counts do not reproduce is a failed candidate, not a partial result.
