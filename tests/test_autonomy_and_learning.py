@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 from adaptive_harness.agent.agent import DeveloperAgent
 from adaptive_harness.agent.swarm import DeveloperAgentWorker, SwarmResult
@@ -12,7 +13,9 @@ from adaptive_harness.data.storage import ExperienceRepository
 from adaptive_harness.learning.distill import export_distillation
 from adaptive_harness.learning.harvester import harvest_verified_traces
 from adaptive_harness.llm.mock_client import LLMResponse
+from adaptive_harness.llm.client import LLMClient
 from adaptive_harness.tools.delegation import DelegateSubagentTool
+from adaptive_harness.tools.bash import RunBashTool
 from adaptive_harness.tui.app import AdaptiveHarnessApp
 from adaptive_harness.tui.widgets import ClassifierTelemetryWidget, QuickSelectModal, ThemePickerModal
 import pytest
@@ -50,6 +53,18 @@ def test_plain_code_does_not_count_as_completed_edit(tmp_path: Path):
     assert not (tmp_path / "app.py").exists()
 
 
+def test_offline_mock_does_not_fabricate_requested_implementation(tmp_path: Path):
+    agent = DeveloperAgent(llm_client=LLMClient(force_mock=True), workspace_root=str(tmp_path),
+                           preferences_dir=tmp_path / "prefs")
+    events = list(agent.run_stream("create hello.py with a greet function"))
+    domain = next(event.payload for event in events if event.event_type == "domain_mode")
+    result = next(event.payload for event in events if event.event_type == "response")
+    assert domain["mode"] == "coding"
+    assert not result["success"] and result["stop_reason"] == "provider_error"
+    assert not (tmp_path / "hello.py").exists()
+    assert not (tmp_path / "scratch.py").exists()
+
+
 def test_turbo_risk_boundary_allows_local_cleanup_but_gates_catastrophe():
     risk = ToolRiskClassifier()
     assert risk.evaluate("run_bash", {"command": "rm -rf build"}, catastrophic_only=True) is None
@@ -74,6 +89,40 @@ def test_delegate_subagent_restricts_workspace_and_returns_structured_result(tmp
     outside = tool.execute("coder", "escape", "../outside")
     assert not outside.success
     assert not (tmp_path.parent / "outside").exists()
+
+
+def test_read_only_delegation_does_not_create_a_missing_target(tmp_path: Path, monkeypatch):
+    seen = []
+
+    def fake_worker(self, assignment):
+        seen.append(assignment)
+        return SwarmResult(assignment.role, assignment.phase, True, "planned")
+
+    monkeypatch.setattr(DeveloperAgentWorker, "__call__", fake_worker)
+    tool = DelegateSubagentTool(tmp_path)
+    missing = tool.execute("architect", "plan the app", "not_created")
+    assert not missing.success
+    assert not (tmp_path / "not_created").exists()
+    assert not seen
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    assert tool.execute("reviewer", "inspect the app", "existing").success
+    assert seen[0].workspace_root == existing
+
+
+def test_reviewer_shell_only_checks_workspace_javascript(tmp_path: Path):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is not installed")
+    tool = RunBashTool(tmp_path, read_only=True)
+    script = tmp_path / "main.js"
+    script.write_text("const answer = 42;\n")
+    assert tool.execute("node --check main.js").success
+    blocked = tool.execute("touch unexpected.txt")
+    assert not blocked.success
+    assert not (tmp_path / "unexpected.txt").exists()
+    assert not tool.execute("node --check ../outside.js").success
+    script.write_text("const = ;\n")
+    assert not tool.execute("node --check main.js").success
 
 
 def test_verified_trace_export_and_workspace_retrieval(tmp_path: Path):

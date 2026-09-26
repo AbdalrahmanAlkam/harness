@@ -43,8 +43,12 @@ class DelegateSubagentTool(Tool):
                               error="Choose architect, coder, reviewer, or security and provide a task")
         try:
             root = workspace_path(self.workspace_root, target_dir or ".")
-            root.mkdir(parents=True, exist_ok=True)
             selected_role, phase = roles[role]
+            if selected_role is SwarmRole.CODER:
+                root.mkdir(parents=True, exist_ok=True)
+            elif not root.is_dir():
+                return ToolResult(success=False, output="",
+                                  error=f"Read-only subagent target directory does not exist: {target_dir}")
             assignment = SwarmAssignment(selected_role, phase, task, root)
             worker = DeveloperAgentWorker(llm_client_factory=self.llm_client_factory,
                 repository=self.repository, safety_profile=self.safety_profile,

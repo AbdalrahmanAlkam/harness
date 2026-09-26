@@ -310,6 +310,7 @@ def dev(
     console.print(f"Task: [bold white]\"{escape(task)}\"[/bold white]")
 
     last_agent_content = ""
+    task_succeeded = False
     for event in agent.run_stream(task):
         et = event.event_type
         p = event.payload
@@ -386,6 +387,7 @@ def dev(
             badge_col = "green" if p["status"] == "SUCCESS" else "red bold"
             console.print(f"  [dim]Verification Classifier: [{badge_col}]{p['status']}[/{badge_col}] -> Action: {p['action']}[/dim]")
         elif et == "response":
+            task_succeeded = bool(p.get("success"))
             if p.get("content") and p["content"] != last_agent_content:
                 console.print("\n[bold magenta]Agent:[/bold magenta]")
                 console.print(Markdown(format_model_markdown(p["content"])))
@@ -400,6 +402,9 @@ def dev(
             }.get(p.get("stop_reason"), "Stopped before completion")
             color = "green" if p.get("success", True) else "yellow"
             console.print(f"\n[bold {color}]{status} in {p['total_time_ms']} ms ({p['steps']} steps)[/bold {color}]\n")
+
+    if not task_succeeded:
+        raise typer.Exit(code=1)
 
 
 @app.command()

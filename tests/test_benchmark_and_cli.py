@@ -41,6 +41,14 @@ def test_cli_help():
     assert "Adaptive Agent Harness CLI" in result.output
 
 
+def test_dev_offline_implementation_failure_exits_nonzero(tmp_path):
+    result = runner.invoke(app, ["dev", "create hello.py with a greet function", "--offline",
+                                 "--workspace", str(tmp_path), "--db", str(tmp_path / "experience.db")])
+    assert result.exit_code == 1
+    assert "Offline mock cannot implement this edit" in result.output
+    assert not (tmp_path / "hello.py").exists()
+
+
 def test_cli_run_task(quick_model, tmp_path):
     _, model_path = quick_model
     db_path = tmp_path / "cli_exp.db"

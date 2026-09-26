@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 import re
 import shlex
 
-from adaptive_harness.tools.base import Tool, ToolResult
+from adaptive_harness.tools.base import Tool, ToolResult, workspace_path
 from adaptive_harness.tools.process import run_process
 
 
@@ -43,8 +43,9 @@ class RunBashTool(Tool):
         "required": ["command"],
     }
 
-    def __init__(self, workspace_root: Optional[Path | str] = None):
+    def __init__(self, workspace_root: Optional[Path | str] = None, *, read_only: bool = False):
         self.workspace_root = Path(workspace_root or os.getcwd()).resolve()
+        self.read_only = read_only
 
     def execute(self, command: str, timeout_seconds: int = 30, **kwargs: Any) -> ToolResult:
         cmd_strip = command.strip()
@@ -54,6 +55,22 @@ class RunBashTool(Tool):
             words = shlex.split(cmd_strip)
         except ValueError as exc:
             return ToolResult(success=False, output="", error=f"Invalid shell quoting: {exc}")
+        if self.read_only:
+            # Reviewers can check JavaScript syntax without executing project
+            # scripts or giving a shell command permission to edit the workspace.
+            if len(words) != 3 or words[:2] != ["node", "--check"]:
+                return ToolResult(success=False, output="",
+                                  error="Reviewer shell access only permits node --check <workspace JavaScript file>")
+            try:
+                checked_path = workspace_path(self.workspace_root, words[2])
+            except ValueError as exc:
+                return ToolResult(success=False, output="", error=str(exc))
+            if checked_path.suffix not in {".js", ".mjs", ".cjs"} or not checked_path.is_file():
+                return ToolResult(success=False, output="",
+                                  error="Reviewer syntax check requires an existing JavaScript file")
+            command_to_run: str | list[str] = ["node", "--check", str(checked_path)]
+        else:
+            command_to_run = cmd_strip
         if ("rm" in words and any(word in {"/", "/*", "--no-preserve-root"} for word in words)
                 and any(word.startswith("-") and ("r" in word or word == "--recursive") for word in words)):
             return ToolResult(success=False, output="", error="Command blocked by safety filter: recursive root deletion")
@@ -78,8 +95,8 @@ class RunBashTool(Tool):
 
         try:
             res = run_process(
-                cmd_strip,
-                shell=True,
+                command_to_run,
+                shell=not self.read_only,
                 cwd=str(self.workspace_root),
                 timeout=timeout_seconds,
                 env=env,

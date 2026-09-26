@@ -48,10 +48,27 @@ class MockLLMClient:
         last_user_msg = ""
         for m in reversed(messages):
             if m.get("role") == "user":
-                last_user_msg = str(m.get("content", ""))
-                break
+                candidate = str(m.get("content", ""))
+                if not candidate.startswith(("The task requires real file changes.",
+                                             "The task is not complete.",
+                                             "Continue your previous response")):
+                    last_user_msg = candidate
+                    break
 
         low = last_user_msg.lower()
+
+        # The mock is a test fixture, not a code generator. A generic sample
+        # file cannot satisfy an implementation request, so never claim it did.
+        simple_write = re.fullmatch(r"\s*write file ([\w./-]+\.(?:py|md|toml|txt|json))\s*", last_user_msg, re.I)
+        implementation_request = (re.search(r"\b(?:create|build|implement|make|edit|write|fix|refactor)\b", low)
+            and re.search(r"\b(?:app|code|file|folder|project|module|function|website|script|tests?|bug)\b|"
+                          r"\b[\w./-]+\.(?:py|js|ts|html|css|json|md|toml)\b", low))
+        if implementation_request and not simple_write:
+            return LLMResponse(
+                content="Offline mock cannot implement this edit. Configure a live or local model and retry.",
+                model=model or self.default_model,
+                finish_reason="error",
+            )
 
         # If user asks to run tests or pytest
         if "test" in low or "pytest" in low:
@@ -98,9 +115,9 @@ class MockLLMClient:
             )
 
         # If user asks to edit or write a file
-        if "edit" in low or "write" in low or "create file" in low:
+        if simple_write:
             file_match = re.search(r"(\S+\.(?:py|md|toml|txt|json))", last_user_msg)
-            path = file_match.group(1) if file_match else "scratch.py"
+            path = file_match.group(1)
             return LLMResponse(
                 content=f"Writing implementation to `{path}`.",
                 tool_calls=[

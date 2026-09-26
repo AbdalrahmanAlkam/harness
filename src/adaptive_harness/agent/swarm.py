@@ -287,7 +287,7 @@ class DeveloperAgentWorker:
             tools += [WriteFileTool(workspace_root=root), EditFileTool(workspace_root=root),
                       RunBashTool(workspace_root=root), RunPytestTool(workspace_root=root)]
         elif assignment.role is SwarmRole.QA and assignment.phase is SwarmPhase.VERIFY:
-            tools.append(RunBashTool(workspace_root=root))
+            tools.append(RunBashTool(workspace_root=root, read_only=True))
             if (assignment.workspace_root / "tests").is_dir():
                 tools.append(RunPytestTool(workspace_root=root))
         prompts = PromptRegistry.for_workspace(assignment.workspace_root)

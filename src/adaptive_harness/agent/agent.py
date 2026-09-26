@@ -413,6 +413,12 @@ class DeveloperAgent:
         heuristic_domain = self.domain_classifier.classify(user_input)
         if self.forced_mode is None and classifier_name != "semif" and heuristic_domain.confidence >= 0.8:
             domain_res = heuristic_domain
+        if (self.forced_mode is None and requests_file_changes(original_input) and
+                re.search(r"\b(?:file|folder|directory|code|app|function|module|project)\b|"
+                          r"\b[\w./-]+\.(?:py|js|ts|html|css|json|md|toml)\b", original_input, re.I)):
+            # An explicit request to create or edit project files should not
+            # lose its coding tools to a noisy domain prediction.
+            domain_res = DomainAssessment(DomainMode.CODING, 0.95)
         predicted_level = ThinkingLevel(thinking_prediction.label)
         heuristic_thinking = self.thinking_classifier.classify(user_input)
         order = list(ThinkingLevel)

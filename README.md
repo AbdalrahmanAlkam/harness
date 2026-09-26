@@ -4,7 +4,7 @@
 
 Install the project into its virtual environment, then run `adaptive-harness dev "git status"` or `adaptive-harness tui`. With no API key or custom task-model endpoint, completions use the offline mock client. Set `OPENROUTER_API_KEY` or pass `--key` for live completions. `--base-url` points the task model at an OpenAI-compatible local server; the classifier backend is configured separately.
 
-Use `adaptive-harness dev --offline "check status"` to explicitly run the no-network mock path even when credentials are configured. Live request failures are shown as errors, their response text is redacted for the configured key, and the current request is never presented as completed work; the client switches to offline mock mode for the next request.
+Use `adaptive-harness dev --offline "check status"` to explicitly run the no-network mock path even when credentials are configured. The mock supports simple demonstration tools, but reports implementation requests it cannot fulfill as errors; `dev` exits with status 1 for incomplete tasks. Live request failures are shown as errors, their response text is redacted for the configured key, and the current request is never presented as completed work.
 
 The default OpenRouter model is `z-ai/glm-5.3-flash` in manual selection mode. The agent keeps the active model for every step. `--model MODEL_ID` or `--tier fast|standard|reasoning` selects another fixed model; `--model auto` or `/model auto` enables complexity-based routing explicitly. In the TUI, `/model` or F4 opens a searchable OpenRouter catalog. The catalog falls back to built-in and previously fetched choices when the network is unavailable. A fixed model appears as `MANUAL` in telemetry.
 
@@ -86,7 +86,7 @@ The **Adaptive Agent Harness 2.0** solves this by embedding **pervasive machine 
    - **Reasoning Tier** (e.g. `anthropic/claude-sonnet-4`): complex architectures, concurrency/deadlocks, multi-file algorithms.
 4. **Tool Verification & Self-Healing Classifier (`VerificationClassifier`)**: Actively inspects tool outputs (bash stdout/stderr, pytest assertions, compiler syntax errors, missing paths) to classify failure modes (`SYNTAX_ERROR`, `TEST_FAILURE`, `FILE_ERROR`, `RUNTIME_ERROR`) and immediately trigger targeted recovery actions (`AUTO_RETRY_SYNTAX_FIX`, `AUTO_RETRY_TEST_FIX`, etc.).
 5. **Interactive Textual TUI (`AdaptiveHarnessApp`)**: A full terminal IDE featuring live classifier telemetry gauges, probability bar charts, streaming agent thought logs, and interactive clarification modals.
-6. **OpenRouter Protocol & Offline Fallback**: Direct integration with OpenRouter's API (`https://openrouter.ai/api/v1`) and OpenAI-compatible endpoints, paired with an intelligent **Mock LLM engine** for instant offline development without requiring a paid API key.
+6. **OpenRouter Protocol & Offline Fallback**: Direct integration with OpenRouter's API (`https://openrouter.ai/api/v1`) and OpenAI-compatible endpoints, paired with a **Mock LLM engine** for simple offline demonstrations without requiring a paid API key.
 
 ---
 

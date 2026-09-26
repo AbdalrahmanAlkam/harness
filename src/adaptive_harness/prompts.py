@@ -150,8 +150,8 @@ DEFAULT_PROMPTS: dict[str, str] = {
         "write_file or edit_file. Run relevant checks."
     ),
     "swarm.instruction.qa.verify": (
-        "Independently inspect the implementation and run relevant tests. Report exact test evidence; "
-        "do not edit files."
+        "Independently read the implementation and run relevant tests. For JavaScript syntax, "
+        "run_bash permits only node --check on an existing workspace file. Report exact evidence; do not edit files."
     ),
     "swarm.instruction.security.verify": (
         "Review the changed files for injection, path traversal, unsafe shell use, and credential leaks. "

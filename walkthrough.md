@@ -6,7 +6,7 @@ The TUI uses the directory where it was launched and edits there directly by def
 
 For a headless run, use `adaptive-harness dev "inspect the tests"`. The default OpenRouter model is `z-ai/glm-5.3-flash` in manual mode. Add `--model anthropic/claude-sonnet-4` or `--tier fast` to choose another fixed model; `--model auto` opts into complexity routing. In the TUI, F4 or `/model` opens a searchable picker for the active provider, and `/model auto` enables automatic routing. OpenRouter choices come from its catalog when available; direct providers show their configured tier models. Repeat `--backup-provider NAME` to opt into failover on 429 or server errors.
 
-For a guaranteed no-network walkthrough, run `adaptive-harness dev --offline "check status"`. This uses the mock engine even if a live key is configured. For shell or test tools, timeouts terminate the full child process group, and captured stdout or stderr is capped at 200 KB.
+For a guaranteed no-network walkthrough, run `adaptive-harness dev --offline "check status"`. This uses the mock engine even if a live key is configured. The mock reports implementation requests it cannot satisfy as errors and `dev` exits with status 1 for incomplete tasks. For shell or test tools, timeouts terminate the full child process group, and captured stdout or stderr is capped at 200 KB.
 
 Copy an agent reply with `/copy` or Ctrl+Shift+C. Drag-select a passage in the chat log first to copy only that selection. If the provider rejects a thinking setting, the harness retries once with the same model and its default reasoning behavior.
 
