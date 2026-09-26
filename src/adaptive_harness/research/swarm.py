@@ -1450,6 +1450,7 @@ class ResearchSwarm:
                                                    SwarmPhase, SwarmRole, run_assignment)
         from adaptive_harness.data.storage import ExperienceRepository
         from adaptive_harness.research.roles import WORKER_TOOLS
+        from adaptive_harness.tools.process import process_scope
 
         if not self._interactive_capable():
             return {"ran": False, "reason": "no live model configured"}
@@ -1545,7 +1546,12 @@ class ResearchSwarm:
         assignment = SwarmAssignment(SwarmRole.CODER, SwarmPhase.IMPLEMENT, directive,
                                      self.workspace.root)
         try:
-            result = run_assignment(worker, assignment)
+            # Everything this worker spawns is tagged with its agent id, so a stop
+            # can reach exactly its children and nothing else. Without the tag the
+            # only handle available is the thread, and a leader running on the main
+            # thread would share its identity with the verifiers.
+            with process_scope(agent.agent_id):
+                result = run_assignment(worker, assignment)
         except WorkerCancelled as exc:
             summary = {"ran": True, "success": False, "cancelled": True,
                        "state": WorkerState.CANCELLED.value,
@@ -2268,31 +2274,138 @@ class ResearchSwarm:
                     {"agent_id": lead.agent_id, "role": lead.role_name},
                     {"status": "lead_assignment_missing", "fallback_path": target.name})
 
+    def _progress_report(self, outcome: ConvergenceOutcome) -> str:
+        """The published document for a run that did not converge.
+
+        It has to be *diagnostic*, not merely apologetic. A bare "not solved" tells
+        a reader nothing they could not already see. This one states which
+        invariants failed and why, what each division produced, which tasks remain
+        open, and whether a human stopped the run — the facts a reader needs to
+        decide whether to resume, redirect, or abandon.
+        """
+        def esc(text: str) -> str:
+            # Typst is markup: an unescaped '#', '*', or '_' from a model-authored
+            # artifact is exactly what broke compilation in the first place.
+            return (str(text).replace("\\", "\\\\").replace("#", "\\#")
+                    .replace("*", "\\*").replace("_", "\\_").replace("$", "\\$"))
+
+        # Publication is a best-effort final step, so a partially populated outcome
+        # degrades the report rather than raising on the way to the PDF.
+        cycles = getattr(outcome, "cycles", 0)
+        spawned = getattr(outcome, "workers_spawned", 0)
+        stop_reason = getattr(getattr(outcome, "stop_reason", None), "value", "unknown")
+        final_report = getattr(outcome, "final_report", None)
+
+        lines = [
+            "= Research progress report", "",
+            "The research swarm did not verify its objective. This document is a progress "
+            "report, not a proof and not a completed academic paper. Nothing below should "
+            "be read as a settled result.", "",
+            f"The loop exited after {cycles} cycle(s) with `{stop_reason}`, having recruited "
+            f"{spawned} worker(s).", ""]
+
+        if self.control.stopped_by:
+            lines += [f"== The run was stopped by a human", "",
+                      f"`{esc(self.control.stopped_by)}` stopped the run: "
+                      f"{esc(self.control._run_stop.reason or 'no reason recorded')}. This "
+                      "is an operator decision, not a mathematical limit — the loop was "
+                      "interrupted, so no claim about what the swarm could have achieved is "
+                      "implied either way.", ""]
+
+        lines += ["== Which invariants failed", ""]
+        statuses = (final_report.statuses if final_report is not None else ())
+        for status in statuses:
+            mark = "satisfied" if status.satisfied else "*not satisfied*"
+            lines.append(f"- `{status.invariant.value}` — {mark}. {esc(status.detail)}")
+        if not statuses:
+            lines.append("The gate produced no status record for this run.")
+        lines.append("")
+
+        if self.plan.propositions:
+            lines += ["== What each claim was decided to be", ""]
+            for item in self.claims.adjudications:
+                lines.append(f"- `{item.prop_id}` — **{item.verdict.value}** "
+                             f"(script exit {item.exit_code}).")
+                if item.statement:
+                    lines.append(f"  - Claimed: {esc(item.statement[:300])}")
+                if item.finding:
+                    lines.append(f"  - Kernel said: {esc(item.finding[:220])}")
+            if not self.claims.adjudications:
+                for claim in self.plan.propositions:
+                    lines.append(f"- `{claim.prop_id}` — **UNTESTED**, no verdict was reached.")
+                    if claim.statement:
+                        lines.append(f"  - Claimed: {esc(claim.statement[:300])}")
+            lines.append("")
+
+        certified = [item for item in self.lean_gate.receipts if item.certified]
+        lines += ["== The formal tier", ""]
+        if certified:
+            lines.append(f"{len(certified)} of {len(self.lean_gate.receipts)} Lean file(s) "
+                         "were machine-checked by the kernel with no `sorry`, no `admit`, and "
+                         "no user-declared axiom:")
+            for item in certified:
+                lines.append(f"- `{esc(item.name)}` — {esc(', '.join(item.theorems) or 'no named theorem')}")
+        else:
+            lines.append("No Lean file was certified in this run, so nothing here rests on a "
+                         "machine-checked formal derivation.")
+        lines.append("")
+
+        open_tasks = self.board.open_tasks()
+        if open_tasks:
+            lines += ["== Work that was left open", ""]
+            for task in open_tasks:
+                lines.append(f"- `{task.task_id}` ({esc(task.division)}, "
+                             f"{esc(task.gap)}) — artifact `{esc(task.artifact)}`, "
+                             f"{task.attempts} attempt(s). {esc(task.note[:200])}")
+            lines.append("")
+
+        if self.bus.unacknowledged():
+            lines += ["== Requests that were never answered", ""]
+            for message in self.bus.unacknowledged():
+                lines.append(f"- `{message.message_id}`: {esc(message.sender)} asked "
+                             f"{esc(message.recipient)} for help on "
+                             f"*{esc(message.subject)}* and received no reply.")
+            lines.append("")
+
+        lines += ["== Where the evidence is", "",
+                  "The objective specification, exact claim manifest, attempted proof scripts, "
+                  "verification receipts, the task board, the convergence history, and the "
+                  "hash-chained communication ledger are preserved beside this report. The "
+                  "ledger verifies its own integrity; the receipts carry the SHA-256 of the "
+                  "exact bytes that were executed.", ""]
+        return "\n".join(lines) + "\n"
+
     def _republish(self, outcome: ConvergenceOutcome) -> None:
-        """Build the final PDF from the terminal gate state, tolerating failure."""
+        """Build the final PDF from the terminal gate state, tolerating failure.
+
+        On an unsolved live run the delivered document is the diagnostic progress
+        report, not whatever the Typst author last wrote. A draft is preserved as
+        ``paper_draft.typ`` so the work is not lost, but shipping a stale draft
+        because it happens to compile would replace an honest account of the run
+        with something that reads like a finished paper.
+        """
         if self._live_research_mode():
             if not outcome.solved:
                 marker = "#align(center)[*Research status: UNSOLVED*]"
-                progress = (
-                    "= Research progress report\n\n"
-                    "The research swarm did not verify its objective. This document is a "
-                    "progress report, not a proof or a completed academic paper.\n\n"
-                    "The objective, exact claim manifest, attempted proof scripts, "
-                    "verification receipts, convergence history, and communication "
-                    "ledger are preserved beside this report for inspection.\n")
-                if self.workspace.paper_typ.is_file():
-                    source = self.workspace.paper_typ.read_text(encoding="utf-8")
-                else:
-                    source = progress
-                if marker not in source:
-                    self.workspace.paper_typ.write_text(marker + "\n\n" + source,
-                                                        encoding="utf-8")
+                draft = (self.workspace.paper_typ.read_text(encoding="utf-8")
+                         if self.workspace.paper_typ.is_file() else "")
+                body = self._progress_report(outcome)
+                preserved = draft if draft and marker not in draft else ""
+                if preserved:
+                    (self.workspace.root / "paper_draft.typ").write_text(
+                        preserved, encoding="utf-8")
+                self.workspace.paper_typ.write_text(marker + "\n\n" + body, encoding="utf-8")
                 result = self._compile()
                 if result is None or not result.success:
-                    if source != progress:
-                        (self.workspace.root / "paper_draft.typ").write_text(
-                            source, encoding="utf-8")
-                    self.workspace.paper_typ.write_text(marker + "\n\n" + progress,
+                    # The progress report is generated, not authored, so a failure
+                    # here is a harness defect. Say so instead of shipping nothing.
+                    detail = (result.stderr if result is not None else "no compiler result")
+                    (self.workspace.root / "progress_report_build_error.txt").write_text(
+                        f"{detail}\n", encoding="utf-8")
+                    minimal = ("= Research progress report\n\nThe swarm did not verify its "
+                               "objective and the diagnostic report failed to typeset. The "
+                               "reason is recorded in progress_report_build_error.txt.\n")
+                    self.workspace.paper_typ.write_text(marker + "\n\n" + minimal,
                                                         encoding="utf-8")
                     self._compile()
             return

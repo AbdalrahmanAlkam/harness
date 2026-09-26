@@ -285,31 +285,78 @@ def test_stopping_a_worker_reports_whether_there_was_anything_to_stop(tmp_path: 
     assert swarm.stop_worker(agent_id, actor="director", reason="too late") is False
 
 
-def test_a_stop_request_kills_the_child_processes_a_worker_started(tmp_path: Path):
-    """A stopped worker must not leave a Lean build or a sweep burning cycles."""
+def _spawn_scoped(owner: str | None, seconds: int = 120):
+    """Start a real child process, registered the way run_process registers it.
+
+    ``owner=None`` reproduces a process started outside any agent scope — a
+    verifier running on the caller's own thread.
+    """
     import subprocess
 
-    from adaptive_harness.tools.process import live_pids, run_process
+    from adaptive_harness.tools import process as process_module
+    with process_module.process_scope(owner):
+        child = subprocess.Popen(["sleep", str(seconds)], start_new_session=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process_module._register(child.pid)
+    return child
+
+
+def test_a_stop_request_kills_the_child_processes_that_worker_started(tmp_path: Path):
+    """A stopped worker must not leave a Lean build or a sweep burning cycles."""
     swarm = _swarm(tmp_path)
     swarm.control.register("spawner_01", role="Simulation Worker")
     swarm.control.begin("spawner_01")
-    # run_process registers the group against the calling thread, which is the
-    # same attribution request_stop uses to find it.
-    process = subprocess.Popen(["sleep", "120"], start_new_session=True,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    from adaptive_harness.tools import process as process_module
-    process_module._register(process.pid)
+    process = _spawn_scoped("spawner_01")
     try:
-        assert process.pid in live_pids()
         swarm.control.request_stop("spawner_01", actor="empirical_lead_01",
                                    reason="over its step budget")
         signalled = swarm.ledger.by_action("STOP_REQUESTED")[0].payload["processes_signalled"]
         assert process.pid in signalled
         assert process.wait(timeout=10) != 0, "the child process survived the stop"
     finally:
-        process_module._unregister(process.pid)
         if process.poll() is None:  # pragma: no cover - cleanup only
             process.kill()
+
+
+def test_stopping_a_lead_does_not_kill_the_verifiers_own_subprocess(tmp_path: Path):
+    """A regression caught by a live run.
+
+    Attribution used to be by thread id. Leaders and the Director run on the main
+    thread, so cancelling a leader also signalled every process the main thread had
+    started — including the proof gate's own verifier. A proof script that exits 0
+    on its own was reported as REJECTED_NONZERO because the gate's subprocess had
+    been killed by an unrelated cancellation.
+    """
+    from adaptive_harness.tools.process import live_pids
+
+    swarm = _swarm(tmp_path)
+    # A lead: registered, queued, and sharing this test's thread.
+    lead = "theory_lead_01"
+    swarm.control.begin(lead)
+    assert swarm.control.record(lead).thread_id is not None
+
+    # The gate's verifier, running on this same thread but owned by no agent.
+    verifier = _spawn_scoped(None)
+    try:
+        assert verifier.pid in live_pids()
+        swarm.control.request_stop(lead, actor="executive_director_01",
+                                   reason="diverted to the Lean gap")
+        assert verifier.poll() is None, (
+            "cancelling a lead killed an unrelated process on the same thread")
+    finally:
+        if verifier.poll() is None:
+            verifier.kill()
+            verifier.wait(timeout=10)
+    assert swarm.control.record(lead).state is WorkerState.CANCELLED
+
+
+def test_a_proof_script_that_exits_zero_is_not_reported_as_failing(tmp_path: Path):
+    """The user-visible consequence of the attribution bug, asserted directly."""
+    swarm = _swarm(tmp_path)
+    _write(swarm, "proofs/prop-01.py", PROOF_BODY)
+    ok, detail, _ = swarm._evaluate_proofs()
+    assert ok, detail
+    assert [receipt.status for receipt in swarm.proofs.receipts] == ["VERIFIED_EXIT_0"]
 
 
 def test_stopping_the_run_ends_the_loop_with_an_attributable_external_stop(tmp_path: Path):
@@ -656,3 +703,79 @@ def test_an_unknown_action_is_rejected(tmp_path: Path):
     swarm.control.begin(worker)
     result = StopWorkerTool(swarm).execute(worker, "detonate", "director", "why not")
     assert not result.success and "cancel, pause, or resume" in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# The delivered document for a run that did not converge
+# ---------------------------------------------------------------------------
+
+def _unsolved(swarm: ResearchSwarm):
+    from adaptive_harness.research.gate import (ConvergenceOutcome, GateReport, Invariant,
+                                                InvariantStatus, StopReason)
+    report = GateReport(
+        statuses=tuple(InvariantStatus(invariant=item, satisfied=False,
+                                       detail=f"{item.value} was not satisfied")
+                       for item in Invariant),
+        fingerprint="fp", cycle=1)
+    return ConvergenceOutcome(False, StopReason.EXTERNAL_STOP, 1, report, (), 6)
+
+
+def test_the_unsolved_report_states_which_invariants_failed_and_why(tmp_path: Path):
+    swarm = _swarm(tmp_path)
+    text = swarm._progress_report(_unsolved(swarm))
+    assert "not a proof" in text
+    for invariant in ("mathematical_soundness", "adversarial_clearance", "document_integrity"):
+        assert invariant in text
+    assert "was not satisfied" in text
+    # A run that never certified a Lean file must not imply a formal proof exists.
+    assert "No Lean file was certified" in text
+
+
+def test_the_unsolved_report_names_the_human_who_stopped_the_run(tmp_path: Path):
+    """An operator stop must not be presented as a mathematical limit."""
+    swarm = _swarm(tmp_path)
+    swarm.control.stop_run(actor="operator", reason="SIGINT from the operator")
+    text = swarm._progress_report(_unsolved(swarm))
+    assert "stopped by a human" in text
+    assert "SIGINT from the operator" in text
+    assert "not a mathematical limit" in text
+
+
+def test_the_unsolved_report_lists_open_work_and_unanswered_requests(tmp_path: Path):
+    swarm = _swarm(tmp_path)
+    task = _new_task(swarm, artifact="proofs/prop-01.py")
+    swarm.board.lease(task.task_id, "theory_prover_01")
+    swarm.bus.ask_for_help(sender="theory_prover_01", recipient="theory_lead_01",
+                           subject="stuck on rfl", body="no progress")
+    text = swarm._progress_report(_unsolved(swarm))
+    assert "Work that was left open" in text and task.task_id in text
+    assert "never answered" in text and "stuck on rfl" in text
+
+
+def test_typst_metacharacters_from_an_artifact_cannot_break_the_report(tmp_path: Path):
+    """The first live failure was ``#math.N``: unescaped model prose is markup."""
+    swarm = _swarm(tmp_path)
+    swarm.plan = _plan_with(swarm, 1)
+    swarm.plan = swarm.plan.__class__(
+        swarm.plan.topic,
+        tuple(item.__class__(prop_id=item.prop_id, kind=item.kind, name=item.name,
+                             statement="cost is #math.N * 3_0 and $x$", hypotheses=item.hypotheses,
+                             lean_statement=item.lean_statement) for item in swarm.plan.propositions),
+        strategy="test", notes="")
+    swarm._adjudicate()
+    text = swarm._progress_report(_unsolved(swarm))
+    assert "\\#math.N" in text and "\\* 3\\_0" in text and "\\$x\\$" in text
+
+
+def test_a_stale_but_compiling_draft_does_not_replace_the_diagnostic_report(tmp_path: Path):
+    """Shipping a valid old draft would read like a finished paper."""
+    swarm = _swarm(tmp_path)
+    draft = "= A Draft Paper\n\nSome prose the author wrote.\n"
+    swarm.workspace.paper_typ.write_text(draft, encoding="utf-8")
+    swarm._republish(_unsolved(swarm))
+    delivered = swarm.workspace.paper_typ.read_text(encoding="utf-8")
+    assert "Research progress report" in delivered
+    assert "A Draft Paper" not in delivered
+    assert swarm.workspace.root.joinpath("paper_draft.typ").read_text(
+        encoding="utf-8") == draft
+    assert not (swarm.workspace.root / "progress_report_build_error.txt").exists()

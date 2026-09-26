@@ -212,6 +212,8 @@ research mode described in section 5.1:
 
 - **`SpawnSubagentTool` (`spawn_subagent`)** / **`ScaleDivisionTool` (`scale_division`)**: grow or shrink a division's worker pool on demand.
 - **`VerifyProofTool` (`verify_proofs`)** / **`RunExperimentTool` (`run_experiments`)**: adjudicate the exact-derivation and seeded-replication gates.
+- **`StopWorkerTool` (`stop_worker`)**: cancel, pause, or resume a named worker. `actor` and `reason` are both required, and both are written to the ledger — an unattributable stop is not an auditable stop. Cancelling kills the child processes that worker started and prevents any further tool call by it.
+- **`SwarmStatusTool` (`swarm_status`)**: read every worker's lifecycle state and assignment, the open board tasks with owners and artifacts, and the unanswered help requests. Read-only.
 
 ---
 
@@ -358,11 +360,40 @@ Artifacts land under `research/<topic-slug>/`: the hash-chained
 `comm_ledger.jsonl`, `00_objective_spec.md`, `claim_manifest.json`,
 `evidence/index.json`, `proofs/` and `experiments/` with their generated scripts
 and raw CSV, `figures/`, `03_adversarial_audit.md`, `bibliography.bib`,
-`convergence_history.json`, receipt indexes, and the generated `paper.typ` plus
-its `paper.pdf`.
-If live authoring fails or leaves an invalid Typst draft, the final PDF is
-explicitly labelled an `UNSOLVED` progress report and directs readers to the
-receipts and ledger. The failed source is preserved as `paper_draft.typ`.
+`convergence_history.json`, `task_board.json`, receipt indexes, and the generated
+`paper.typ` plus its `paper.pdf`.
+
+**When a run does not converge, the delivered PDF is a diagnostic progress
+report**, not the author's draft and not a paper. It names which invariants
+failed and why, what each claim was decided to be, whether any Lean file was
+certified, which board tasks remain open, which help requests went unanswered,
+and — if a human stopped the run — who stopped it and why. A human stop is
+reported as an operator decision and explicitly *not* as a mathematical limit.
+Whatever the author wrote is preserved as `paper_draft.typ`.
+
+**Coordination.** The Director plans; each Division Lead leases work off a shared
+board and hands it to a specific worker; workers run concurrently up to
+`--parallel-workers`. Every unit of work is a `TASK-NNNN` with a single owner, a
+time-boxed lease, its dependencies, its exact artifact path, its acceptance
+criterion, and the receipts minted for that file. The lease is both owner-bound
+and artifact-bound, so two workers cannot be handed one artifact — the failure
+mode a worker-index modulo used to produce. Workers are confined to the paths
+their task authorises, and a task is completed only with receipts issued for that
+exact file.
+
+Workers move through `queued`, `running`, `blocked`, `completed`, `failed`,
+`cancelled`, and `timed_out`, and every transition is recorded with its actor and
+reason. A leader can `stop_worker` a looping worker, and the stop reaches it: the
+tool loop checks a cancellation token on every event, so a cancelled worker makes
+no further tool call, and the process groups it started are killed. Ctrl-C on
+`adaptive-harness research` stops every active worker and ends the run with an
+`EXTERNAL_STOP` naming you, rather than grinding on to a stagnation verdict.
+
+`task_board.json` and the ledger are the recovery state. Re-running the same
+command resumes: completed tasks are not re-dispatched, stale leases from a
+crashed worker are released, unanswered help requests stay visible, and the
+Director's and leads' existing artifacts are reused rather than re-billed. Pass
+`--no-resume` to start clean.
 
 **The output is a mathematical paper**, not a log: title, abstract,
 introduction, a notation table, numbered theorems each with explicit hypotheses,
@@ -399,10 +430,14 @@ adaptive-harness dev "settle whether balanced routing minimises delay variance" 
     --research "balanced routing under heavy-tailed delay"
 ```
 
-`--research TOPIC` exposes `spawn_subagent`, `scale_division`, `verify_proofs`,
-`run_experiments`, `run_lean_proof`, and `compile_typst`. With a live configured
-client it attaches the LLM research path. The tools appear only in the
-investigative modes, never in `security`/audit.
+`--research TOPIC` exposes `spawn_subagent`, `scale_division`, `stop_worker`,
+`swarm_status`, `verify_proofs`, `run_experiments`, `run_lean_proof`, and
+`compile_typst`. With a live configured client it attaches the LLM research path.
+The tools appear only in the investigative modes, never in `security`/audit.
+
+This attachment gives one interactive agent authority over the swarm's control
+plane and tools; it does **not** run the full convergence loop. Only
+`adaptive-harness research` supervises cycles to a verdict.
 
 ### 2. Algorithmic Routing & Recovery Benchmarks
 ```bash

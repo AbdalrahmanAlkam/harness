@@ -1115,14 +1115,15 @@ class SwarmControl:
         return record
 
     def _terminate_agent_processes(self, agent_id: str) -> tuple[int, ...]:
-        """SIGKILL the process group of a specific worker's child processes."""
+        """SIGKILL the process groups belonging to one specific worker.
+
+        Attribution is by *scope*, not by thread: leaders and the Director run on
+        the main thread, so a thread-keyed kill would also take down the
+        verifiers' own subprocesses running there — which is how a passing proof
+        script came to be reported as a non-zero exit during a live stop.
+        """
         from adaptive_harness.tools.process import terminate_owned
-        with self._lock:
-            record = self._workers.get(agent_id)
-            thread_id = record.thread_id if record else None
-        if thread_id is None:
-            return ()
-        return terminate_owned(thread_id)
+        return terminate_owned(agent_id)
 
     def pause_run(self, *, actor: str, reason: str) -> None:
         """Pause the whole swarm. Workers finish their current tool call, then wait."""

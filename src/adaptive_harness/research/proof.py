@@ -112,6 +112,33 @@ socket.socket = _blocked
 socket.create_connection = _blocked
 """
 
+# The guard is installed by a launcher rather than prepended to the script. Two
+# reasons, both about honesty:
+#
+#   * A script that audits its own source (a not-unreasonable thing for an exactness
+#     certificate to do) would otherwise read the guard's `import socket` and
+#     conclude it had been tampered with. That is a false accusation, and it was
+#     observed live: a correct proof exited 1 and was reported REJECTED_NONZERO.
+#   * The receipt's SHA-256 covers the worker's bytes. Executing a *different* file
+#     than the one hashed means the receipt attests to something other than what
+#     ran, which defeats the point of hashing it.
+# So the source under audit and the source executed are byte-identical, and the
+# network block is applied around it.
+_GUARD_LAUNCHER = """\
+import runpy, sys
+_target = sys.argv[1]
+{guard}
+sys.argv = [_target]
+_globals = runpy.run_path(_target, run_name="__main__")
+"""
+
+
+def _write_guard_launcher(directory: Path) -> Path:
+    """Materialise the launcher that installs the guard and runs the target."""
+    launcher = directory / "_harness_network_guard.py"
+    launcher.write_text(_GUARD_LAUNCHER.format(guard=_NETWORK_GUARD), encoding="utf-8")
+    return launcher
+
 
 @dataclass
 class ProofRunner:
@@ -165,12 +192,15 @@ class ProofRunner:
             self._cache[digest] = receipt
             return receipt
 
-        guarded = self.proof_dir / f".{path.stem}.guarded.py"
-        guarded.write_text(_NETWORK_GUARD + source, encoding="utf-8")
+        # The script is executed exactly as written. The guard is installed by a
+        # launcher in the same directory, so the bytes the receipt hashes are the
+        # bytes that run.
+        launcher = _write_guard_launcher(self.proof_dir)
         started = time.perf_counter()
         try:
             completed = subprocess.run(
-                [self.python_executable, str(guarded)], capture_output=True, text=True,
+                [self.python_executable, str(launcher), str(path)],
+                capture_output=True, text=True,
                 timeout=self.timeout_s, check=False, cwd=str(self.proof_dir))
             exit_code: int | None = completed.returncode
             stdout, stderr = completed.stdout, completed.stderr
@@ -179,7 +209,7 @@ class ProofRunner:
         except OSError as exc:
             exit_code, stdout, stderr = None, "", f"{type(exc).__name__}: {exc}"
         finally:
-            guarded.unlink(missing_ok=True)
+            launcher.unlink(missing_ok=True)
         duration_ms = (time.perf_counter() - started) * 1000.0
 
         if exit_code == 0:
@@ -207,7 +237,15 @@ class ProofRunner:
 
     def record(self, receipt: ProofReceipt, ledger: Any = None, sender: Mapping[str, str] | None = None,
                recipient: Mapping[str, str] | None = None) -> ProofReceipt:
-        """Persist a receipt to disk and, when given, to the comm ledger."""
+        """Persist a receipt to disk and, when given, to the comm ledger.
+
+        ``self.receipts`` is *replaced* for this theorem rather than appended to.
+        ``run_all`` already installed the full result set, so appending here
+        duplicated every receipt and made one script look like two derivations —
+        which then surfaced in the gate as the same rejection counted twice.
+        """
+        self.receipts = [item for item in self.receipts
+                         if Path(item.script).name != Path(receipt.script).name]
         self.receipts.append(receipt)
         index_path = self.proof_dir.parent / "proof_receipts.json"
         existing: list[dict[str, Any]] = []

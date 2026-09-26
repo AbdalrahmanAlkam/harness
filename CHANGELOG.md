@@ -5,6 +5,65 @@ work in this push; earlier history is summarized in `git log`.
 
 ## [Unreleased]
 
+### Fixed
+- **Cancelling a worker no longer kills unrelated processes.** Process groups were
+  attributed by thread id, but leaders and the Director run on the main thread, so
+  cancelling one also signalled every process the main thread had started —
+  including the proof gate's own verifier. Observed live: a correct proof script
+  exiting 0 was reported `REJECTED_NONZERO` because its subprocess had been killed
+  by an unrelated cancellation. Attribution is now an explicit per-agent scope.
+- **Proof and experiment receipts are no longer double-counted.** `run_all`
+  installed the result set and `record` then appended to it, so one script looked
+  like two derivations and the gate reported the same verdict twice.
+- **The proof gate executes the bytes it hashes.** The network guard was prepended
+  to the script, so the executed file differed from the file the receipt's SHA-256
+  covered, and a script that audited its own source saw the guard's `import
+  socket` and failed. The guard is now installed by a launcher; the source under
+  audit and the source executed are byte-identical, and connections are still
+  blocked.
+- A skill whose completion checks are unreachable with the exposed tool set is no
+  longer injected. The agent was handed checklists it had no instrument for — a
+  research worker has no `run_pytest` — and then failed a gate it could never
+  pass. The skip is reported, not silent.
+- `is_leader` is an explicit field rather than a `role_name.endswith("Lead")`
+  heuristic that silently demoted any differently-named lead and classified the
+  Director as a worker.
+
+### Added
+- **Swarm coordination** (`src/adaptive_harness/research/coordination.py`):
+  a `TaskBoard` of uniquely identified, single-owner, lease-protected assignments
+  with dependencies, artifact-path exclusivity, evidence, and atomic persistence;
+  a `MessageBus` with addressed messages, help requests that must be
+  acknowledged, and recorded outcomes; and a `SwarmControl` with seven lifecycle
+  states, a legal-transition table, and leader-initiated stop/pause/cancel.
+- **Hierarchical dispatch.** The Director plans, each lead leases and delegates,
+  and workers execute concurrently up to a bounded fan-out. Previously leaders
+  were created, ran once, and were excluded from every dispatch.
+- **Stop control that reaches a running worker.** The tool loop consults a
+  cancellation token on every event, so a cancelled worker makes no further tool
+  call, and its child process groups are killed. `agent/swarm.py` distinguishes an
+  abort from a failure, because laundering a cancellation into an error made
+  `run_assignment` retry the worker that had just been told to stop.
+- **Concurrency-safe ledger.** Appends are serialised by a re-entrant lock,
+  re-sync the chain tip when another writer moved the file, and `fsync`. 240
+  concurrent appends across 8 threads verify as an intact chain.
+- **Restart recovery.** A resumed run restores the board, lets the ledger override
+  it, replays unanswered help requests, releases stale leases, and reuses the
+  Director's and leads' existing artifacts instead of re-billing them.
+- **Path enforcement.** Every worker, not only leaders, is confined to its
+  authorised paths; a proof worker may also write the `.md` the adjudication gate
+  requires.
+- **Pre-registered hypotheses.** An empirical task records its prediction, sampling
+  model, seed, and acceptance band on the board *before* the script runs, so a
+  prediction invented after seeing the data has no earlier entry to match.
+- **Live telemetry.** `adaptive-harness research` reports every worker's state,
+  open tasks, unanswered requests, and who stopped the run; Ctrl-C stops every
+  active worker and ends with an attributable `EXTERNAL_STOP`.
+- **Diagnostic unsolved report.** A run that did not converge now publishes which
+  invariants failed and why, each claim's verdict, the formal-tier status, open
+  tasks, unanswered requests, and any human stop — with model-authored text
+  escaped so it cannot break the build.
+
 ### Changed
 - Standalone `research` now uses separate live OpenRouter agents by default;
   `--offline-legacy` preserves the earlier deterministic demonstration.

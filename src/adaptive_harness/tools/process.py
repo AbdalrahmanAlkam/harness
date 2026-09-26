@@ -1,26 +1,48 @@
 """Bounded process execution with whole-process-group timeout cleanup."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 import signal
 import subprocess
 import selectors
 import threading
 import time
+from typing import Iterator
 
 # Every live process is registered here so an operator-initiated stop can reach
-# children a tool spawned, not just the Python thread driving them. Registration
-# is keyed by the *owning thread* because a worker runs its tools on its own
-# thread; that is what lets a leader kill exactly the processes belonging to the
-# worker it stopped instead of collateral-damaging a concurrent sibling.
-_active: dict[int, int] = {}
+# children a tool spawned, not just the Python thread driving them. Attribution is
+# by *scope* — an explicit owner string set by whoever is running the work — with
+# the thread id kept only as a fallback.
+#
+# Attribution by thread alone is unsound here. Leaders and the Director run on the
+# main thread, so cancelling one of them would otherwise signal every process the
+# main thread had started, including a verifier's own subprocess. That silently
+# turned a passing proof into a non-zero exit. A scope says which agent owns the
+# work, which is what "stop that worker" actually means.
+_active: dict[int, tuple[str | None, int]] = {}
 _active_lock = threading.Lock()
 _local = threading.local()
 
 
+@contextmanager
+def process_scope(owner: str | None) -> Iterator[None]:
+    """Attribute every process started inside this block to ``owner``."""
+    previous = getattr(_local, "owner", None)
+    _local.owner = owner
+    try:
+        yield
+    finally:
+        _local.owner = previous
+
+
+def current_scope() -> str | None:
+    return getattr(_local, "owner", None)
+
+
 def _register(pid: int) -> None:
     with _active_lock:
-        _active[pid] = threading.get_ident()
+        _active[pid] = (getattr(_local, "owner", None), threading.get_ident())
 
 
 def _unregister(pid: int) -> None:
@@ -28,9 +50,14 @@ def _unregister(pid: int) -> None:
         _active.pop(pid, None)
 
 
-def _owner_ids() -> set[int]:
+def _owned(owner: str | None = None, thread: int | None = None) -> list[int]:
+    """Process ids matching an owner scope, or a thread when no scope is set."""
     with _active_lock:
-        return {owner for pid, owner in _active.items() if owner == threading.get_ident()}
+        if owner is not None:
+            return [pid for pid, (scope, _tid) in _active.items() if scope == owner]
+        if thread is not None:
+            return [pid for pid, (_scope, tid) in _active.items() if tid == thread]
+        return []
 
 
 def live_pids() -> tuple[int, ...]:
@@ -39,22 +66,17 @@ def live_pids() -> tuple[int, ...]:
         return tuple(_active)
 
 
-def terminate_owned(owner: int | None = None, *, sig: int = signal.SIGKILL) -> tuple[int, ...]:
-    """Kill the process groups owned by ``owner`` (default: the current thread).
+def terminate_owned(owner: str | None = None, *, thread: int | None = None,
+                   sig: int = signal.SIGKILL) -> tuple[int, ...]:
+    """Kill the process groups belonging to ``owner``, or to ``thread``.
 
-    Returns the pids that were signalled. A worker that is stopped must not
-    leave a Lean build or a Monte-Carlo sweep running after its thread returns,
-    so cancellation calls this rather than merely abandoning the tool result.
+    A worker that is stopped must not leave a Lean build or a Monte-Carlo sweep
+    running after its thread returns, so cancellation calls this rather than merely
+    abandoning the tool result. The ``owner`` form is preferred: it reaches exactly
+    the work that was stopped, even when a worker shares the main thread.
     """
-    if owner is None:
-        targets = _owner_ids()
-    else:
-        with _active_lock:
-            targets = {candidate for pid, candidate in _active.items() if candidate == owner}
     killed: list[int] = []
-    with _active_lock:
-        pids = [pid for pid, candidate in _active.items() if candidate in targets]
-    for pid in pids:
+    for pid in _owned(owner, thread):
         try:
             os.killpg(pid, sig)
             killed.append(pid)

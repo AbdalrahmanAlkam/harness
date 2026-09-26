@@ -3,7 +3,6 @@
 from pathlib import Path
 import json
 from io import BytesIO
-from types import SimpleNamespace
 
 from adaptive_harness.research.experiment import ExperimentRunner
 from adaptive_harness.research.swarm import ResearchSwarm, SwarmConfig
@@ -204,18 +203,39 @@ def test_live_counterexample_is_reassessed_after_artifact_repair(tmp_path: Path)
         assert worker_id not in decisions
 
 
+def _unsolved_outcome(swarm: ResearchSwarm):
+    """A realistic unsolved outcome, so the report is exercised on real data."""
+    from adaptive_harness.research.gate import (ConvergenceOutcome, GateReport, Invariant,
+                                                InvariantStatus, StopReason)
+    report = GateReport(
+        statuses=(InvariantStatus(invariant=Invariant.DOCUMENT_INTEGRITY, satisfied=False,
+                                 detail="paper.pdf did not build cleanly"),
+                  InvariantStatus(invariant=Invariant.MATHEMATICAL_SOUNDNESS, satisfied=False,
+                                 detail="no proof script exists yet")),
+        fingerprint="fp", cycle=1)
+    return ConvergenceOutcome(False, StopReason.STAGNATION_ABORT, 1, report, (), 0)
+
+
 def test_unsolved_live_paper_displays_terminal_status(tmp_path: Path):
     swarm = ResearchSwarm("unfinished", root=tmp_path,
                           config=SwarmConfig(llm_client_factory=lambda: object()))
     swarm.workspace.paper_typ.write_text("= Partial result\n")
-    swarm._republish(SimpleNamespace(solved=False))
-    assert "Research status: UNSOLVED" in swarm.workspace.paper_typ.read_text()
+    swarm._republish(_unsolved_outcome(swarm))
+    delivered = swarm.workspace.paper_typ.read_text()
+    assert "Research status: UNSOLVED" in delivered
+    # The author's draft is preserved, not silently dropped.
+    assert swarm.workspace.root.joinpath("paper_draft.typ").read_text() == "= Partial result\n"
+    # And the delivered document is diagnostic rather than a draft.
+    assert "Research progress report" in delivered
+    assert "Which invariants failed" in delivered
+    assert "document_integrity" in delivered and "paper.pdf did not build cleanly" in delivered
+    assert "mathematical_soundness" in delivered and "no proof script exists yet" in delivered
 
 
 def test_failed_live_author_leaves_an_honest_progress_pdf(tmp_path: Path):
     swarm = ResearchSwarm("unfinished", root=tmp_path,
                           config=SwarmConfig(llm_client_factory=lambda: object()))
-    swarm._republish(SimpleNamespace(solved=False))
+    swarm._republish(_unsolved_outcome(swarm))
     assert "not a proof" in swarm.workspace.paper_typ.read_text()
     assert swarm.workspace.paper_pdf.is_file()
 
@@ -224,7 +244,7 @@ def test_invalid_live_draft_is_preserved_and_replaced_by_progress_pdf(tmp_path: 
     swarm = ResearchSwarm("unfinished", root=tmp_path,
                           config=SwarmConfig(llm_client_factory=lambda: object()))
     swarm.workspace.paper_typ.write_text("#let =\n")
-    swarm._republish(SimpleNamespace(solved=False))
+    swarm._republish(_unsolved_outcome(swarm))
     assert (swarm.workspace.root / "paper_draft.typ").read_text() == "#let =\n"
     assert "Research status: UNSOLVED" in swarm.workspace.paper_typ.read_text()
     assert swarm.workspace.paper_pdf.is_file()

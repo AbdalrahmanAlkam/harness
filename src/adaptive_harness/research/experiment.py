@@ -296,6 +296,13 @@ class ExperimentRunner:
         return receipts
 
     def record(self, receipt: ExperimentReceipt, ledger: Any = None) -> ExperimentReceipt:
+        """Persist a receipt, replacing any earlier one for the same script.
+
+        ``run_all`` already installed the full result set, so appending would
+        duplicate every receipt and make one experiment look like two.
+        """
+        self.receipts = [item for item in self.receipts
+                         if Path(item.script).name != Path(receipt.script).name]
         self.receipts.append(receipt)
         index_path = self.experiment_dir.parent / "experiment_receipts.json"
         existing: list[dict[str, Any]] = []
