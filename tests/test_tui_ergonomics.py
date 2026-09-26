@@ -88,7 +88,7 @@ def test_model_catalog_parses_text_models(monkeypatch):
             ]}).encode()
     monkeypatch.setattr("adaptive_harness.llm.catalog.urlopen", lambda request, timeout: Response())
     assert fetch_models() == [CatalogModel("z-ai/glm-5.3-flash", "GLM 5.3 Flash", 1000000)]
-    assert MODEL_TIERS["standard"] == "z-ai/glm-5.3-flash"
+    assert MODEL_TIERS["standard"] == "stealth/space-bunny-alpha"
 
 
 def test_launch_model_override_wins_saved_session(tmp_path: Path):

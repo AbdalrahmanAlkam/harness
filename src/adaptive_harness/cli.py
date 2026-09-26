@@ -132,7 +132,7 @@ def tui(
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID (e.g. anthropic/claude-sonnet-4)"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
     mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
-    thinking: str = typer.Option("auto", "--thinking", help="Thinking level: none, low, medium, deep, auto"),
+    thinking: str = typer.Option("auto", "--thinking", help="Model effort: auto, low, medium, high, xhigh, max (deep = high)"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
     step_policy: str = typer.Option("classifier", "--step-policy", help="Tool-step limits: classifier (default; stops circling loops), fixed (hardcoded per-thinking budgets), unbounded"),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", min=1, help="Explicit tool-step cap overriding the step policy"),
@@ -217,7 +217,7 @@ def dev(
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
     mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
-    thinking: str = typer.Option("auto", "--thinking", help="Thinking level: none, low, medium, deep, auto"),
+    thinking: str = typer.Option("auto", "--thinking", help="Model effort: auto, low, medium, high, xhigh, max (deep = high)"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
     step_policy: str = typer.Option("classifier", "--step-policy", help="Tool-step limits: classifier (default; stops circling loops), fixed (hardcoded per-thinking budgets), unbounded"),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", min=1, help="Explicit tool-step cap overriding the step policy"),
@@ -267,6 +267,15 @@ def dev(
 
     provider_tiers = PROVIDER_TIERS.get(selected_provider, MODEL_TIERS)
     selected_model = (None if model and model.lower() == "auto" else model) or (provider_tiers[tier] if tier in MODEL_TIERS else None)
+    if selected_thinking is not None and (not model or model.lower() != "auto"):
+        from adaptive_harness.classifiers.thinking_classifier import ThinkingLevel, effort_for_level
+        from adaptive_harness.llm.effort import supported_efforts
+        active_model = selected_model or PROVIDERS[selected_provider].default_model
+        supported = supported_efforts(active_model, selected_provider)
+        effort = effort_for_level(selected_thinking)
+        if (selected_thinking is ThinkingLevel.NONE and supported) or (effort and effort not in supported):
+            raise typer.BadParameter(f"{active_model} supports reasoning efforts: "
+                                     f"{', '.join(supported) or 'auto only'}", param_hint="--thinking")
     workspace = Path(workspace or Path.cwd()).expanduser().resolve()
     from adaptive_harness.data.config import ConfigManager
     try:

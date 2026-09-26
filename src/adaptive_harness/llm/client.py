@@ -12,13 +12,14 @@ from openai import OpenAI
 
 from adaptive_harness.llm.mock_client import LLMResponse, MockLLMClient, ToolCall
 from adaptive_harness.llm.providers import PROVIDERS, PROVIDER_TIERS, provider_for_url
+from adaptive_harness.llm.effort import EFFORTS, supported_efforts
 
 
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 MODEL_TIERS = {
     "fast": "google/gemini-2.5-flash-lite",
-    "standard": "z-ai/glm-5.3-flash",
+    "standard": "stealth/space-bunny-alpha",
     "reasoning": "anthropic/claude-sonnet-4",
 }
 
@@ -164,11 +165,18 @@ class LLMClient:
             kwargs["tool_choice"] = "auto"
         model_name = selected_model.lower()
         is_openrouter = self.base_url.rstrip("/").startswith("https://openrouter.ai")
+        available_efforts = supported_efforts(selected_model, self.provider)
+        if reasoning_effort in EFFORTS and available_efforts and reasoning_effort not in available_efforts:
+            # Automatic task classification uses common effort names. Some
+            # models expose only a subset; choose the nearest supported one.
+            target = EFFORTS.index(reasoning_effort)
+            reasoning_effort = min(available_efforts,
+                key=lambda effort: (abs(EFFORTS.index(effort) - target), -EFFORTS.index(effort)))
         is_claude_reasoning = ((model_name.startswith("anthropic/claude") or
                                (self.provider == "anthropic" and model_name.startswith("claude"))) and any(
             marker in model_name for marker in ("claude-3.7", "claude-3-7", "claude-sonnet-4",
                                                  "claude-opus-4", "claude-haiku-4", "claude-4", "claude-5")))
-        supports_reasoning = (is_claude_reasoning or
+        supports_reasoning = (bool(available_efforts) or is_claude_reasoning or
                               any(marker in model_name for marker in
                                   ("gemini-2.5", "gemini-3", "deepseek-r1", "o3-mini", "reasoning",
                                    "z-ai/glm-5.3")))
@@ -181,7 +189,7 @@ class LLMClient:
                 # thinking signature OpenRouter needs to replay with Claude.
                 # Use provider defaults for this conversation until it resets.
                 pass
-            elif reasoning_budget_tokens == 0:
+            elif reasoning_budget_tokens == 0 and model_name != "stealth/space-bunny-alpha":
                 kwargs["extra_body"] = {"reasoning": {"enabled": False} if is_claude_reasoning
                                         else {"effort": "none"}}
                 kwargs.pop("temperature", None)

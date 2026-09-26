@@ -183,7 +183,7 @@ def test_launch_workspace_and_manual_model_survive_session_resume(tmp_path: Path
     app = AdaptiveHarnessApp(db_path=database, config_dir=tmp_path / "prefs")
     session_id = app.session.id
     assert app.workspace_root == str(first)
-    assert app.agent.explicit_model == "z-ai/glm-5.3-flash"
+    assert app.agent.explicit_model == "stealth/space-bunny-alpha"
     assert app.agent.llm_client.base_url == "https://openrouter.ai/api/v1"
     assert app.swarm_mode == "auto" and app.isolation_mode == "off"
     app.session_store.close()

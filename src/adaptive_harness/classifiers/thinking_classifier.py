@@ -11,11 +11,22 @@ class ThinkingLevel(str, Enum):
     MEDIUM = "medium"
     DEEP = "deep"
     EXTREME = "extreme"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
 
 
 BUDGET_TOKENS = {ThinkingLevel.NONE: 0, ThinkingLevel.LOW: 1000,
                  ThinkingLevel.MEDIUM: 4000, ThinkingLevel.DEEP: 16000,
-                 ThinkingLevel.EXTREME: 32000}
+                 ThinkingLevel.EXTREME: 32000, ThinkingLevel.HIGH: 16000,
+                 ThinkingLevel.XHIGH: 24000, ThinkingLevel.MAX: 32000}
+
+
+def effort_for_level(level: ThinkingLevel) -> str | None:
+    return {ThinkingLevel.NONE: None, ThinkingLevel.LOW: "low", ThinkingLevel.MEDIUM: "medium",
+            ThinkingLevel.DEEP: "high", ThinkingLevel.EXTREME: "high",
+            ThinkingLevel.HIGH: "high", ThinkingLevel.XHIGH: "xhigh",
+            ThinkingLevel.MAX: "max"}[level]
 
 
 def parse_thinking_level(value: str | ThinkingLevel | None) -> ThinkingLevel | None:
@@ -28,9 +39,9 @@ def parse_thinking_level(value: str | ThinkingLevel | None) -> ThinkingLevel | N
     try:
         level = ThinkingLevel(value.strip().lower())
     except ValueError as exc:
-        raise ValueError("Thinking must be none, low, medium, deep, or auto") from exc
+        raise ValueError("Thinking must be auto, none, low, medium, high, xhigh, max, or deep") from exc
     if level == ThinkingLevel.EXTREME:
-        raise ValueError("Thinking must be none, low, medium, deep, or auto")
+        raise ValueError("Thinking must be auto, none, low, medium, high, xhigh, max, or deep")
     return level
 
 
@@ -52,6 +63,5 @@ class ThinkingClassifier:
             level = ThinkingLevel.NONE
         else:
             level = ThinkingLevel.LOW
-        effort = {ThinkingLevel.NONE: None, ThinkingLevel.LOW: "low", ThinkingLevel.MEDIUM: "medium",
-                  ThinkingLevel.DEEP: "high", ThinkingLevel.EXTREME: "high"}[level]
+        effort = effort_for_level(level)
         return ThinkingAssessment(level, BUDGET_TOKENS[level], effort)

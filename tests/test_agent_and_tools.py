@@ -156,7 +156,7 @@ def test_reasoning_budget_uses_supported_openrouter_parameters():
                     reasoning_budget_tokens=1000)
     assert requests[-1]["extra_body"] == {"reasoning": {"effort": "low"}, "usage": {"include": True}}
     client.complete(messages, model=MODEL_TIERS["standard"], reasoning_budget_tokens=0)
-    assert requests[-1]["extra_body"] == {"reasoning": {"effort": "none"}, "usage": {"include": True}}
+    assert requests[-1]["extra_body"] == {"usage": {"include": True}}
 
 
 def test_run_bash_tool(tmp_path: Path):

@@ -17,7 +17,7 @@ class Provider:
 
 PROVIDERS = {
     "openrouter": Provider("openrouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
-                           "z-ai/glm-5.3-flash", 128_000),
+                           "stealth/space-bunny-alpha", 1_000_000),
     "anthropic": Provider("anthropic", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY",
                           "claude-sonnet-4-6", 200_000),
     "openai": Provider("openai", "https://api.openai.com/v1", "OPENAI_API_KEY",
@@ -59,6 +59,8 @@ def context_window(model: str, provider: str = "openrouter", override: int | Non
     if override and override > 0:
         return override
     lowered = model.lower()
+    if lowered == "stealth/space-bunny-alpha":
+        return 1_000_000
     if "claude" in lowered:
         return 200_000
     if "gemini" in lowered:

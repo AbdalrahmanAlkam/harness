@@ -21,7 +21,7 @@ from adaptive_harness.classifiers.engine import (BaseClassifierBackend, SklearnB
 from adaptive_harness.classifiers.domain_classifier import (DomainClassifier, DomainAssessment,
     DomainMode, parse_domain_mode, audit_command_is_read_only)
 from adaptive_harness.classifiers.thinking_classifier import (ThinkingClassifier, ThinkingAssessment,
-    ThinkingLevel, BUDGET_TOKENS, parse_thinking_level)
+    ThinkingLevel, BUDGET_TOKENS, parse_thinking_level, effort_for_level)
 from adaptive_harness.classifiers.skill_classifier import SKILL_CLASSES
 from adaptive_harness.data.storage import ExperienceRepository
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
@@ -56,7 +56,8 @@ STEP_POLICIES = ("classifier", "fixed", "unbounded")
 
 # Previous hardcoded tool-step budgets, selectable via step_policy="fixed".
 FIXED_STEP_BUDGETS = {ThinkingLevel.NONE: 4, ThinkingLevel.LOW: 8, ThinkingLevel.MEDIUM: 12,
-                      ThinkingLevel.DEEP: 16, ThinkingLevel.EXTREME: 20}
+                      ThinkingLevel.DEEP: 16, ThinkingLevel.EXTREME: 20,
+                      ThinkingLevel.HIGH: 16, ThinkingLevel.XHIGH: 20, ThinkingLevel.MAX: 24}
 
 
 
@@ -398,8 +399,10 @@ class DeveloperAgent:
                 classifier_name, classifier_model = self.fallback_classifier.name, self.fallback_classifier.model
                 yield AgentEvent("classifier_fallback", {"backend": classifier_name, "model": classifier_model})
         if self.forced_thinking is not None:
+            classifier_level = (ThinkingLevel.DEEP.value if self.forced_thinking in {
+                ThinkingLevel.HIGH, ThinkingLevel.XHIGH, ThinkingLevel.MAX} else self.forced_thinking.value)
             thinking_prediction = Classification(self.forced_thinking.value,
-                {label: float(label == self.forced_thinking.value) for label in THINKING_LABELS}, 0.0)
+                {label: float(label == classifier_level) for label in THINKING_LABELS}, 0.0)
         else:
             try:
                 thinking_prediction = self.classifier_backend.classify(user_input, THINKING_LABELS)
@@ -425,11 +428,11 @@ class DeveloperAgent:
         if self.forced_thinking is None and classifier_name != "semif" and order.index(heuristic_thinking.level) > order.index(predicted_level):
             predicted_level = heuristic_thinking.level
         thinking_res = ThinkingAssessment(predicted_level, BUDGET_TOKENS[predicted_level],
-                                          None if predicted_level == ThinkingLevel.NONE else
-                                          "high" if predicted_level in (ThinkingLevel.DEEP, ThinkingLevel.EXTREME) else predicted_level.value)
+                                          effort_for_level(predicted_level))
         if self.forced_thinking is not None and self.explicit_model is None:
             forced_tier = ("fast" if predicted_level == ThinkingLevel.NONE else
-                           "reasoning" if predicted_level in (ThinkingLevel.DEEP, ThinkingLevel.EXTREME) else
+                           "reasoning" if predicted_level in (ThinkingLevel.DEEP, ThinkingLevel.EXTREME,
+                                                               ThinkingLevel.HIGH, ThinkingLevel.XHIGH, ThinkingLevel.MAX) else
                            "standard")
             complexity_res = ComplexityRoutingResult(forced_tier,
                 self.complexity_router.tier_models[forced_tier], 1.0,

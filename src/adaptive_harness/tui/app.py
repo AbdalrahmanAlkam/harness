@@ -26,7 +26,8 @@ from adaptive_harness.agent.swarm import DeveloperAgentWorker, SwarmCoordinator
 from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.classifiers.engine import create_backend
 from adaptive_harness.classifiers.domain_classifier import parse_domain_mode
-from adaptive_harness.classifiers.thinking_classifier import parse_thinking_level, BUDGET_TOKENS
+from adaptive_harness.classifiers.thinking_classifier import parse_thinking_level, BUDGET_TOKENS, effort_for_level
+from adaptive_harness.llm.effort import supported_efforts
 from adaptive_harness.data.storage import ExperienceRepository
 from adaptive_harness.data.config import (ConfigManager, PromptHistoryStore,
                                           DEFAULT_MODEL, DEFAULT_MODEL_SELECTION, DEFAULT_SWARM_MODE)
@@ -240,6 +241,13 @@ class AdaptiveHarnessApp(App):
         self.semif_temperature = semif_temperature
         initial_mode = parse_domain_mode(mode)
         initial_thinking = parse_thinking_level(thinking)
+        initial_effort = effort_for_level(initial_thinking) if initial_thinking else None
+        if not requested_auto_model and initial_thinking is not None:
+            supported = supported_efforts(self.default_model, self.provider_name)
+            if (initial_thinking is ThinkingLevel.NONE and supported) or (
+                    initial_effort and initial_effort not in supported):
+                raise ValueError(f"{self.default_model} supports reasoning efforts: "
+                                 f"{', '.join(supported) or 'auto only'}")
         self._cli_mode_override = initial_mode
         self._cli_thinking_override = initial_thinking
         self._cli_step_policy_override = step_policy
@@ -496,6 +504,13 @@ class AdaptiveHarnessApp(App):
             self.agent.forced_mode = None
             self.agent.forced_thinking = None
             self._session_restore_warning = f"Saved mode or thinking level is invalid ({exc}); using auto."
+        saved_effort = effort_for_level(self.agent.forced_thinking) if self.agent.forced_thinking else None
+        supported = supported_efforts(self.agent.explicit_model or self.agent.llm_client.default_model,
+                                      self.provider_name)
+        if (self.agent.forced_thinking is ThinkingLevel.NONE and supported) or (
+                saved_effort and saved_effort not in supported):
+            self.agent.forced_thinking = None
+            self._session_restore_warning = "Saved reasoning effort is unavailable for this model; using auto."
         self.agent.safety_profile = (self._cli_safety_override if preserve_cli_overrides and self._cli_safety_override
                                      else settings.get("safety", self._default_safety))
         if self.agent.safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
@@ -683,12 +698,16 @@ class AdaptiveHarnessApp(App):
                            [self.llm_client.get_model_for_tier(tier) for tier in ("fast", "standard", "reasoning")])
         for model_id in [*provider_models, self.agent.explicit_model or ""]:
             if model_id and model_id not in seen:
-                choices.append((model_id, f"★ {model_id}"))
+                efforts = supported_efforts(model_id, self.provider_name)
+                suffix = f" · efforts: {'/'.join(efforts)}" if efforts else ""
+                choices.append((model_id, f"★ {model_id}{suffix}"))
                 seen.add(model_id)
         for model in models:
             if model.id not in seen:
                 context = f" · {model.context_length // 1000}k context" if model.context_length else ""
-                choices.append((model.id, f"{model.name}  ·  {model.id}{context}"))
+                efforts = supported_efforts(model.id, self.provider_name)
+                effort_label = f" · efforts: {'/'.join(efforts)}" if efforts else ""
+                choices.append((model.id, f"{model.name}  ·  {model.id}{context}{effort_label}"))
                 seen.add(model.id)
         def picked(model_id: str | None) -> None:
             if model_id is not None:
@@ -704,10 +723,21 @@ class AdaptiveHarnessApp(App):
             self.agent.llm_client.default_model = PROVIDERS[self.provider_name].default_model
         selected_catalog = next((item for item in self._model_catalog if item.id == model_id), None)
         self.agent.context_window_override = selected_catalog.context_length if selected_catalog else None
+        chosen_effort = effort_for_level(self.agent.forced_thinking) if self.agent.forced_thinking else None
+        supported = supported_efforts(self.agent.explicit_model or self.agent.llm_client.default_model,
+                                      self.provider_name)
+        if (self.agent.forced_thinking is ThinkingLevel.NONE and supported) or (
+                chosen_effort and chosen_effort not in supported):
+            self.agent.forced_thinking = None
+            self.query_one("#chat-log", RichLog).write(Text(
+                "Reasoning effort reset to auto because the selected model does not support it.", style="yellow"))
         self.query_one("#chat-log", RichLog).write(Text(f"✓ Model: {model_id}", style="green"))
         self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
             model=self.agent.explicit_model or self.agent.llm_client.default_model,
-            selection="manual" if self.agent.explicit_model else "auto")
+            selection="manual" if self.agent.explicit_model else "auto",
+            thinking_level=self.agent.forced_thinking.value if self.agent.forced_thinking else "—",
+            thinking_tokens=BUDGET_TOKENS[self.agent.forced_thinking] if self.agent.forced_thinking else 0,
+            thinking_selection="forced" if self.agent.forced_thinking else "auto")
         self._save_session()
         self._refresh_status()
 
@@ -727,6 +757,13 @@ class AdaptiveHarnessApp(App):
         self.llm_client = self.agent.llm_client
         self.base_url = self.llm_client.base_url
         self.config.update(provider=provider)
+        chosen_effort = effort_for_level(self.agent.forced_thinking) if self.agent.forced_thinking else None
+        supported = supported_efforts(self.agent.explicit_model or self.llm_client.default_model, provider)
+        if (self.agent.forced_thinking is ThinkingLevel.NONE and supported) or (
+                chosen_effort and chosen_effort not in supported):
+            self.agent.forced_thinking = None
+            self.query_one("#chat-log", RichLog).write(Text(
+                "Reasoning effort reset to auto for the selected provider model.", style="yellow"))
         self._refresh_status()
 
     def _set_safety(self, profile: str) -> None:
@@ -916,7 +953,7 @@ class AdaptiveHarnessApp(App):
         log.write("  Ctrl+Shift+C            - Copy selected chat text or latest agent reply")
         log.write("  /safety <turbo|balanced|cautious|strict> - Set tool confirmation level")
         log.write("  /mode <coding|research|science|security|auto> - Set operational mode")
-        log.write("  /thinking <none|low|medium|deep|auto> - Set reasoning budget")
+        log.write("  /thinking <auto|low|medium|high|xhigh|max> - Set model reasoning effort (deep = high)")
         log.write("  /steps <classifier|fixed|unbounded|N> - Set tool-step limit policy")
         log.write("  /prompts [show NAME]   - List model prompts or print one; edit via prompts.json overrides")
         log.write("  /classifier <semif|sklearn|backend> [model/path] - Switch decision engine")
@@ -1099,13 +1136,10 @@ class AdaptiveHarnessApp(App):
         elif cmd == "/tier":
             if arg in MODEL_TIERS:
                 target_model = PROVIDER_TIERS.get(self.provider_name, MODEL_TIERS)[arg]
-                self.agent.llm_client.default_model = target_model
-                self.agent.explicit_model = target_model
+                self._set_model(target_model)
                 log.write(f"[green]✓ Switched to {arg.upper()} tier ({target_model})[/green]")
                 self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
                     model=target_model, tier=arg, selection="manual")
-                self._save_session()
-                self._refresh_status()
             else:
                 log.write(f"[red]Invalid tier. Choose from: {', '.join(MODEL_TIERS.keys())}[/red]")
         elif cmd == "/mode":
@@ -1124,14 +1158,27 @@ class AdaptiveHarnessApp(App):
             self._refresh_status()
             log.write(Text(f"✓ Mode: {self.agent.forced_mode.value if self.agent.forced_mode else 'auto'}", style="green"))
         elif cmd == "/thinking":
+            active_model = self.agent.explicit_model or self.agent.llm_client.default_model
+            supported = supported_efforts(active_model, self.provider_name)
             if not arg:
-                log.write(Text(f"Thinking: {self.agent.forced_thinking.value if self.agent.forced_thinking else 'auto'}", style="cyan"))
+                choices = [("auto", "Auto · task classifier chooses effort")]
+                choices += [(effort, effort.upper()) for effort in supported]
+                self.push_screen(QuickSelectModal(f"Reasoning effort for {active_model}", choices,
+                                                  current=self.agent.forced_thinking.value if self.agent.forced_thinking else "auto"),
+                                 callback=lambda selected: self._handle_slash_command(f"/thinking {selected}") if selected else None)
                 return
             try:
-                self.agent.forced_thinking = parse_thinking_level(arg)
+                selected_level = parse_thinking_level(arg)
             except ValueError as exc:
                 log.write(Text(str(exc), style="red"))
                 return
+            selected_effort = effort_for_level(selected_level) if selected_level else None
+            if (selected_level is ThinkingLevel.NONE and supported) or (
+                    selected_effort and selected_effort not in supported):
+                log.write(Text(f"{active_model} does not expose {selected_effort or 'none'} effort. "
+                               f"Available: {', '.join(supported) or 'auto only'}", style="red"))
+                return
+            self.agent.forced_thinking = selected_level
             self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(
                 thinking_level=self.agent.forced_thinking.value if self.agent.forced_thinking else "—",
                 thinking_tokens=BUDGET_TOKENS[self.agent.forced_thinking] if self.agent.forced_thinking else 0,
@@ -1354,7 +1401,8 @@ class AdaptiveHarnessApp(App):
         level = self.agent.forced_thinking or self.agent.thinking_classifier.classify(task).level
         editing = bool(re.search(r"\b(edit|implement|fix|refactor|add|write|change|modify|build|upgrade|migrate|create)\b",
                                  task, flags=re.I))
-        return editing and level in {ThinkingLevel.MEDIUM, ThinkingLevel.DEEP, ThinkingLevel.EXTREME}
+        return editing and level in {ThinkingLevel.MEDIUM, ThinkingLevel.DEEP, ThinkingLevel.EXTREME,
+                                     ThinkingLevel.HIGH, ThinkingLevel.XHIGH, ThinkingLevel.MAX}
 
     def _should_swarm(self, task: str) -> bool:
         """Auto mode only pipelines explicit multi-agent requests.

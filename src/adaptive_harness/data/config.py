@@ -9,7 +9,7 @@ import re
 
 
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "adaptive-harness"
-DEFAULT_MODEL = "z-ai/glm-5.3-flash"
+DEFAULT_MODEL = "stealth/space-bunny-alpha"
 DEFAULT_MODEL_SELECTION = "manual"
 DEFAULT_SWARM_MODE = "auto"
 

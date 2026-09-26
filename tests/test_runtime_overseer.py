@@ -213,7 +213,7 @@ def test_provider_failover_on_rate_limit(monkeypatch):
     assert response.metadata["failed_over_from"] == "deepseek"
     assert client.provider == "openrouter"
     assert calls == [("https://api.deepseek.com", "deepseek-chat"),
-                     ("https://openrouter.ai/api/v1", "z-ai/glm-5.3-flash")]
+                     ("https://openrouter.ai/api/v1", "stealth/space-bunny-alpha")]
 
 
 def test_failed_backup_restores_primary_provider(monkeypatch):
