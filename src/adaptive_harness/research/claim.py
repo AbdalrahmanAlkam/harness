@@ -60,6 +60,15 @@ class ClaimAdjudication:
                 "finding": self.finding, "script": self.script, "hash": self.sha256}
 
 
+class DeciderError(RuntimeError):
+    """The exact-decider guard itself failed, as opposed to unusable input.
+
+    Kept distinct so that a harness defect cannot masquerade as "this claim is
+    undecidable" — the two demand opposite responses: one is the caller's problem,
+    the other is the model's.
+    """
+
+
 def verdict_from_exit(exit_code: int | None) -> Verdict:
     """Map a derivation script's exit code onto a verdict.
 
@@ -266,7 +275,7 @@ counterexample was exhibited; any other code = the attempt could not decide.
 import sys
 
 import sympy
-from sympy import Eq, simplify, together, cancel, nsimplify, S
+from sympy import Eq, simplify, together, cancel, nsimplify, S, zoo, nan, oo
 
 HOLD = {holds}
 COUNTEREXAMPLE = {counter}
@@ -295,6 +304,77 @@ def free_symbol_names(expression: str) -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
+def _decidable_pair(expression: str) -> tuple[str, str] | None:
+    """Split and validate ``lhs == rhs`` for exact decision, or return None.
+
+    Everything here is defensive on purpose. This input is authored by a language
+    model, and two ordinary-looking mistakes used to take the whole run down:
+
+    * a second ``==`` in the text (``a == b == c``, ``x == 1 and y == 2``) leaves
+      a comparison on the right-hand side, which ``sympify`` evaluates to a Python
+      ``bool`` — and a bool has no ``free_symbols``;
+    * text that is not SymPy at all raises ``SympifyError`` from deep inside the
+      parser.
+
+    A function that raises on model output is a single point of failure for the
+    entire run, so every rejection path returns None and the caller falls back to
+    the model-authored path.
+    """
+    try:
+        import sympy
+        from sympy.core.relational import Relational
+        from sympy.logic.boolalg import BooleanFunction
+
+        text = (expression or "").strip()
+        if "==" not in text:
+            return None
+        match = _EQUATION.match(text)
+        if not match:
+            return None
+        lhs, rhs = match.group("lhs").strip(), match.group("rhs").strip()
+        if not lhs or not rhs or "==" in lhs or "==" in rhs:
+            # A chained or compound comparison is not a single identity.
+            return None
+        left, right = sympy.sympify(lhs), sympy.sympify(rhs)
+        # sympify returns a plain bool for a relational expression; only real
+        # SymPy expressions have free symbols.
+        if not isinstance(left, sympy.Expr) or not isinstance(right, sympy.Expr):
+            return None
+        # A lambda, piecewise, or relational term is a function or a proposition,
+        # not the value of a claim. Deciding one would manufacture a verdict from
+        # something that is not a mathematical assertion.
+        forbidden = (sympy.Lambda, sympy.Piecewise, Relational, BooleanFunction)
+        if any(left.has(kind) or right.has(kind) for kind in forbidden):
+            return None
+        if left.has(sympy.Float) or right.has(sympy.Float):
+            # A Float is approximate arithmetic. The claim is not exact, and a
+            # decider built on one would settle a statement that was never posed.
+            return None
+        # An undefined or infinite residual means the expression could not be
+        # evaluated, not that the claim is false. Reporting that as a refutation
+        # would be a false accusation, which is the one outcome worse than silence.
+        infinite = (sympy.zoo, sympy.nan, sympy.oo, -sympy.oo)
+        if any(left.has(term) or right.has(term) for term in infinite):
+            return None
+        if left.free_symbols != right.free_symbols:
+            # Different free variables on the two sides is a malformed claim, and
+            # treating it as an identity would be a category error.
+            return None
+        return lhs, rhs
+    except (sympy.SympifyError, SyntaxError, TypeError, ValueError, AttributeError) as exc:
+        # Expected: the text is not SymPy, so there is nothing to decide.
+        return None
+    except RecursionError:
+        return None
+    except Exception as exc:  # noqa: BLE001
+        # Unexpected. A broad catch here once hid a broken guard that silently
+        # disabled *every* decider, so the failure is surfaced rather than
+        # swallowed into "this claim is undecidable".
+        raise DeciderError(
+            f"the exact-decider guard failed unexpectedly on {expression!r}: "
+            f"{type(exc).__name__}: {exc}") from exc
+
+
 def exact_decider(expression: str, *, statement: str = "",
                   symbols: Sequence[str] = ()) -> str:
     """Build a self-adjudicating decider for ``lhs == rhs`` in exact arithmetic.
@@ -309,26 +389,21 @@ def exact_decider(expression: str, *, statement: str = "",
     * **It refuses to guess.** A residual that is not provably zero yields a
       refutation (for a closed claim) or exit 4 (undecided, for one with free
       symbols), never a pass.
-    * **An unusable expression yields no script at all**, so a malformed claim
-      falls back to the model-authored path instead of producing a script that
-      crashes on line one.
+    * **It never raises.** The expression is model-authored, so anything that
+      cannot be parsed yields an empty string and the caller falls back to the
+      model-authored path. A parser crash here would abort the entire run.
     """
     import sympy
 
-    text = (expression or "").strip()
-    match = _EQUATION.match(text) if "==" in text else None
-    if not match:
+    pair = _decidable_pair(expression)
+    if pair is None:
         return ""
-    lhs, rhs = match.group("lhs").strip(), match.group("rhs").strip()
+    lhs, rhs = pair
     try:
-        left, right = sympy.sympify(lhs), sympy.sympify(rhs)
-    except Exception:  # noqa: BLE001 - any parse failure means "not decidable"
-        return ""
-    if left.free_symbols != right.free_symbols:
-        # Different free variables on the two sides is a malformed claim, and
-        # treating it as an identity would be a category error.
-        return ""
-    names = free_symbol_names(text)
+        text = (expression or "").strip()
+        names = free_symbol_names(text)
+    except Exception:  # noqa: BLE001 - defensive; free_symbol_names is already guarded
+        names = ()
     declared = tuple(name for name in symbols if name.strip() and name in names)
     if not declared:
         declared = names
@@ -350,6 +425,12 @@ def exact_decider(expression: str, *, statement: str = "",
         "    if difference == 0:",
         "        print('[HOLD] the identity holds exactly; the residual is 0')",
         "        return HOLD",
+        "    # An undefined or infinite residual is a failure to evaluate, not a",
+        "    # refutation. Deciding the claim here would be a false accusation.",
+        "    if difference.has(zoo, nan, oo, -oo):",
+        "        print('[UNDECIDED] the residual is not a finite value: '",
+        "              + str(difference))",
+        "        return UNDECIDED",
         "    if not difference.free_symbols:",
         "        # A closed expression with a provably nonzero residual is a",
         "        # refutation, not an absence of proof: there is nothing left to vary.",

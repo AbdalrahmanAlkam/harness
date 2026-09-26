@@ -205,3 +205,58 @@ def test_spec_section_renders_an_empty_formulation_honestly():
     text = render_spec_section(Formulation((), "no checkable identity was available", True))
     assert "no checkable identity" in text
     assert "## Formulated Claims" in text
+
+
+# ---------------------------------------------------------------------------
+# The exact decider is fed model-authored text, so it must be total
+# ---------------------------------------------------------------------------
+
+def _run_decider(expression: str) -> int:
+    import subprocess
+    import sys
+    import tempfile
+
+    from adaptive_harness.research.claim import exact_decider
+    source = exact_decider(expression, statement=expression)
+    assert source, f"expected a decider for {expression!r}"
+    with tempfile.TemporaryDirectory() as directory:
+        script = Path(directory) / "decider.py"
+        script.write_text(source, encoding="utf-8")
+        return subprocess.run([sys.executable, str(script)], capture_output=True,
+                              text=True, timeout=120).returncode
+
+
+def test_the_decider_never_raises_on_anything_a_model_might_write():
+    """A parser crash on model output is a single point of failure for the run."""
+    from adaptive_harness.research.claim import exact_decider
+    hostile = [
+        "", "   ", "==", "== 4", "4 ==", "a == b == c", "x == 1 and y == 2",
+        "not math at all", "import os", "x* == y", "a<b == c>d", "() == ()",
+        '""" == """', "None == None", "True == True", "foo(bar) == baz(qux)",
+        "|N++(v)| >= |N+(v)|", "\\frac{1}{2} == 0.5", "A[0][1] == 1",
+        "sum(1 for k in range(4)) == 6", "v1.out_deg == v2.out_deg",
+        "\n==\n", "0 == 0.0", "1/0 == 1", "lambda: 1 == 2", "x == y",
+        "f(x) == f(x) for all x", "set() == {1,2}",
+    ]
+    for expression in hostile:
+        result = exact_decider(expression, statement=expression)
+        assert isinstance(result, str), expression
+
+
+def test_an_unevaluable_expression_is_never_reported_as_a_counterexample():
+    """Undefined is not false. A refutation here would be a false accusation."""
+    from adaptive_harness.research.claim import exact_decider
+    for expression in ("1/0 == 1", "lambda: 1 == 2", "a == b == c",
+                       "sum(1 for k in range(4)) == 6", "0 == 0.0"):
+        assert exact_decider(expression, statement=expression) == "", expression
+
+
+def test_a_genuine_identity_is_still_decided_by_the_kernel():
+    from adaptive_harness.research.claim import EXIT_COUNTEREXAMPLE, EXIT_HOLDS
+    assert _run_decider("2 + 2 == 4") == EXIT_HOLDS
+    assert _run_decider("(x + y)**2 == x**2 + 2*x*y + y**2") == EXIT_HOLDS
+    assert _run_decider("sqrt(2)**2 == 2") == EXIT_HOLDS
+    # A closed false claim is a refutation, and that one is real.
+    assert _run_decider("2 + 2 == 5") == EXIT_COUNTEREXAMPLE
+    # A false identity with free symbols is caught by the exact grid.
+    assert _run_decider("(x + y)**2 == x**2 + y**2") == EXIT_COUNTEREXAMPLE
