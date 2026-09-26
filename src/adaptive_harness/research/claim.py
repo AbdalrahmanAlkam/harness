@@ -108,10 +108,12 @@ class Proposition:
     notation: tuple[tuple[str, str], ...] = ()
     script: str = ""
     rationale: str = ""
+    lean_statement: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {"prop_id": self.prop_id, "kind": self.kind, "name": self.name,
                 "hypotheses": list(self.hypotheses), "statement": self.statement,
+                "lean_statement": self.lean_statement,
                 "consequence": self.consequence,
                 "notation": [list(item) for item in self.notation],
                 "script_lines": len(self.script.splitlines())}

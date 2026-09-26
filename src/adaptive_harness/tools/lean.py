@@ -438,6 +438,7 @@ class LeanVerifier:
                              or SORRY_AXIOM in item.message]
         # Check 3: a declaration depends on sorryAx.
         sorry_axioms = [item for item in axioms if item.axiom == SORRY_AXIOM]
+        unsupported_axioms = [item for item in axioms if item.axiom not in BENIGN_AXIOMS]
 
         errors = [item for item in diagnostics if item.severity == "error"]
         failure: str | None = None
@@ -449,6 +450,9 @@ class LeanVerifier:
         elif sorry_axioms:
             names = ", ".join(item.declaration for item in sorry_axioms)
             failure = f"Proof contains unproven placeholder 'sorry': {names} depends on {SORRY_AXIOM}"
+        elif unsupported_axioms:
+            names = ", ".join(sorted({item.axiom for item in unsupported_axioms}))
+            failure = f"Proof depends on unsupported axiom(s): {names}"
         elif goals:
             failure = "Proof has unsolved goals: " + "; ".join(goals[:3])
         elif errors:
@@ -573,4 +577,3 @@ class RunLeanProofTool(Tool):
         except OSError:
             return None
         return receipt
-

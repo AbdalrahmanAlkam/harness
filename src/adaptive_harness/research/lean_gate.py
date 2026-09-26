@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import json
 from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping, Sequence
@@ -99,7 +100,10 @@ class LeanProofGate:
         return self.toolchain.version() if self.toolchain else ""
 
     def scripts(self) -> list[Path]:
-        return sorted(self.proof_dir.glob("*.lean"))
+        # Accept both the dedicated formal tier and a proof file placed
+        # directly under proofs/; neither location may evade the gate.
+        return sorted({*self.proof_dir.glob("*.lean"),
+                       *self.proof_dir.parent.glob("*.lean")})
 
     def write(self, name: str, source: str) -> Path:
         """Write a Lean source into the gate's directory and return its path."""
@@ -132,17 +136,29 @@ class LeanProofGate:
         axioms = tuple(sorted({item.axiom for item in result.axioms}))
         unexpected = [name for name in axioms if name not in BENIGN_AXIOMS]
         errors = tuple(item.message for item in result.errors)
-        if result.success and unexpected:
+        if result.success and not names:
+            status = "LEAN_NO_THEOREM"
+            errors += ("file contains no named theorem or lemma",)
+        elif result.success and unexpected:
             status = "LEAN_DEPENDS_ON_EXTRA_AXIOMS"
         elif result.success:
             status = "LEAN_VERIFIED"
         else:
             status = "LEAN_REJECTED"
-        return LeanProofReceipt(
+        receipt = LeanProofReceipt(
             proof_id=proof_id, name=target.stem, path=str(target), sha256=digest, status=status,
             lean_version=result.lean_version, duration_ms=result.duration_ms,
             exit_code=result.exit_code, theorems=names, axioms=axioms, errors=errors,
             verified_at=_now())
+        sidecar = target.with_name(target.name + ".receipt.json")
+        sidecar.write_text(json.dumps({**receipt.to_dict(),
+                                       "diagnostics": [item.to_dict() for item in result.diagnostics],
+                                       "unsolved_goals": list(result.unsolved_goals),
+                                       "placeholders": [{"line": line, "token": token}
+                                                        for line, token in result.placeholders],
+                                       "error": result.error}, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
+        return receipt
 
     def verify_all(self) -> list[LeanProofReceipt]:
         """Verify every Lean file and record the receipts."""
@@ -203,6 +219,8 @@ class LeanProofGate:
         if not scripts:
             return False, "no Lean proof exists, so the formal tier is empty", ()
         receipts = self.receipts or self.verify_all()
+        if any(not receipt.theorems for receipt in receipts):
+            return False, "a Lean file contains no named theorem or lemma", ()
         evidence = [f"{receipt.proof_id} {receipt.status}" for receipt in receipts]
         failed = [receipt for receipt in receipts if not receipt.certified]
         if failed:
