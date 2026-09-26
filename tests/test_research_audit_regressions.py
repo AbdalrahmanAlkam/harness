@@ -380,3 +380,82 @@ def test_live_artifact_worker_writes_target_before_verification_loop(tmp_path: P
     assert "tool_names_override" not in calls[1]
     assert "max_steps_override" not in calls[1]
     assert (swarm.workspace.proof_dir / "prop-01.py").is_file()
+
+
+def _ladder_swarm(tmp_path: Path, monkeypatch) -> ResearchSwarm:
+    """A manifest shaped as a ladder: one conjecture, decidable claims beneath."""
+    swarm = ResearchSwarm("open problem", root=tmp_path,
+                          config=SwarmConfig(llm_client_factory=lambda: object()))
+
+    def director_writes(agent, division, directive, *, success_criterion, target, **_kwargs):
+        if agent.role_name == "Executive Director":
+            swarm.workspace.objective_spec.write_text("# Objective\n")
+            target.write_text(json.dumps({"claims": [
+                {"id": "C-01", "kind": "conjecture", "name": "SNC",
+                 "statement": "every 2-cycle-free digraph has a vertex v with |N++(v)| >= |N+(v)|",
+                 "hypotheses": []},
+                {"id": "T-01", "kind": "theorem", "name": "small cases",
+                 "statement": "SNC holds for every 2-cycle-free digraph on at most 3 vertices",
+                 "hypotheses": [], "sympy_expression": "2 + 2 == 4",
+                 "lean_statement": "example : (2:Nat) + 2 = 4 := rfl"}]}))
+        return {"ran": True, "success": True, "tool_calls": 1}
+
+    monkeypatch.setattr(swarm, "_run_worker", director_writes)
+    swarm._prepare_live_research("attack the open problem")
+    return swarm
+
+
+def test_an_open_problem_is_accepted_as_the_target_not_rejected(tmp_path: Path, monkeypatch):
+    """Pointing the run at an open problem must not be a validation failure."""
+    swarm = _ladder_swarm(tmp_path, monkeypatch)
+    assert [item.prop_id for item in swarm.plan.propositions] == ["C-01", "T-01"]
+    assert [item.prop_id for item in swarm.goals] == ["C-01"]
+    assert [item.prop_id for item in swarm.decidable] == ["T-01"]
+
+
+def test_a_conjecture_is_never_adjudicated_or_decided(tmp_path: Path, monkeypatch):
+    """The top rung must never acquire a verdict, least of all 'proven'."""
+    swarm = _ladder_swarm(tmp_path, monkeypatch)
+    swarm._synthesize()
+    # No decider is written for the conjecture.
+    assert not (swarm.workspace.proof_dir / "c-01.py").exists()
+    assert (swarm.workspace.proof_dir / "t-01.py").exists()
+    ledger = swarm._adjudicate()
+    assert [item.prop_id for item in ledger.adjudications] == ["T-01"]
+    assert not any(item.prop_id == "C-01" for item in ledger.adjudications)
+
+
+def test_progress_on_a_conjecture_is_reported_as_sub_claim_progress(tmp_path: Path,
+                                                                    monkeypatch):
+    """A run that settles a sub-claim must not imply it settled the problem."""
+    swarm = _ladder_swarm(tmp_path, monkeypatch)
+    swarm._synthesize()
+    swarm._adjudicate()
+    ok, detail, _ = swarm._evaluate_claim()
+    assert ok, detail
+    assert "1 open problem(s) stated as the target (C-01)" in detail
+    assert "not a resolution" in detail
+    text = swarm._progress_report(_unsolved_outcome(swarm))
+    assert "Open problem under investigation: SNC" in text
+    assert "Nothing in this report resolves it" in text
+    assert "What remains open" in text
+    assert "C-01" in text
+
+
+def test_an_unkinded_claim_is_a_theorem_not_an_open_problem(tmp_path: Path, monkeypatch):
+    """Regression: defaulting an unkinded claim to 'conjecture' would let any
+    manifest that omits a kind escape validation and be carried as the target."""
+    swarm = ResearchSwarm("default kind", root=tmp_path,
+                          config=SwarmConfig(llm_client_factory=lambda: object()))
+
+    def director_writes(agent, division, directive, *, success_criterion, target, **_kwargs):
+        if agent.role_name == "Executive Director":
+            swarm.workspace.objective_spec.write_text("# Objective\n")
+            target.write_text(json.dumps({"claims": [
+                {"id": "T-01", "name": "No kind", "statement": "unstated form"}]}))
+        return {"ran": True, "success": True, "tool_calls": 1}
+
+    monkeypatch.setattr(swarm, "_run_worker", director_writes)
+    swarm._prepare_live_research("go")
+    assert swarm.plan.propositions == ()
+    assert "sympy_expression" in swarm.plan.notes

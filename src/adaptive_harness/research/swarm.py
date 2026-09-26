@@ -515,7 +515,7 @@ class ResearchSwarm:
         written: list[str] = []
         undetermined: list[str] = []
         for prop in self.plan.propositions:
-            if not prop.script:
+            if prop.is_goal or not prop.script:
                 undetermined.append(prop.prop_id)
                 continue
             target = self.workspace.proof_dir / f"{prop.prop_id.lower()}.py"
@@ -563,6 +563,10 @@ class ResearchSwarm:
 
         ledger = ClaimLedger()
         for prop in self.plan.propositions:
+            if prop.is_goal:
+                # A goal is not adjudicated. Recording it as UNTESTED would put a
+                # fabricated verdict on the very problem the run was asked to attack.
+                continue
             script = self.workspace.proof_dir / f"{prop.prop_id.lower()}.py"
             receipt = self.proofs.run_script(script, prop.prop_id) if script.is_file() else None
             exit_code = receipt.exit_code if receipt else None
@@ -590,18 +594,41 @@ class ResearchSwarm:
         self.claims = ledger
         return ledger
 
+    @property
+    def goals(self) -> tuple[Proposition, ...]:
+        """The open problems this run was pointed at, if any."""
+        return tuple(item for item in self.plan.propositions if item.is_goal)
+
+    @property
+    def decidable(self) -> tuple[Proposition, ...]:
+        """The claims a run can actually settle, i.e. everything but the goals."""
+        return tuple(item for item in self.plan.propositions if not item.is_goal)
+
     def _evaluate_claim(self) -> tuple[bool, str, tuple[str, ...]]:
-        """The headline verdict must actually be decided, not merely attempted."""
+        """The headline verdict must actually be decided, not merely attempted.
+
+        A run aimed at an open problem settles its *sub-claims*; it does not settle
+        the problem. The distinction is reported rather than blurred, because a
+        paper that says "we proved the conjecture" when it proved a small-case
+        lemma is the exact failure this harness exists to prevent.
+        """
         if self._live_research_mode() and not self.workspace.objective_spec.is_file():
             return False, "Director has not written 00_objective_spec.md", ()
         ledger = self.claims if self.claims.adjudications else self._adjudicate()
+        goals = self.goals
+        prefix = ""
+        if goals:
+            names = ", ".join(item.prop_id for item in goals)
+            prefix = (f"{len(goals)} open problem(s) stated as the target ({names}); "
+                      f"what follows is progress on the decidable sub-claims, not a "
+                      f"resolution. ")
         if not ledger.adjudications:
-            return False, ("no proposition was derived, so the claim was not tested; "
+            return False, (prefix + "no proposition was derived, so nothing was tested; "
                            + (self.plan.notes or "supply a checkable claim to proceed")), ()
         evidence = [f"{item.prop_id} {item.verdict.value}" for item in ledger.adjudications]
         if not ledger.decided:
-            return False, f"verdict {ledger.headline.value}: {ledger.summary()}", tuple(evidence)
-        return True, f"verdict {ledger.headline.value}: {ledger.summary()}", tuple(evidence)
+            return False, prefix + f"verdict {ledger.headline.value}: {ledger.summary()}", tuple(evidence)
+        return True, prefix + f"verdict {ledger.headline.value}: {ledger.summary()}", tuple(evidence)
 
     def _formalise(self) -> None:
         """Emit the Lean 4 counterpart of the derived propositions.
@@ -2345,15 +2372,40 @@ class ResearchSwarm:
             "(3) 'lean_statement': the exact Lean proposition, same scope and hypotheses as the "
             "statement, for example 'example (n m : Nat) : Nat.succ n + m = Nat.succ (n + m) "
             ":= rfl'. "
-            "Include one central claim and at most two supporting lemmas. Every claim must carry "
-            "a nonempty 'sympy_expression' and a nonempty 'lean_statement'. "
+            "Include one central claim and at most two supporting lemmas. Every decidable claim "
+            "must carry a nonempty 'sympy_expression' and a nonempty 'lean_statement'. "
             "WORKED EXAMPLE for the topic '2 + 2 = 4': statement 'the sum of the natural number "
             "two and two is four'; sympy_expression '2 + 2 == 4'; lean_statement 'example : "
             "(2 : Nat) + 2 = 4 := rfl'. For the binomial theorem: statement 'the square of a sum "
             "of two integers equals the sum of their squares plus twice their product'; "
             "sympy_expression '(x + y)**2 == x**2 + 2*x*y + y**2'; lean_statement 'example (x y : "
             "Nat) : (x + y)^2 = x^2 + 2*x*y + y^2 := by ring_nf'. "
-            "Keep empirical predictions out of the mathematical claims array. "
+            + self._open_problem_directive()
+            + "Keep empirical predictions out of the mathematical claims array. "
+        )
+
+    def _open_problem_directive(self) -> str:
+        """How to point the run at an open problem without pretending to settle it.
+
+        An open problem is not a proposition, and demanding an exact expression
+        for one is the category error this harness was rewritten to remove. The
+        workable shape is a ladder: state the problem as a ``conjecture`` — which
+        is carried as the target, printed as open, and never adjudicated — and then
+        state the decidable rungs beneath it that a run can genuinely settle.
+        """
+        return (
+            "IF THE TOPIC IS AN OPEN PROBLEM, do not force it into a single decidable claim, "
+            "and do not claim to settle it. Structure the claims array as a ladder. (a) One "
+            "claim with kind 'conjecture' stating the open problem itself in plain mathematics. "
+            "It may have no sympy_expression; that is expected and correct. It is recorded as the "
+            "target and is never marked proven. (b) Decidable claims underneath it, in increasing "
+            "difficulty, each with its own kind 'theorem' plus a sympy_expression and a "
+            "lean_statement: the exhaustive small cases, a verifying procedure for a proposed "
+            "witness or counterexample, boundary and degenerate cases, and any supporting lemma "
+            "the argument needs. (c) An explicit statement of what remains open. "
+            "For a conjecture, prefer 'every digraph with at most n vertices satisfies P' with an "
+            "exact expression that enumerates all such digraphs, over a hand-written script. "
+            "Report progress on the rungs, and say plainly that the top rung is unsolved. "
         )
 
     def _prepare_live_research(self, objective: str) -> None:
@@ -2430,11 +2482,28 @@ class ResearchSwarm:
                                  or item.get("exact_expression")
                                  or item.get("sympy_statement") or "").strip()
                 lean = str(item.get("lean_statement", "")).strip()
+                # A goal is allowed to be undecidable — that is what a goal is.
+                # It is carried as the target, never adjudicated, and the run's
+                # progress is the decidable claims beneath it. Requiring an exact
+                # expression of the goal itself is the category error this whole
+                # change set exists to remove.
+                # An unkinded claim is a theorem, not an open problem. Defaulting
+                # to "conjecture" would let any manifest that omits a kind escape
+                # validation and be carried as the target.
+                goal = Proposition(
+                    prop_id=item["id"], kind=str(item.get("kind") or "theorem"),
+                    name=str(item.get("name", item["id"])), statement=statement,
+                    hypotheses=tuple(hypotheses), lean_statement=lean,
+                    sympy_expression=expression)
+                if goal.is_goal:
+                    propositions.append(goal)
+                    continue
                 if not expression:
                     raise ValueError(
                         f"claim {item['id']} has no 'sympy_expression'; a claim the exact "
                         "computer cannot decide cannot be settled, and asking a worker to "
-                        "invent one produced scripts that failed every time")
+                        "invent one produced scripts that failed every time. If this is the "
+                        "open problem itself, give it kind 'conjecture'.")
                 if not lean:
                     raise ValueError(
                         f"claim {item['id']} has no 'lean_statement'; the formal tier is part "
@@ -2519,7 +2588,15 @@ class ResearchSwarm:
             "= Research progress report", "",
             "The research swarm did not verify its objective. This document is a progress "
             "report, not a proof and not a completed academic paper. Nothing below should "
-            "be read as a settled result.", "",
+            "be read as a settled result.", ""]
+        for goal in self.goals:
+            lines += [f"== Open problem under investigation: {goal.name}", "",
+                      f"*{goal.statement}*", "",
+                      "This is an open problem. Nothing in this report resolves it. What "
+                      "follows is machine-checked progress on the decidable sub-claims beneath "
+                      "it, and the gap between them and the full statement is stated explicitly "
+                      "below.", ""]
+        lines += [
             f"The loop exited after {cycles} cycle(s) with `{stop_reason}`, having recruited "
             f"{spawned} worker(s).", ""]
 
@@ -2540,8 +2617,8 @@ class ResearchSwarm:
             lines.append("The gate produced no status record for this run.")
         lines.append("")
 
-        if self.plan.propositions:
-            lines += ["== What each claim was decided to be", ""]
+        if self.decidable:
+            lines += ["== What each decidable claim was decided to be", ""]
             for item in self.claims.adjudications:
                 lines.append(f"- `{item.prop_id}` — **{item.verdict.value}** "
                              f"(script exit {item.exit_code}).")
@@ -2550,10 +2627,23 @@ class ResearchSwarm:
                 if item.finding:
                     lines.append(f"  - Kernel said: {esc(item.finding[:220])}")
             if not self.claims.adjudications:
-                for claim in self.plan.propositions:
+                for claim in self.decidable:
                     lines.append(f"- `{claim.prop_id}` — **UNTESTED**, no verdict was reached.")
                     if claim.statement:
                         lines.append(f"  - Claimed: {esc(claim.statement[:300])}")
+            lines.append("")
+        if self.goals:
+            settled = {item.prop_id for item in
+                       (*self.claims.proven, *self.claims.disproven)}
+            unresolved = [claim.prop_id for claim in self.decidable
+                          if claim.prop_id not in settled]
+            lines += ["== What remains open", ""]
+            for goal in self.goals:
+                lines.append(f"- `{goal.prop_id}` ({esc(goal.name)}) is unsolved. The run "
+                             f"establishes nothing about it beyond the decidable claims above.")
+            if unresolved:
+                lines.append("- The following decidable sub-claims were also not settled: "
+                             + ", ".join(f"`{item}`" for item in unresolved) + ".")
             lines.append("")
 
         certified = [item for item in self.lean_gate.receipts if item.certified]

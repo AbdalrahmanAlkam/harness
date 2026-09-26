@@ -14,6 +14,8 @@ from enum import Enum
 import re
 from typing import Any, Mapping, Sequence
 
+from adaptive_harness.research.roles import CONJECTURE_KINDS
+
 
 class Verdict(str, Enum):
     """Outcome of attempting to settle a claim."""
@@ -126,6 +128,16 @@ class Proposition:
     def exactly_decidable(self) -> bool:
         """Whether the claim carries a form exact computation can settle."""
         return bool(self.sympy_expression.strip())
+
+    @property
+    def is_goal(self) -> bool:
+        """Whether this states the problem rather than a decidable result.
+
+        Goals are carried through the run as the target — printed in the paper as
+        open, and never adjudicated — while the decidable claims beneath them are
+        what a run can actually settle.
+        """
+        return self.kind.strip().lower() in CONJECTURE_KINDS
 
     def to_dict(self) -> dict[str, Any]:
         return {"prop_id": self.prop_id, "kind": self.kind, "name": self.name,

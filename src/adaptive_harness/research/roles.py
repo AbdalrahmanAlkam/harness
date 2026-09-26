@@ -43,6 +43,19 @@ class DivisionSpec:
     default_tools: tuple[str, ...]
 
 
+#: Claim kinds that state a *goal* rather than a decidable result.
+#:
+#: An open problem is not a proposition the kernel can settle, and demanding an
+#: exact expression for it is a category error — the same one that made a worker
+#: try to evaluate Lean's kernel in Python. A conjecture is recorded as the
+#: target, printed in the paper as open, and excluded from adjudication; the
+#: progress the run reports is then the decidable sub-claims underneath it.
+CONJECTURE_KINDS = frozenset({
+    "conjecture", "open_problem", "open_question", "target", "goal", "unsolved",
+    "hypothesis_seeking", "research_question",
+})
+
+
 DIVISION_SPECS: Mapping[Division, DivisionSpec] = {
     Division.LITERATURE: DivisionSpec(
         Division.LITERATURE, "Literature Lead",

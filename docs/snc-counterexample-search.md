@@ -9,19 +9,28 @@ stylistic: a double-quoted topic has every `$D`, `$v` and `$A` expanded away by
 the shell before the harness ever sees it, and `Seymour's` makes single-quoting
 impossible. `"$(cat scripts/snc_topic.txt)"` survives both.
 
-## What this can and cannot do
+## The claim ladder
 
-Seymour's Second Neighborhood Conjecture is **open**. This system cannot prove
-or disprove it, and a run that reports success has not settled the conjecture.
+Attacking an open problem is the point, so the topic is written as a **ladder**
+rather than as one claim. A claim with `kind: "conjecture"` states the problem
+itself: it may have no exact expression, it is carried as the target, and it is
+**never adjudicated or marked proven**. Beneath it sit the decidable rungs the
+run can actually settle — exhaustive small cases, an exact verifier for a
+proposed counterexample, boundary cases, a Lean formalisation.
 
-What it can do is real: generate candidate 2-cycle-free digraphs and
-**machine-verify** each one by recomputing `|N+(v)|` and `|N++(v)|` for every
-vertex from the adjacency matrix. A reported counterexample is a finding only if
-that recomputation passes. An unverifiable candidate is recorded as a failed
-candidate, not as a partial result.
+So the run reports *progress on the sub-claims* and states the gap explicitly.
+The progress report has a "What remains open" section naming the conjecture and
+any unsettled rung. A run that proves a small-case lemma while saying the
+conjecture is unsolved is the correct outcome, not a disappointing one.
+
+## What counts as a finding
+
+A candidate counterexample counts only if `|N+(v)|` and `|N++(v)|` are
+**recomputed from the adjacency matrix by exact code**, not asserted. An
+unverifiable candidate is recorded as a failed candidate, not a partial result.
 
 Expect `UNSOLVED` with a progress report. That is the honest outcome, and the
-report names which invariant blocked it.
+report names which invariant blocked it and what remains open.
 
 ## Reading the output
 
