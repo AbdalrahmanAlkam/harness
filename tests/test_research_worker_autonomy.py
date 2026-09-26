@@ -231,5 +231,14 @@ def test_red_team_accepts_a_structured_refutation(tmp_path: Path):
     assert swarm.ledger.by_action("COUNTEREXAMPLE_FOUND")
 
 
+def test_red_team_cannot_clear_without_inspecting_artifacts(tmp_path: Path):
+    swarm = _swarm(tmp_path, [], final='{"falsified": false, "finding": "nothing found"}')
+    agent_id = swarm.spawn_subagent("adversarial_lead_01", "Red Team Auditor",
+                                    "check the claim", ["search_files"])
+    swarm._falsify(swarm.agents[agent_id], [])
+    assert swarm.agents[agent_id].clearance is Clearance.PENDING
+    assert not swarm.ledger.by_action("CLEARANCE_GRANTED")
+
+
 def test_worker_trajectory_is_a_declared_ledger_action():
     assert "WORKER_TRAJECTORY" in ACTIONS

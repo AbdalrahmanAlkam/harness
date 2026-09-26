@@ -692,7 +692,7 @@ if simplify(2 * total - n * (n + 1)) == 0:
 refute("the closed form failed its own doubling identity")
 """
     step_body = """
-from sympy import expand, simplify, symbols
+from sympy import Rational, expand, simplify, symbols
 k = symbols("k", integer=True, nonnegative=True)
 
 # The induction step, given 2*S(k) = k(k+1), reduces to polynomial arithmetic.

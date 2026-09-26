@@ -155,7 +155,7 @@ class ProofRunner:
 
         # The cache is keyed on content, so an edited script always re-runs.
         cached = self._cache.get(digest) if use_cache else None
-        if cached is not None and cached.theorem_id == identifier:
+        if cached is not None and cached.theorem_id == identifier and cached.script == str(path):
             return cached
 
         violations = scan_for_approximations(source)

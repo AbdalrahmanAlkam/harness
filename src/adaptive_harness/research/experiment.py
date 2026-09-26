@@ -159,7 +159,7 @@ class ExperimentRunner:
         return sorted(path for path in self.experiment_dir.glob("*.py")
                       if not path.name.startswith("."))
 
-    def _hash_artifacts(self, before: Mapping[str, float]) -> dict[str, str]:
+    def _hash_artifacts(self, before: Mapping[str, int]) -> dict[str, str]:
         """Hash data files, recording only those the script created or touched."""
         hashes: dict[str, str] = {}
         for path in sorted(self.experiment_dir.iterdir()):
@@ -167,14 +167,14 @@ class ExperimentRunner:
                 continue
             previous = before.get(path.name)
             current = path.stat().st_mtime_ns
-            if previous is not None and abs(current - previous) < 1e-9:
+            if previous is not None and current == previous:
                 continue
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             hashes[path.name] = f"sha256:{digest}"
         return hashes
 
-    def _snapshot(self) -> dict[str, float]:
-        return {path.name: float(path.stat().st_mtime_ns)
+    def _snapshot(self) -> dict[str, int]:
+        return {path.name: path.stat().st_mtime_ns
                 for path in self.experiment_dir.iterdir() if path.is_file()}
 
     def run_script(self, script: str | Path, *, seed: int, experiment_id: str | None = None,
@@ -188,7 +188,7 @@ class ExperimentRunner:
             path = self.experiment_dir / path
         if not path.is_file():
             return ExperimentReceipt(experiment_id or path.stem, str(path), seed, "MISSING",
-                                    None, 0.0, (), "experiment script does not exist")
+                                     error="experiment script does not exist")
         source = path.read_text(encoding="utf-8", errors="replace")
         digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
         identifier = experiment_id or path.stem
@@ -198,7 +198,8 @@ class ExperimentRunner:
         claim_key = canonical_key([asdict(item) for item in predictions])
         cache_key = (f"{digest}:{claim_key}", int(seed))
         cached = self._cache.get(cache_key) if use_cache else None
-        if cached is not None and self._artifacts_intact(cached):
+        if (cached is not None and cached.script == str(path)
+                and cached.experiment_id == identifier and self._artifacts_intact(cached)):
             return cached
 
         guarded = self.experiment_dir / f".{path.stem}.seeded.py"

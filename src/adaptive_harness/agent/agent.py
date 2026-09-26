@@ -603,7 +603,7 @@ class DeveloperAgent:
             DomainMode.CODING: set(self.tools) - {"check_convergence"},
             # Research mode must be able to typeset and build its own paper, and
             # to machine-check a formal proof, or it cannot deliver either.
-            DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "run_bash", "calculate", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof"},
+            DomainMode.RESEARCH: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "web_search", "run_bash", "run_pytest", "run_python_repl", "verify_equation", "calculate", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof"},
             DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof"},
             DomainMode.AUDIT: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user"},
         }[domain_res.mode]

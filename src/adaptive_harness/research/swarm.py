@@ -477,7 +477,10 @@ class ResearchSwarm:
             script = self.workspace.proof_dir / f"{prop.prop_id.lower()}.py"
             receipt = self.proofs.run_script(script, prop.prop_id) if script.is_file() else None
             exit_code = receipt.exit_code if receipt else None
-            verdict = verdict_from_exit(exit_code) if receipt else Verdict.UNTESTED
+            # An exit code cannot override the exactness scan. A script with a
+            # float literal can exit 0 (or 3) but establishes no exact claim.
+            verdict = (verdict_from_exit(exit_code) if receipt and
+                       receipt.status != "REJECTED_INEXACT" else Verdict.UNTESTED)
             finding = ""
             if receipt is not None and receipt.stdout:
                 tail = [line.strip() for line in receipt.stdout.splitlines() if line.strip()]
@@ -605,7 +608,7 @@ class ResearchSwarm:
             # Exit 0 means the proposition holds; exit 3 means a counterexample was
             # exhibited. Both are valid *decisions*; anything else means the script
             # could not decide, which is a failure of the derivation, not a result.
-            if receipt.exit_code in (EXIT_HOLDS, EXIT_COUNTEREXAMPLE):
+            if receipt.status != "REJECTED_INEXACT" and receipt.exit_code in (EXIT_HOLDS, EXIT_COUNTEREXAMPLE):
                 evidence.append(f"{receipt.theorem_id} exit {receipt.exit_code} ({receipt.sha256[:19]})")
             else:
                 failed.append(f"{receipt.theorem_id} {receipt.status}")
@@ -967,6 +970,9 @@ class ResearchSwarm:
                     f"{FALSIFICATION_VERDICT}"),
                 target=self.workspace.root / "audit" / f"{agent.agent_id}.md")
             verdict = FalsificationVerdict.parse(outcome.get("summary"))
+            if not outcome.get("tool_calls"):
+                verdict = FalsificationVerdict(Clearance.PENDING,
+                                               "the falsification worker used no investigative tools")
             if not verdict.conclusive and not outcome.get("success"):
                 verdict = FalsificationVerdict(
                     Clearance.PENDING,
