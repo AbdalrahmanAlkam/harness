@@ -1,0 +1,83 @@
+{
+  "solved": true,
+  "stop_reason": "CONVERGED",
+  "cycles": 2,
+  "workers_spawned": 2,
+  "gate": {
+    "cycle": 2,
+    "satisfied": true,
+    "fingerprint": "b7fc0bca02778d22",
+    "statuses": [
+      {
+        "invariant": "mathematical_soundness",
+        "satisfied": true,
+        "detail": "all 2 derivation(s) reached a clean verdict",
+        "evidence": [
+          "prop-gauss-step exit 0 (sha256:4cfafadbfef3)",
+          "prop-gauss exit 0 (sha256:36afb7c534c7)"
+        ]
+      },
+      {
+        "invariant": "empirical_replication",
+        "satisfied": true,
+        "detail": "no simulation applies to this claim, so the result rests on exact computation alone and no statistical claim is made",
+        "evidence": []
+      },
+      {
+        "invariant": "adversarial_clearance",
+        "satisfied": true,
+        "detail": "2 red-team worker(s) cleared 2 proved claim(s); audit log written",
+        "evidence": [
+          "adversarial_red_team_auditor_01",
+          "adversarial_falsifier_02"
+        ]
+      },
+      {
+        "invariant": "document_integrity",
+        "satisfied": true,
+        "detail": "paper.pdf built cleanly (101685 bytes, typst 0.15.1 (9dfd3a08))",
+        "evidence": []
+      },
+      {
+        "invariant": "claim_adjudication",
+        "satisfied": true,
+        "detail": "verdict PROVEN: Headline PROVEN of 2 proposition(s) (2 proven, 0 disproven, 0 inconclusive).",
+        "evidence": [
+          "PROP-GAUSS PROVEN",
+          "PROP-GAUSS-STEP PROVEN"
+        ]
+      },
+      {
+        "invariant": "formal_verification",
+        "satisfied": true,
+        "detail": "all 1 Lean file(s) machine-checked by Lean (version 4.34.1, x86_64-unknown-linux-gnu, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release), covering 2 theorem(s), with no sorry and no sorryAx",
+        "evidence": [
+          "LEAN-PROOF-001 LEAN_VERIFIED"
+        ]
+      }
+    ]
+  },
+  "history": [
+    {
+      "index": 1,
+      "gaps": [
+        "adversarial_clearance"
+      ],
+      "diagnosis": "adversarial_clearance: no red-team worker has returned a verdict yet",
+      "workers_spawned": [
+        "adversarial_red_team_auditor_01",
+        "adversarial_falsifier_02"
+      ],
+      "gate_fingerprint": "4e923c3061aaac86",
+      "elapsed_s": 3.34
+    },
+    {
+      "index": 2,
+      "gaps": [],
+      "diagnosis": "none",
+      "workers_spawned": [],
+      "gate_fingerprint": "b7fc0bca02778d22",
+      "elapsed_s": 2.89
+    }
+  ]
+}

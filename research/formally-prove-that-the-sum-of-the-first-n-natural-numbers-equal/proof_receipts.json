@@ -1,0 +1,20 @@
+[
+  {
+    "theorem_id": "prop-gauss-step",
+    "script": "/home/aaa/Documents/projects/harness/research/formally-prove-that-the-sum-of-the-first-n-natural-numbers-equal/proofs/prop-gauss-step.py",
+    "hash": "sha256:4cfafadbfef39e821b89079b4bc847d58e88cd67a4d19732916264a9df4b061e",
+    "status": "VERIFIED_EXIT_0",
+    "exit_code": 0,
+    "duration_ms": 274.66,
+    "violations": []
+  },
+  {
+    "theorem_id": "prop-gauss",
+    "script": "/home/aaa/Documents/projects/harness/research/formally-prove-that-the-sum-of-the-first-n-natural-numbers-equal/proofs/prop-gauss.py",
+    "hash": "sha256:36afb7c534c728c2b61befc979d6e98fe6a35b852f64c5d99e874633d6307abe",
+    "status": "VERIFIED_EXIT_0",
+    "exit_code": 0,
+    "duration_ms": 285.45,
+    "violations": []
+  }
+]

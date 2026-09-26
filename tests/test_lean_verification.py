@@ -17,6 +17,7 @@ from adaptive_harness.tools.lean import (BENIGN_AXIOMS, LeanDiagnostic, LeanErro
                                          declared_names, find_placeholders,
                                          strip_lean_comments)
 from adaptive_harness.research.claim import Verdict
+from adaptive_harness.research.gate import Invariant
 from adaptive_harness.research.lean_gate import LeanProofGate, theorems_in
 
 TOOLCHAIN = LeanToolchain()
@@ -390,3 +391,47 @@ def test_paper_carries_the_lean_boxes_and_listings(tmp_path: Path):
     # The appendix carries the listings so a reader can reproduce the check.
     assert "Lean 4 Listings" in paper
     assert "gauss_two_mul" in paper
+
+
+@needs_lean
+def test_tampered_lean_file_blocks_the_run(tmp_path: Path):
+    """The defining negative control.
+
+    Lean's own verdict on a file whose proof step is replaced by `sorry` is exit
+    code 0 with a warning, so a verifier that trusts the exit code would certify
+    a false theorem. The run must be refused anyway. This is asserted end to end
+    rather than only at the tool level, because the invariant wiring is exactly
+    where such a hole would reappear.
+    """
+    from adaptive_harness.research import ResearchSwarm, SwarmConfig
+
+    topic = "formally prove that the sum of the first n natural numbers"
+    swarm = ResearchSwarm(topic, root=tmp_path, config=SwarmConfig(max_cycles=2))
+    swarm._synthesize()
+    swarm._formalise()
+    swarm._adjudicate()
+    assert swarm.claims.headline is Verdict.PROVEN
+
+    # Establish the honest baseline first.
+    honest = swarm.run()
+    assert honest.solved, honest.render()
+
+    # Now replace the induction step with the escape hatch, in place.
+    target = swarm.workspace.lean_dir / "LEAN-GAUSS.lean"
+    source = target.read_text()
+    tampered = source.replace("    calc 2 * (sumFirst k", "    sorry\n    calc 2 * (sumFirst k", 1)
+    assert tampered != source
+    target.write_text(tampered)
+
+    # The harness must refuse even though Lean itself is satisfied.
+    verdict = swarm.lean_gate.verify_file(target)
+    assert not verdict.certified
+    assert "placeholder" in (verdict.errors[0] if verdict.errors else "") or \
+        verdict.status == "LEAN_REJECTED"
+
+    reopened = ResearchSwarm(topic, root=tmp_path, config=SwarmConfig(max_cycles=2))
+    blocked = reopened.run()
+    assert not blocked.solved, "a sorry-bearing proof was allowed to publish"
+    failing = [status for status in reopened._last_report.statuses
+               if status.invariant is Invariant.FORMAL_VERIFICATION]
+    assert failing and not failing[0].satisfied

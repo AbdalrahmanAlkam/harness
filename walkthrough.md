@@ -96,3 +96,28 @@ Every derived script is scanned for floating-point literals and approximating ca
 A topic the kernel cannot formalise is not a failure to hide. `adaptive-harness research "zzz qqq unmatchable"` produces a paper that explicitly reports INCONCLUSIVE, states that no derivation strategy matched, and names what input would let it proceed. Prefer that to a confident paper about nothing.
 
 Artifacts land in `research/<topic-slug>/` — the hash-chained ledger, the derivation plan, the generated proof and experiment scripts with their raw data, the figures, the audit log, the bibliography, the convergence history, the receipts, and the paper. Because the paper is generated from receipts, nothing can be typeset that was not derived and checked.
+
+## The two proof tiers, and why `sorry` is fatal
+
+SymPy can tell you two expressions are equal. It cannot tell you a *deduction* is valid. That is what Lean 4 is for, and the harness now runs both as a single standard.
+
+Try the acceptance example:
+
+```bash
+adaptive-harness research "Formally prove that the sum of the first N natural numbers equals N*(N+1)/2 and verify both in SymPy and Lean 4"
+```
+
+The kernel derives two SymPy propositions (the closed form is algebraically well formed; the induction step is polynomial and therefore exactly decidable) and pairs them with a Lean file that discharges the induction itself. The run reports `PROVEN`, and `paper.pdf` carries a *Formal Foundations* section with a green certification box per proof.
+
+The part worth knowing is what Lean does *not* tell you. Lean will happily accept this:
+
+```lean
+theorem gauss_two_mul (n : Nat) : 2 * sumFirst n = n * (n + 1) := by
+  sorry
+```
+
+and **exit 0**, emitting a `warning: declaration uses 'sorry'` rather than an error. Any verifier that reads the exit status would certify a false theorem. So three checks must all pass: no `sorry` token in the source (with comments and string literals stripped first, so prose cannot trip it), no "declaration uses 'sorry'" diagnostic, and — the strongest — no dependency on `sorryAx`, which the kernel asks Lean about directly via `#print axioms`. You can watch the difference yourself: replace the induction step in `proofs/lean/LEAN-GAUSS.lean` with `sorry`, run `lean` on it, note the exit code is still 0, then re-run the research command. `formal_verification` fails, the run reports `UNSOLVED`, and the paper is not published. That test is pinned as `test_tampered_lean_file_blocks_the_run`.
+
+What must be certified depends on the verdict, because the standard applies to asserted theorems. A `PROVEN` theorem needs its Lean file. A `DISPROVEN` result does not: the refutation is the result, and it is certified by an exact witness the kernel already checked — a Lean proof of a falsehood would be neither expected nor meaningful. An `INCONCLUSIVE` verdict publishes no theorem, so the tier does not apply and the paper says so rather than implying formal backing it lacks.
+
+The shipped proofs use core Lean only, with no imports, because Mathlib cannot be assumed present — its cache is roughly 5 GB and the install failed here for want of space. Core Lean has no `ring`, so the Gauss proof expands `(k+1)(k+2)` by hand. Every library proof is compiled by a test, so if a future Lean release breaks a tactic the suite fails rather than shipping a theorem that no longer verifies. Where a `lakefile` exists the tool uses `lake env lean`, so a Mathlib environment is picked up automatically.

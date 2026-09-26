@@ -77,6 +77,35 @@ work in this push; earlier history is summarized in `git log`.
 - **Self-adjudicating experiment generator** with pinned seeds, Student-t 95%
   intervals, and a rank-order prediction that a wrong theory would break.
 
+### Added
+- **Lean 4 as the machine-checked epistemic proof engine.** `RunLeanProofTool`
+  (`run_lean_proof`) compiles and adjudicates Lean sources, and a sixth
+  invariant, `formal_verification`, requires that any theorem the paper asserts
+  is machine-checked. The paper gains a *Formal Foundations* section with a
+  certification box per proof and an appendix listing the full sources.
+- **The zero-sorry invariant, enforced three independent ways.** Established
+  empirically before implementation: **Lean exits 0 on a proof containing
+  `sorry`** — it emits a warning, not an error — so a verifier trusting the exit
+  code would certify a false theorem. The tool therefore requires (1) no
+  `sorry`/`admit` token in the source, after comments and string literals are
+  stripped; (2) no "declaration uses 'sorry'" diagnostic; and (3) no dependency
+  on `sorryAx`, reported by a kernel-emitted `#print axioms` audit. The third is
+  the strongest, being vouched for by Lean rather than inferred from text.
+  `test_tampered_lean_file_blocks_the_run` pins this end to end.
+- **A two-tier proof standard** (`research/lean_gate.py`). Tier 1 is SymPy
+  computation, Tier 2 is Lean-checked logic. The requirement tracks the verdict:
+  a PROVEN theorem must be certified; a DISPROVEN result is certified by its
+  exact witness, since a Lean proof of a falsehood is neither expected nor
+  meaningful; and an INCONCLUSIVE verdict publishes no theorem, so the tier does
+  not apply. An empty formal tier on an asserted theorem blocks publication.
+- **A Formal Proof Lead division** with a Lean Formaliser, Tactic Specialist, and
+  Axiom Auditor, plus `LEAN_PROOF_SUBMISSION` / `_VERIFIED` / `_REJECTED` ledger
+  actions and `proofs/lean/` beside `proofs/` so the tiers cannot contaminate
+  each other.
+- **A `gauss` strategy in the derivation kernel**, so the acceptance example is
+  covered by both tiers. SymPy discharges the algebra of the induction step;
+  Lean discharges the induction itself, which SymPy cannot do.
+
 ### Fixed
 - **Live mode could never converge.** Any non-empty falsification response was read
   as a counterexample, so with `--author` the adversarial gate never cleared. The
@@ -103,6 +132,13 @@ work in this push; earlier history is summarized in `git log`.
   Added a separate literal escaper for string contexts.
 
 ### Notes
+- Formal proofs are **core-Lean only**: no imports beyond the prelude. Mathlib
+  could not be installed on the development machine (its cache needs roughly
+  5 GB, and the fetch exhausted the tmpfs), and a proof that needs a
+  multi-gigabyte dependency is not reproducible anyway. Core Lean has no `ring`,
+  `linarith`, or `ring_nf`, so polynomial identities are distributed by hand.
+  The tool still prefers `lake env lean` when a `lakefile` is present, so a
+  Mathlib environment is used automatically where one exists.
 - The research swarm defaults to **mechanical mode**: no language model is called
   unless `--author` is passed, so a default run makes zero network requests and
   costs nothing. All verification is local and deterministic.

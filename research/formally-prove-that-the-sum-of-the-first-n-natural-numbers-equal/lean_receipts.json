@@ -1,0 +1,27 @@
+{
+  "lean_version": "Lean (version 4.34.1, x86_64-unknown-linux-gnu, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release)",
+  "mathlib_available": false,
+  "all_certified": true,
+  "receipts": [
+    {
+      "proof_id": "LEAN-PROOF-001",
+      "name": "LEAN-GAUSS",
+      "path": "/home/aaa/Documents/projects/harness/research/formally-prove-that-the-sum-of-the-first-n-natural-numbers-equal/proofs/lean/LEAN-GAUSS.lean",
+      "hash": "sha256:8aa955ddcdc469b4fb43f0bafb227b207274a35390b3cc0ff907e7cb3eb1a0f5",
+      "status": "LEAN_VERIFIED",
+      "lean_version": "Lean (version 4.34.1, x86_64-unknown-linux-gnu, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release)",
+      "duration_ms": 857.12,
+      "exit_code": 0,
+      "theorems": [
+        "expand",
+        "gauss_two_mul"
+      ],
+      "axioms": [
+        "Quot.sound",
+        "propext"
+      ],
+      "errors": [],
+      "verified_at": "2026-09-26T13:22:02.606087+00:00"
+    }
+  ]
+}

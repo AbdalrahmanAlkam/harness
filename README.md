@@ -267,13 +267,61 @@ Refutation requires an *exhibited* counterexample, not a failure to simplify:
 is why the probe set includes negative points. A script that errors or times out
 is `INCONCLUSIVE`, because a broken proof attempt is not evidence against a claim.
 
+**The second proof tier: Lean 4.** SymPy can confirm that two expressions are
+equal; only a theorem prover can confirm that a *deduction* is valid. Every
+theorem the swarm publishes can carry a formal Lean 4 counterpart, compiled by the
+Lean kernel:
+
+```bash
+adaptive-harness research "Formally prove that the sum of the first N natural numbers equals N*(N+1)/2 and verify both in SymPy and Lean 4"
+```
+
+A formal proof is admitted only when **all three** of these hold:
+
+| Check | Source of truth |
+| --- | --- |
+| the source contains no `sorry`/`admit` token | static scan, after comments and string literals are stripped |
+| the compiler emitted no "declaration uses 'sorry'" | `lean` diagnostics |
+| no declaration depends on `sorryAx` | `#print axioms`, emitted by the kernel |
+
+The third check is why the exit code alone is not trusted. **Lean exits 0 on a
+proof containing `sorry`** — it emits a *warning*, not an error. A verifier that
+reads only the exit status would certify a false theorem; this one does not, and
+`tests/test_lean_verification.py::test_tampered_lean_file_blocks_the_run` pins
+that behaviour end to end.
+
+What is required depends on the verdict, because the standard applies to
+*asserted theorems*:
+
+- **PROVEN** — the paper asserts a theorem, so every Lean file must be certified.
+  An empty proof set blocks publication.
+- **DISPROVEN** — nothing is asserted; the refutation *is* the result, certified
+  by an exact witness the kernel checked. Requiring a Lean proof to publish "this
+  claim is false" would be wrong.
+- **INCONCLUSIVE** — no theorem is published, so the tier is not applicable and
+  the paper says so.
+
+**Core Lean only.** The shipped proofs use no imports beyond Lean's prelude,
+because Mathlib cannot be assumed present: on this machine its cache needs about
+5 GB and the fetch failed for want of space. Core Lean has no `ring`, `linarith`,
+or `ring_nf`, so polynomial identities are distributed by hand — the Gauss proof
+below expands `(k+1)(k+2)` explicitly for that reason. Every library proof is
+compiled by a test, so the library cannot rot silently. The tool resolves
+`lake env lean` automatically when a `lakefile` is present, so a Mathlib
+environment works if one exists.
+
+The paper gains a *Formal Foundations* section with a green certification box per
+proof (toolchain, theorem names, axiom set, digest) and an appendix listing the
+full Lean sources, so a reader can reproduce the check with
+`lean proofs/lean/<name>.lean`.
+
 **No approximation is admissible.** Before execution every script is scanned by
 AST for floating-point literals and approximating calls (`float`, `evalf`, `N`),
 and rejected without running if it contains any. This is not decoration: it
 caught a genuine error in an early draft of the Pareto second moment, where the
 asserted `α·x_m²/((α−1)(α−2))` was wrong and SymPy's `α·x_m²/(α−2)` was right.
 
-**Five invariants**, all required simultaneously:
+**Six invariants**, all required simultaneously:
 
 | Invariant | Requirement |
 | --- | --- |
@@ -281,6 +329,7 @@ asserted `α·x_m²/((α−1)(α−2))` was wrong and SymPy's `α·x_m²/(α−2
 | `empirical_replication` | every seeded simulation reproduced its prediction at 95% |
 | `adversarial_clearance` | the *reported verdict* is certified — no open objection, and for a refutation an exact witness |
 | `claim_adjudication` | the headline claim reached a decided verdict |
+| `formal_verification` | every published theorem is backed by a Lean 4 proof the kernel checked, with zero `sorry` |
 | `document_integrity` | `paper.typ` compiles to `paper.pdf` with **zero** Typst warnings |
 
 Artifacts land under `research/<topic-slug>/`: the hash-chained
