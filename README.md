@@ -203,6 +203,15 @@ The agent is equipped with a workspace-scoped developer toolbelt (`src/adaptive_
 - **`AskUserTool` (`ask_user`)**: Prompts the developer in the middle of development with multiple-choice buttons or free-text answers.
 - **`RunPythonReplTool` (`run_python_repl`)**: Runs scientific Python inside a restricted Bubblewrap process with no network or workspace mount.
 - **`VerifyEquationTool` (`verify_equation`)**: Checks exact SymPy substitution and denominator validity for a proposed root.
+- **`CompileTypstTool` (`compile_typst`)**: Compiles a Typst source to a publication PDF, resolving Typst from `PATH` or the `typst` Python wrapper. Any Typst warning fails the build.
+
+### Autonomous research tools (`src/adaptive_harness/tools/research_swarm.py`)
+
+These operate on a live `ResearchSwarm` rather than the workspace, and back the
+research mode described in section 5.1:
+
+- **`SpawnSubagentTool` (`spawn_subagent`)** / **`ScaleDivisionTool` (`scale_division`)**: grow or shrink a division's worker pool on demand.
+- **`VerifyProofTool` (`verify_proofs`)** / **`RunExperimentTool` (`run_experiments`)**: adjudicate the exact-derivation and seeded-replication gates.
 
 ---
 
@@ -223,6 +232,100 @@ adaptive-harness dev "run pytest on test_agent_and_tools.py"
 # Custom OpenRouter model
 adaptive-harness dev "refactor the storage layer" --key $OPENROUTER_API_KEY --model anthropic/claude-sonnet-4
 ```
+
+### 1.1 Autonomous Research Swarm (`research`)
+
+Give it a topic. It derives propositions, decides each one by executing a
+self-adjudicating derivation script, and publishes a mathematical paper stating
+the result — `PROVEN`, `DISPROVEN`, or `INCONCLUSIVE`. It does not audit research
+you did yourself; it does the research.
+
+```bash
+# Derive, prove, corroborate, and publish. No network requests, no cost.
+adaptive-harness research "pareto heavy tailed network delay: critical index and variance-optimal balanced routing"
+
+# Settle a specific algebraic claim directly
+adaptive-harness research "quadratic expansion" \
+    --claim "(x+y)**2 == x**2 + 2*x*y + y**2" --symbols x,y
+
+# A claim that is false is refuted, and that is a success
+adaptive-harness research "bad claim" --claim "(x+y)**2 == x**2 + y**2" --symbols x,y
+```
+
+**How a claim is settled.** The kernel constructs a machine-checkable statement
+from a definition, writes a self-adjudicating script for it, and the exit code
+*is* the verdict:
+
+| Exit | Verdict | Meaning |
+| --- | --- | --- |
+| `0` | `PROVEN` | the difference `lhs - rhs` is identically zero |
+| `3` | `DISPROVEN` | an exact rational witness makes the difference nonzero |
+| other | `INCONCLUSIVE` | the attempt could not decide — never treated as a refutation |
+
+Refutation requires an *exhibited* counterexample, not a failure to simplify:
+`exp(x) == 1 + x` is refuted at `x = 1`, and `sqrt(x^2) == x` at `x = -1`, which
+is why the probe set includes negative points. A script that errors or times out
+is `INCONCLUSIVE`, because a broken proof attempt is not evidence against a claim.
+
+**No approximation is admissible.** Before execution every script is scanned by
+AST for floating-point literals and approximating calls (`float`, `evalf`, `N`),
+and rejected without running if it contains any. This is not decoration: it
+caught a genuine error in an early draft of the Pareto second moment, where the
+asserted `α·x_m²/((α−1)(α−2))` was wrong and SymPy's `α·x_m²/(α−2)` was right.
+
+**Five invariants**, all required simultaneously:
+
+| Invariant | Requirement |
+| --- | --- |
+| `mathematical_soundness` | every derivation is approximation-free and reached a clean verdict |
+| `empirical_replication` | every seeded simulation reproduced its prediction at 95% |
+| `adversarial_clearance` | the *reported verdict* is certified — no open objection, and for a refutation an exact witness |
+| `claim_adjudication` | the headline claim reached a decided verdict |
+| `document_integrity` | `paper.typ` compiles to `paper.pdf` with **zero** Typst warnings |
+
+Artifacts land under `research/<topic-slug>/`: the hash-chained
+`comm_ledger.jsonl`, `00_objective_spec.md` (including the derivation plan),
+`evidence/index.json`, `proofs/` and `experiments/` with their generated scripts
+and raw CSV, `figures/`, `03_adversarial_audit.md`, `bibliography.bib`,
+`convergence_history.json`, receipt indexes, and the generated `paper.typ` plus
+its `paper.pdf`.
+
+**The output is a real mathematical paper**, not a log: title, abstract,
+introduction, a notation table, numbered theorems each with explicit hypotheses,
+a formal statement typeset in 2D math, a proof ending in □, a consequence, and a
+verdict line — followed by empirical corroboration, the adversarial audit, a
+conclusion that matches the verdict, references, and appendices carrying the
+ledger and every receipt. A topic the kernel cannot formalise produces an
+explicit `INCONCLUSIVE` paper saying so, rather than a confident-sounding paper
+about nothing.
+
+**The loop is stagnation-limited, not turn-limited.** It runs until it converges
+or until it can *prove* more identical work cannot help. Progress means reaching
+a new *minimum* in outstanding gaps (a high-water mark), so a flapping invariant
+oscillating 4→3→4→3 cannot look like progress. After `--patience` no-progress
+cycles the worker budget doubles; when escalation cannot grow, the run concedes
+with an honest `STAGNATION_ABORT` and UNSOLVED.
+
+```python
+from adaptive_harness.research import ResearchSwarm, SwarmConfig
+
+swarm = ResearchSwarm("pareto heavy tailed network delay", root="research")
+swarm.run()
+print(swarm.claims.headline.value)   # PROVEN | DISPROVEN | INCONCLUSIVE
+print(swarm.claims.summary())
+```
+
+Attach the same engine to a normal agent task so a model can drive it mid-task:
+
+```bash
+adaptive-harness dev "settle whether balanced routing minimises delay variance" \
+    --research "balanced routing under heavy-tailed delay"
+```
+
+`--research TOPIC` exposes `spawn_subagent`, `scale_division`, `verify_proofs`,
+and `run_experiments`. Like the standalone command it defaults to mechanical
+mode and makes no network requests; the tools appear only in the investigative
+modes, never in `security`/audit.
 
 ### 2. Algorithmic Routing & Recovery Benchmarks
 ```bash
@@ -281,21 +384,23 @@ pytest tests/ -v
 ```
 
 ```text
-============================= 49 passed in 13.78s ==============================
-tests/test_agent_and_tools.py::test_llm_client_mock_mode PASSED          [  2%]
-tests/test_agent_and_tools.py::test_run_bash_tool PASSED                 [  4%]
-tests/test_agent_and_tools.py::test_file_ops_tools PASSED                [  6%]
-tests/test_agent_and_tools.py::test_workspace_tools PASSED               [  8%]
-tests/test_agent_and_tools.py::test_clarification_and_schema PASSED      [ 10%]
-tests/test_agent_and_tools.py::test_skill_classifier PASSED              [ 12%]
-tests/test_agent_and_tools.py::test_ambiguity_classifier PASSED          [ 14%]
-tests/test_agent_and_tools.py::test_complexity_router PASSED             [ 16%]
-tests/test_agent_and_tools.py::test_verification_classifier PASSED       [ 18%]
-tests/test_agent_and_tools.py::test_developer_agent_stream PASSED        [ 20%]
-tests/test_agent_and_tools.py::test_tui_app_headless[asyncio] PASSED     [ 22%]
-... [algorithmic strategies, benchmarks, calibration, and storage tests]
-============================= 49 passed in 13.78s ==============================
+============================= 257 passed in 36.37s =============================
+tests/test_agent_and_tools.py::test_llm_client_mock_mode PASSED          [  0%]
+tests/test_agent_and_tools.py::test_run_bash_tool PASSED                 [  0%]
+tests/test_agent_and_tools.py::test_file_ops_tools PASSED                [  1%]
+tests/test_research_swarm.py::test_proof_receipt_requires_exit_zero_and_exactness PASSED
+tests/test_research_swarm.py::test_experiment_requires_a_hashed_data_artifact PASSED
+tests/test_research_swarm.py::test_ledger_chain_verifies_and_detects_tampering PASSED
+tests/test_research_swarm.py::test_loop_aborts_on_a_flapping_invariant_instead_of_spinning PASSED
+tests/test_research_swarm.py::test_solved_run_produces_a_verified_ledger_and_a_pdf PASSED
+... [strategies, benchmarks, calibration, swarm, TUI, and skills tests]
+============================= 257 passed in 36.37s ==============================
 ```
+
+The research tests are deliberately adversarial about the research machinery
+itself: they assert that a flaky invariant cannot be mistaken for progress, that
+an unsolved run stays terminated and reports UNSOLVED, and that a solved run's
+PDF is byte-for-byte generated from its receipts.
 
 ---
 
@@ -331,15 +436,28 @@ harness/
 │       ├── tui/                           # Textual Terminal User Interface
 │       │   ├── app.py                     # Full TUI application & slash commands
 │       │   └── widgets.py                 # Telemetry panel & Clarification modal
-│       ├── cli.py                         # Typer CLI (tui, dev, train, benchmark, etc.)
+│       ├── research/                      # Autonomous research swarm
+│       │   ├── swarm.py                   # Executive Director, divisions, convergence loop
+│       │   ├── ledger.py                  # Hash-chained comm_ledger.jsonl writer
+│       │   ├── proof.py                   # Exact SymPy proof receipts (exit 0, no floats)
+│       │   ├── experiment.py              # Seeded replication, data hashes, 95% intervals
+│       │   ├── gate.py                    # Invariant gate & Relentless Convergence Loop
+│       │   ├── paper.py                   # Typst paper generated from receipts
+│       │   ├── typst.py                   # Typst resolution & warning-free compilation
+│       │   ├── figures.py                 # Deterministic vector SVG figures
+│       │   └── roles.py                   # Divisions, leaders, and worker roles
+│       ├── cli.py                         # Typer CLI (tui, dev, research, train, benchmark)
 │       ├── harness/                       # Algorithmic routing harness & verifier
 │       ├── models/                        # Domain models, feature extraction, calibration
 │       ├── data/                          # Dataset generator and SQLite repository
 │       ├── strategies/                    # Specialized algorithmic problem solvers
 │       ├── evaluation/                    # Ablation benchmarks, ECE, & matplotlib plots
 │       └── dashboard/                     # Rich console output formatting
+├── research/                              # Research artifacts (one dir per topic)
+│   └── <topic-slug>/                      # Ledger, proofs, experiments, figures, paper.pdf
 └── tests/
     ├── test_agent_and_tools.py            # Phase 2 test suite (TUI, agent, classifiers, tools)
+    ├── test_research_swarm.py             # Receipts, ledger, invariant gate, publication
     └── test_*.py                          # Strategy, benchmark, and calibration unit tests
 ```
 

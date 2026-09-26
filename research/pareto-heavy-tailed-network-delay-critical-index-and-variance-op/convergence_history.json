@@ -1,0 +1,88 @@
+{
+  "solved": true,
+  "stop_reason": "CONVERGED",
+  "cycles": 2,
+  "workers_spawned": 2,
+  "gate": {
+    "cycle": 2,
+    "satisfied": true,
+    "fingerprint": "7139f2fbed15a5df",
+    "statuses": [
+      {
+        "invariant": "mathematical_soundness",
+        "satisfied": true,
+        "detail": "all 7 derivation(s) reached a clean verdict",
+        "evidence": [
+          "prop-01 exit 0 (sha256:274cea20fd86)",
+          "prop-02 exit 0 (sha256:e601edfbab0b)",
+          "prop-03 exit 0 (sha256:47f56df3f965)",
+          "prop-04 exit 0 (sha256:12c53d615813)",
+          "prop-05 exit 0 (sha256:1ffa46bc4f27)",
+          "prop-06 exit 0 (sha256:0a78a11e4110)",
+          "prop-07 exit 0 (sha256:468320933980)"
+        ]
+      },
+      {
+        "invariant": "empirical_replication",
+        "satisfied": true,
+        "detail": "all 2 experiment(s) replicated at seed 20260926",
+        "evidence": [
+          "exp-01 REPLICATED seed=20260926",
+          "exp-02 REPLICATED seed=20260926"
+        ]
+      },
+      {
+        "invariant": "adversarial_clearance",
+        "satisfied": true,
+        "detail": "2 red-team worker(s) cleared 7 proved claim(s); audit log written",
+        "evidence": [
+          "adversarial_red_team_auditor_01",
+          "adversarial_falsifier_02"
+        ]
+      },
+      {
+        "invariant": "document_integrity",
+        "satisfied": true,
+        "detail": "paper.pdf built cleanly (155975 bytes, typst 0.15.1 (9dfd3a08))",
+        "evidence": []
+      },
+      {
+        "invariant": "claim_adjudication",
+        "satisfied": true,
+        "detail": "verdict PROVEN: Headline PROVEN of 7 proposition(s) (7 proven, 0 disproven, 0 inconclusive).",
+        "evidence": [
+          "PROP-01 PROVEN",
+          "PROP-02 PROVEN",
+          "PROP-03 PROVEN",
+          "PROP-04 PROVEN",
+          "PROP-05 PROVEN",
+          "PROP-06 PROVEN",
+          "PROP-07 PROVEN"
+        ]
+      }
+    ]
+  },
+  "history": [
+    {
+      "index": 1,
+      "gaps": [
+        "adversarial_clearance"
+      ],
+      "diagnosis": "adversarial_clearance: no red-team worker has returned a verdict yet",
+      "workers_spawned": [
+        "adversarial_red_team_auditor_01",
+        "adversarial_falsifier_02"
+      ],
+      "gate_fingerprint": "9fce4050e582e800",
+      "elapsed_s": 2.86
+    },
+    {
+      "index": 2,
+      "gaps": [],
+      "diagnosis": "none",
+      "workers_spawned": [],
+      "gate_fingerprint": "7139f2fbed15a5df",
+      "elapsed_s": 0.59
+    }
+  ]
+}

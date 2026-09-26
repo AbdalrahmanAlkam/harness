@@ -43,3 +43,56 @@ The runtime overseer examines each tool result for loops, unsupported claims, st
 The small-terminal layout hides chat and status panels below 12 rows so the prompt remains above the Footer. Expand the terminal to restore the full view. A synthetic pytest log was compacted from 78,071 to 1,460 characters in a local check, and a 500-function Python source was reduced to a 78-character AST slice; these are measured examples, while actual model token savings vary. This checkout has no cached SemIf checkpoint, so CPU/GPU neural inference latency must be measured on the target machine after weights are installed. The full test suite passed with warnings treated as errors during the Phase 5 audit.
 
 The tool suite has local file search, bash, pytest, and restricted arithmetic. Set `BRAVE_SEARCH_API_KEY` to enable web search with source URLs in research mode. The domain mode changes prompts and available tools, while verification reports checks that actually ran. The arithmetic tool checks expressions but does not replace symbolic proof or numerical convergence testing. See [the implementation brief](docs/implementation-prompt.md) for the broader product requirements and acceptance criteria.
+
+## Autonomous research swarm
+
+`adaptive-harness research "<topic>"` runs a self-scaling investigation that will not report a result until every claim is backed by an executable receipt. An Executive Director owns the objective and the convergence loop; Literature, Theory, Empirical, and Adversarial Leads each own a methodologically distinct line of attack and spawn as many workers as the outstanding gaps justify.
+
+The default is **mechanical mode**, which calls no language model: the Director, the divisions, the gates, and the paper are all local and deterministic, so a default run costs nothing and makes no network requests. Pass `--author` to have a live model draft the artifacts on top; the mechanical gates still adjudicate them either way. This is why a default run shows no OpenRouter traffic.
+
+```bash
+# Zero-cost, zero-network run
+adaptive-harness research "optimal routing under heavy-tailed network delay"
+
+# Pinned seed, explicit objective, live authoring
+adaptive-harness research "variance-minimising routing policy" \
+    --objective "Derive the policy and the regime where it is well-posed" \
+    --seed 20260926 --author
+
+# Stop the loop after N cycles; the verdict stays honest either way
+adaptive-harness research "some topic" --max-cycles 3
+```
+
+A topic is `SOLVED` only when all four invariants hold at once. `mathematical_soundness` requires every script in `proofs/` to be free of floating-point literals and approximating calls (`float`, `evalf`, `N`) and to exit 0 — the scan happens before execution, so an approximate "proof" is rejected without running. `empirical_replication` requires every script in `experiments/` to reproduce its prediction at a pinned seed and emit a hashed data artifact. `adversarial_clearance` requires no open red-team counterexample. `document_integrity` requires `paper.typ` to compile to `paper.pdf` with zero Typst warnings. Typst is resolved from `PATH`, then the `typst` Python wrapper, then reported unavailable; the `compile_typst` tool does the same from inside a task.
+
+The loop is not turn-limited. It is stagnation-limited: it keeps working until it converges or until it can prove that more identical work cannot help. Progress means reaching a new *minimum* in outstanding gaps, tracked as a high-water mark, so a flapping invariant that oscillates cannot masquerade as progress. After `--patience` no-progress cycles the worker budget doubles; when escalation can no longer grow, the run reports `STAGNATION_ABORT` and an honest **UNSOLVED** verdict. `--max-cycles` and the absolute ceiling likewise report `BUDGET_EXHAUSTED` and UNSOLVED — never a false success.
+
+Artifacts land in `research/<topic-slug>/`: the hash-chained `comm_ledger.jsonl` message tree, `00_objective_spec.md`, evidence records, `proofs/`, `experiments/` with their raw CSV, vector `figures/`, `03_adversarial_audit.md`, `bibliography.bib` generated from evidence records only, `convergence_history.json`, the receipt indexes, and the generated `paper.typ` plus its `paper.pdf`. Because the paper is generated from receipts, nothing can be typeset that was not proven or measured, and a withdrawn receipt disappears on the next build. Opening a tampered ledger reports through `verify()` rather than raising, so an auditor can always inspect the evidence of tampering.
+
+The worked example in `research/routing-policy-under-heavy-tailed-delay/` derives a variance-minimising routing split for heavy-tailed delays and, more usefully, establishes the regime where that objective is even well-posed: the variance of a Pareto delay is infinite for tail index `alpha <= 2`, so a variance-minimising policy does not exist on part of the empirically observed range and must be replaced by a robust objective. Three exact SymPy derivations and two seeded experiments back that, and the run converges in two cycles.
+
+## What a research run actually does
+
+`adaptive-harness research "<topic>"` does not audit research you already did; it does the research. The kernel reads the topic, constructs machine-checkable propositions from definitions, writes a self-adjudicating SymPy script for each, executes it, and reads the verdict off the exit code: `0` is PROVEN, `3` is DISPROVEN, anything else is INCONCLUSIVE. It then generates the seeded simulations that corroborate those propositions, runs a red team over the result, and publishes a paper.
+
+Try it on a topic you already know the answer to:
+
+```bash
+adaptive-harness research "pareto heavy tailed network delay: critical index and variance-optimal balanced routing"
+```
+
+Seven propositions are derived, all seven hold, and the run reports `PROVEN`. The interesting one is Theorem 4: for a Pareto delay of index at most two the second moment diverges, so the variance is infinite under *every* allocation and no variance-minimising routing policy exists at all. The paper says that, with the logarithmic divergence at the critical index shown exactly.
+
+To watch a claim fall, hand it a false identity:
+
+```bash
+adaptive-harness research "quadratic expansion" --claim "(x+y)**2 == x**2 + y**2" --symbols x,y
+```
+
+This reports `DISPROVEN` with the witness `counterexample at x=1, y=1: lhs - rhs = 2`, and that is a *successful* run: settling the question either way is the goal, so the red team certifies the refutation rather than the claim. The witness matters — refutation requires an exhibited counterexample, not a failure to simplify. The probe set deliberately includes negative points, which is why `sqrt(x**2) == x` is caught at `x = -1` rather than surviving on positive probes.
+
+Every derived script is scanned for floating-point literals and approximating calls before it runs, so an "exact-looking" proof that secretly calls `N()` is rejected without executing. That check earned its place immediately: it caught a real error in the first draft of the Pareto second moment, where the asserted closed form was missing a factor that SymPy got right.
+
+A topic the kernel cannot formalise is not a failure to hide. `adaptive-harness research "zzz qqq unmatchable"` produces a paper that explicitly reports INCONCLUSIVE, states that no derivation strategy matched, and names what input would let it proceed. Prefer that to a confident paper about nothing.
+
+Artifacts land in `research/<topic-slug>/` — the hash-chained ledger, the derivation plan, the generated proof and experiment scripts with their raw data, the figures, the audit log, the bibliography, the convergence history, the receipts, and the paper. Because the paper is generated from receipts, nothing can be typeset that was not derived and checked.

@@ -222,6 +222,11 @@ def dev(
     step_policy: str = typer.Option("classifier", "--step-policy", help="Tool-step limits: classifier (default; stops circling loops), fixed (hardcoded per-thinking budgets), unbounded"),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", min=1, help="Explicit tool-step cap overriding the step policy"),
     swarm: bool = typer.Option(False, "--swarm", help="Expose delegate_subagent to the coordinator agent"),
+    research_topic: Optional[str] = typer.Option(
+        None, "--research", help="Attach a research swarm for TOPIC and expose spawn_subagent, "
+                                 "scale_division, verify_proofs, and run_experiments"),
+    research_root: Path = typer.Option(Path("research"), "--research-root",
+                                       help="Artifact tree root for --research"),
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
     classifier_model: Optional[str] = typer.Option(None, "--classifier-model", help="Classifier model ID or ONNX directory"),
     classifier_endpoint: Optional[str] = typer.Option(None, "--classifier-endpoint", help="Classifier endpoint"),
@@ -308,6 +313,12 @@ def dev(
                            forced_mode=selected_mode, forced_thinking=selected_thinking,
                            safety_profile=safety or "turbo", swarm_enabled=swarm,
                            step_policy=step_policy, max_steps=max_steps)
+    if research_topic:
+        # Mechanical by default: the swarm's gates are local and deterministic,
+        # so attaching it costs nothing until a live model authors artifacts.
+        research_swarm = agent.enable_research(research_topic, root=research_root)
+        console.print(f"[dim]Research swarm attached: {research_swarm.workspace.root} "
+                      f"(mode: {research_swarm.config.author_mode})[/dim]")
     catalog = SkillCatalog(workspace)
     for name in skill or []:
         try:
@@ -642,6 +653,96 @@ def report(
         for strat, count in stats["strategy_distribution"].items():
             console.print(f"  {strat:15s}: {count}")
     console.print()
+
+
+@app.command()
+def research(
+    topic: str = typer.Argument(..., help="Research topic, e.g. 'optimal routing under heavy-tailed delay'"),
+    root: Path = typer.Option(Path("research"), "--root", help="Artifact tree root"),
+    objective: str = typer.Option("", "--objective", help="Explicit statement of what must be proven"),
+    claim: str = typer.Option("", "--claim",
+                              help="A checkable claim as 'lhs == rhs' in SymPy syntax, decided directly"),
+    symbols: str = typer.Option("", "--symbols", help="Comma-separated free symbols for --claim"),
+    seed: int = typer.Option(20260926, "--seed", help="Pinned seed for every experiment"),
+    max_cycles: Optional[int] = typer.Option(None, "--max-cycles",
+                                             help="Operator safety valve; the loop is not turn-limited by default"),
+    patience: int = typer.Option(2, "--patience", help="No-progress cycles tolerated before escalating"),
+    max_workers: int = typer.Option(8, "--max-workers", help="Per-division worker cap"),
+    author: bool = typer.Option(False, "--author", help="Let a live LLM author the artifacts"),
+):
+    """Runs the autonomous research swarm and publishes a paper with a verdict.
+
+    The kernel derives machine-checkable propositions from the topic, decides each
+    one by executing a self-adjudicating derivation script, and reports the
+    headline result as PROVEN, DISPROVEN, or INCONCLUSIVE. A paper is published
+    either way; the verdict is never inferred from the topic text.
+
+    The loop is stagnation-limited rather than turn-limited: it exits on
+    convergence, or when a cycle provably cannot change the verdict and the
+    escalated worker pool does not help.
+    """
+    from adaptive_harness.research.swarm import ResearchSwarm, SwarmConfig
+
+    author_fn = None
+    if author:
+        try:
+            author_fn = _llm_author()
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator
+            console.print(f"[yellow]Live authoring disabled: {type(exc).__name__}: {exc}[/yellow]")
+
+    config = SwarmConfig(max_cycles=max_cycles, stagnation_patience=patience,
+                         max_workers_per_division=max_workers, seed=seed, author=author_fn,
+                         claim=claim,
+                         claim_symbols=tuple(name.strip() for name in symbols.split(",") if name.strip()))
+    swarm = ResearchSwarm(topic, root=root, config=config)
+    console.print(f"[bold cyan]Research swarm[/bold cyan] {topic}")
+    console.print(f"[dim]strategy: {swarm.plan.strategy} | propositions: "
+                  f"{len(swarm.plan.propositions)}[/dim]")
+    if swarm.plan.notes:
+        console.print(f"[dim]{swarm.plan.notes}[/dim]")
+    console.print(f"[dim]artifacts: {swarm.workspace.root}[/dim]\n")
+    outcome = swarm.run(objective=objective,
+                        on_status=lambda message: console.print(f"[dim]{message}[/dim]"))
+
+    verdict = swarm.claims.headline
+    color = {"PROVEN": "green", "DISPROVEN": "red"}.get(verdict.value, "yellow")
+    console.print(f"\n[bold {color}]VERDICT: {verdict.value}[/bold {color}]")
+    console.print(swarm.claims.summary())
+    for item in swarm.claims.adjudications:
+        console.print(f"  [dim]{item.prop_id}[/dim] {item.verdict.value:<13} {item.statement[:66]}")
+    console.print()
+    for line in outcome.render().splitlines():
+        console.print(line)
+    if swarm._last_report is not None:
+        for status in swarm._last_report.statuses:
+            mark = "[green]PASS[/green]" if status.satisfied else "[red]FAIL[/red]"
+            console.print(f"  {mark} {status.invariant.value}: {status.detail}")
+    if outcome.pdf:
+        console.print(f"\n[bold green]Paper:[/bold green] {outcome.pdf}")
+    console.print(f"[dim]Ledger: {swarm.workspace.ledger_path}[/dim]")
+    if not outcome.solved:
+        raise typer.Exit(code=2)
+
+
+def _llm_author():
+    """Build an authoring callback that drives a live model per artifact."""
+    from adaptive_harness.llm.client import LLMClient
+    from adaptive_harness.research.roles import Division
+
+    client = LLMClient()
+    if client.is_mock:
+        raise RuntimeError("no live model is configured; rerun without --author")
+
+    def author(division: Division, artefact: str, instruction: str) -> str:
+        from adaptive_harness.prompts import PromptRegistry
+        registry = PromptRegistry()
+        system = registry.get(f"research.division.{division.value}")
+        response = client.complete(messages=[{"role": "system", "content": system},
+                                            {"role": "user", "content": instruction}],
+                                   model=client.default_model)
+        return response.content or ""
+
+    return author
 
 
 if __name__ == "__main__":

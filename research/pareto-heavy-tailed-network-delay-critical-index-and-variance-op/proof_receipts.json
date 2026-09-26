@@ -1,0 +1,65 @@
+[
+  {
+    "theorem_id": "prop-01",
+    "script": "/home/aaa/Documents/projects/harness/research/pareto-heavy-tailed-network-delay-critical-index-and-variance-op/proofs/prop-01.py",
+    "hash": "sha256:274cea20fd86792b89acdc61cc36b263ba7797411b98bc43f3f7a593a83cf0d6",
+    "status": "VERIFIED_EXIT_0",
+    "exit_code": 0,
+    "duration_ms": 415.84,
+    "violations": []
+  },
+  {
+    "theorem_id": "prop-02",
+    "script": "/home/aaa/Documents/projects/harness/research/pareto-heavy-tailed-network-delay-critical-index-and-variance-op/proofs/prop-02.py",
+    "hash": "sha256:e601edfbab0b5424fa929a24fd92c8e90983aa3a9c1179df93d5db85a1b5e9f6",
+    "status": "VERIFIED_EXIT_0",
+    "exit_code": 0,
+    "duration_ms": 400.67,
+    "violations": []
+  },
+  {
+    "theorem_id": "prop-03",
+    "script": "/home/aaa/Documents/projects/harness/research/pareto-heavy-tailed-network-delay-critical-index-and-variance-op/proofs/prop-03.py",
+    "hash": "sha256:47f56df3f9650876297139235bcc6b7687964f923bec6c685958708ee89389c8",
+    "status": "VERIFIED_EXIT_0",
+    "exit_code": 0,
+    "duration_ms": 451.22,
+    "violations": []
+  },
+  {
+    "theorem_id": "prop-04",
+    "script": "/home/aaa/Documents/projects/harness/research/pareto-heavy-tailed-network-delay-critical-index-and-variance-op/proofs/prop-04.py",
+    "hash": "sha256:12c53d615813c9568aa0c296a8bfb91d723edfbf0d6f7f947c8e34d25ae7f80c",
+    "status": "VERIFIED_EXIT_0",
+    "exit_code": 0,
+    "duration_ms": 383.6,
+    "violations": []
+  },
+  {
+    "theorem_id": "prop-05",
+    "script": "/home/aaa/Documents/projects/harness/research/pareto-heavy-tailed-network-delay-critical-index-and-variance-op/proofs/prop-05.py",
+    "hash": "sha256:1ffa46bc4f2732fb075b5e5ccfb8447e0b93e0490cc21a39e1a390517a6f19f9",
+    "status": "VERIFIED_EXIT_0",
+    "exit_code": 0,
+    "duration_ms": 372.67,
+    "violations": []
+  },
+  {
+    "theorem_id": "prop-06",
+    "script": "/home/aaa/Documents/projects/harness/research/pareto-heavy-tailed-network-delay-critical-index-and-variance-op/proofs/prop-06.py",
+    "hash": "sha256:0a78a11e4110f087f6d8abe597ad6a16fd1227b465c2f87989056dc78a9fd2a3",
+    "status": "VERIFIED_EXIT_0",
+    "exit_code": 0,
+    "duration_ms": 300.6,
+    "violations": []
+  },
+  {
+    "theorem_id": "prop-07",
+    "script": "/home/aaa/Documents/projects/harness/research/pareto-heavy-tailed-network-delay-critical-index-and-variance-op/proofs/prop-07.py",
+    "hash": "sha256:468320933980c5b88a6c32ee90e929326803919a71daaf88cb44f687480254b3",
+    "status": "VERIFIED_EXIT_0",
+    "exit_code": 0,
+    "duration_ms": 287.21,
+    "violations": []
+  }
+]

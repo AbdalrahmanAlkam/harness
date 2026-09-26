@@ -6,6 +6,108 @@ work in this push; earlier history is summarized in `git log`.
 ## [Unreleased]
 
 ### Added
+- **Autonomous hierarchical research swarm** (`adaptive-harness research "<topic>"`,
+  `src/adaptive_harness/research/`). An Executive Director owns the objective and
+  the Relentless Convergence Loop; four Division Leaders (Literature, Theory,
+  Empirical, Adversarial) each spawn an unbounded worker pool on demand via
+  `spawn_subagent(parent_id, role_name, directive, allowed_tools, budget_tokens)`.
+  A topic is reported `SOLVED` only when all four invariants hold simultaneously:
+  exact proofs exiting 0, seeded replications inside a 95% interval, red-team
+  clearance, and a warning-free `paper.typ` → `paper.pdf` build.
+- **Proof receipts with mechanical exactness enforcement.** Every script in
+  `proofs/` is scanned by AST for floating-point literals and approximating calls
+  (`float`, `evalf`, `N`, …) *before* execution, then run in a subprocess with
+  networking disabled; only exit code 0 admits it as evidence. This caught a real
+  error in the harness's own first draft of the Pareto second moment.
+- **Empirical replication receipts.** Experiments run under an explicitly pinned
+  seed, their data artifacts are hashed, and declared predictions are adjudicated
+  against a Student-t 95% interval with a small-sample correction.
+- **Hash-chained `comm_ledger.jsonl`.** Append-only inter-agent ledger where each
+  entry carries the previous entry's SHA-256. `verify()` recomputes the whole
+  chain and detects edits, reordering, and truncation. Opening a tampered ledger
+  reports through `verify()` rather than raising, so an auditor can always
+  inspect the evidence of tampering.
+- **Relentless Convergence Loop that is provably terminating.** The loop is
+  stagnation-limited rather than turn-limited. Progress is a new *minimum* in
+  outstanding gaps (a high-water mark), which makes a flapping invariant
+  oscillating 4→3→4→3 impossible to mistake for progress; stagnation escalates
+  the worker budget, and when escalation can no longer grow the run concedes with
+  an honest `STAGNATION_ABORT` / UNSOLVED rather than a false success.
+- **`compile_typst` tool and generated papers.** Typst is resolved from `PATH`,
+  then the `typst` Python wrapper, then reported as unavailable. Compilation
+  treats *any* Typst diagnostic as a build break, because a paper with an
+  unresolved reference or a bad figure path is a defect, not a warning.
+  `paper.typ` is generated from receipts, so nothing can be typeset that was not
+  proven or measured.
+- **Deterministic vector figures** (`research/figures.py`) rendered as SVG, so
+  the same receipts always yield byte-identical figures.
+- **Research division prompts** (`research.division.*`, `research.director`) in
+  the central prompt registry, editable without touching code.
+- **Model-facing research tools** (`spawn_subagent`, `scale_division`,
+  `verify_proofs`, `run_experiments`) plus `DeveloperAgent.enable_research()` and
+  `adaptive-harness dev --research TOPIC`, so a live agent can recruit and retire
+  workers mid-task instead of being locked to a fixed roster. The tools and the
+  Director system-prompt framing are gated by the same predicate and appear only
+  in the investigative modes — never in `security`/audit.
+
+### Added
+- **Autonomous derivation kernel** (`research/synthesis.py`). This is what makes
+  research mode *research* rather than verification: given a topic, the kernel
+  constructs machine-checkable propositions from definitions, emits a
+  self-adjudicating SymPy script for each, and lets the exit code decide the
+  verdict (`0` = PROVEN, `3` = DISPROVEN, anything else = INCONCLUSIVE). It also
+  generates the corroborating simulations. A bare topic now yields proofs,
+  experiments, a verdict, and a paper with no manual preparation.
+- **Three-valued claim adjudication** (`research/claim.py`). `PROVEN` /
+  `DISPROVEN` / `INCONCLUSIVE` / `UNTESTED`, with the headline verdict prioritising
+  a single refutation over any number of proofs, since one broken sub-claim sinks
+  the claim. Refutation requires an *exhibited* exact rational witness, so
+  `exp(x) == 1+x` falls at `x=1` and `sqrt(x^2) == x` at `x=-1`; a script that
+  merely fails to simplify is never counted as evidence against a claim.
+- **`claim_adjudication` invariant and `--claim` / `--symbols` CLI options.** A
+  supplied identity in SymPy syntax is decided directly instead of being matched
+  against the topic library.
+- **The paper is now a mathematical paper** (`research/paper.py`): title,
+  abstract, introduction, notation table, numbered theorems with explicit
+  hypotheses, statements typeset in 2D math, proofs ending in a qed box, a
+  consequence and a verdict line per theorem, then empirical corroboration, the
+  adversarial audit, a conclusion matching the verdict, references, and appendices
+  carrying the ledger and receipts. Section numbers are generated rather than
+  delegated to a Typst counter, which prefixed every heading with a spurious "0.".
+- **Self-adjudicating experiment generator** with pinned seeds, Student-t 95%
+  intervals, and a rank-order prediction that a wrong theory would break.
+
+### Fixed
+- **Live mode could never converge.** Any non-empty falsification response was read
+  as a counterexample, so with `--author` the adversarial gate never cleared. The
+  red team now requires a structured verdict
+  (`{"falsified": true|false, "finding": "..."}`); an unparseable reply is recorded
+  as inconclusive and grants no clearance, so a chatty model cannot rubber-stamp a
+  claim. `FalsificationVerdict.parse` covers the ambiguous cases explicitly.
+- **Vacuous red-team clearance.** Adversarial clearance passed even when no proof
+  existed, letting a run clear a claim nobody had made. It now requires a claim to
+  exist first.
+- **Runaway audit-log growth in the convergence loop.** A gate that oscillated
+  between gap counts reset the stagnation counter on every "improvement",
+  producing an unbounded loop that appended ~15,000 ledger entries per second
+  and grew `comm_ledger.jsonl` past 2 GB. Progress is now measured against a
+  monotone high-water mark, receipts are recorded once per distinct verdict
+  rather than once per evaluation, and an absolute cycle ceiling guarantees
+  termination.
+- **Quadratic ledger reads.** `read_raw()` re-parsed the entire ledger on every
+  read, and the audit log renders the message tree each cycle. Parses are now
+  cached on `(size, mtime)`, invalidated on append or external edit.
+- **Typst 0.15 compatibility.** `raw()` takes a string rather than content or
+  `text=`; `width` belongs to `image()` rather than `figure()`; and escaping `_`
+  inside a string literal injected a backslash that made figure paths unloadable.
+  Added a separate literal escaper for string contexts.
+
+### Notes
+- The research swarm defaults to **mechanical mode**: no language model is called
+  unless `--author` is passed, so a default run makes zero network requests and
+  costs nothing. All verification is local and deterministic.
+
+### Added (earlier)
 - **Classifier-driven tool-step policy** (`--step-policy classifier|fixed|unbounded`,
   `--max-steps N`, TUI `/steps`). The default `classifier` policy runs without a
   fixed step cap: the runtime overseer injects a visible stop-circling system

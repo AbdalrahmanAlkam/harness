@@ -38,6 +38,7 @@ from adaptive_harness.tools.plotting import PlotTerminalTool
 from adaptive_harness.agent.compaction import rank_search_results
 from adaptive_harness.data.preferences import ClarificationMemory
 from adaptive_harness.tools.research import WebSearchTool
+from adaptive_harness.tools.research_swarm import CompileTypstTool
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 from adaptive_harness.tools.delegation import DelegateSubagentTool
 from adaptive_harness.agent.skills import SkillCatalog
@@ -193,12 +194,15 @@ class DeveloperAgent:
             PlotTerminalTool(),
             VerifyEquationTool(),
             AskUserTool(callback=self._handle_clarification),
+            CompileTypstTool(workspace_root=workspace_root, allow_install=False),
         ]
         if WebSearchTool().api_key:
             default_tools.append(WebSearchTool())
         tools_list = tools if tools is not None else default_tools
         self.tools: Dict[str, Tool] = {t.name: t for t in tools_list}
         self.swarm_enabled = False
+        self.research_enabled = False
+        self.research_swarm: Any = None
         if swarm_enabled:
             self.enable_swarm(True)
         self.messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
@@ -223,6 +227,58 @@ class DeveloperAgent:
                 on_event=getattr(self, "subagent_event_callback", None))
         else:
             self.tools.pop("delegate_subagent", None)
+
+    def enable_research(self, topic: str | None = None, *,
+                        root: str | Path = "research",
+                        config: Any = None) -> Any:
+        """Attach a live research swarm and its scaling tools to this agent.
+
+        This is the model-facing side of the research engine: it registers
+        ``spawn_subagent``, ``scale_division``, ``verify_proofs``, and
+        ``run_experiments`` so a Director can recruit and retire workers
+        mid-task instead of being locked to a fixed roster. Calling it without
+        a topic re-uses the existing swarm; the returned object is the
+        :class:`ResearchSwarm` driving it.
+        """
+        from adaptive_harness.research.swarm import ResearchSwarm
+        from adaptive_harness.tools.research_swarm import (RunExperimentTool, ScaleDivisionTool,
+                                                           SpawnSubagentTool, VerifyProofTool)
+
+        if getattr(self, "research_swarm", None) is None or topic:
+            self.research_swarm = ResearchSwarm(topic or "research", root=root, config=config)
+        swarm = self.research_swarm
+        self.research_enabled = True
+        self.tools["spawn_subagent"] = SpawnSubagentTool(
+            swarm, on_spawn=getattr(self, "research_event_callback", None))
+        self.tools["scale_division"] = ScaleDivisionTool(swarm)
+        self.tools["verify_proofs"] = VerifyProofTool(swarm)
+        self.tools["run_experiments"] = RunExperimentTool(swarm)
+        return swarm
+
+    def disable_research(self) -> None:
+        """Detach the research swarm and its tools."""
+        self.research_enabled = False
+        self.research_swarm = None
+        for name in ("spawn_subagent", "scale_division", "verify_proofs", "run_experiments"):
+            self.tools.pop(name, None)
+
+    def _research_director_prompt(self) -> str:
+        """Director framing plus the exact artifact contract each tool enforces."""
+        swarm = getattr(self, "research_swarm", None)
+        if swarm is None:
+            return ""
+        from adaptive_harness.research.roles import DIVISION_SPECS
+        divisions = "; ".join(f"{spec.leader_title}: {spec.objective}"
+                              for spec in DIVISION_SPECS.values())
+        return ("\n" + self.prompts.get("research.director")
+                + f"\nTopic: {swarm.topic}\nArtifact root: {swarm.workspace.root}\n"
+                + f"Divisions: {divisions}\n"
+                + "Write proofs into proofs/ as exact SymPy scripts that assert a symbolic identity: "
+                  "floating-point literals, float(), evalf(), and N() are rejected before execution, "
+                  "and only exit code 0 is admitted. Write experiments into experiments/ as seeded "
+                  "scripts that emit a CSV artifact. Use spawn_subagent to recruit a worker for one "
+                  "specific gap and scale_division to resize a pool; use verify_proofs and "
+                  "run_experiments to adjudicate. Never claim a result that has no receipt.")
 
     def set_workspace(self, path: str | Path) -> None:
         target = Path(path).expanduser().resolve()
@@ -506,9 +562,14 @@ class DeveloperAgent:
         skill_guidance = "\n".join(
             f"Active skill: {skill.title}. {skill.instructions} Completion checks: {', '.join(skill.invariants) or 'none'}."
             for skill in selected_skills)
+        # Research orchestration belongs to the investigative modes only. An audit
+        # reviews code and must neither recruit a swarm nor be told it is the
+        # Director, so the framing and the tools are gated by the same predicate.
+        research_active = self.research_enabled and domain_res.mode != DomainMode.AUDIT
         self.messages[0] = {"role": "system", "content": self.system_prompt
                             + self.prompts.get("system.workspace_line") + str(self.workspace_root)
                             + ("\n" + self.prompts.get("system.swarm_coordinator") if self.swarm_enabled else "")
+                            + (self._research_director_prompt() if research_active else "")
                             + self.prompts.get("system.mode_line") + domain_res.mode.value + ". "
                             + self.prompts.get(f"domain.guidance.{domain_res.mode.value}")
                             + "\n" + self.prompts.get("system.tool_guidance")
@@ -539,7 +600,7 @@ class DeveloperAgent:
         domain_tool_names = {
             DomainMode.CODING: set(self.tools) - {"check_convergence"},
             DomainMode.RESEARCH: {"read_file", "write_file", "list_directory", "search_files", "web_search", "run_bash", "calculate", "plot_terminal", "ask_user"},
-            DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "plot_terminal", "ask_user"},
+            DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "plot_terminal", "ask_user", "compile_typst"},
             DomainMode.AUDIT: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user"},
         }[domain_res.mode]
         if self.safety_profile == "turbo":
@@ -552,6 +613,9 @@ class DeveloperAgent:
                                       "edit_file", "run_bash", "run_pytest"} & set(self.tools))
         if self.swarm_enabled and domain_res.mode != DomainMode.AUDIT:
             domain_tool_names.add("delegate_subagent")
+        if research_active:
+            domain_tool_names.update({"spawn_subagent", "scale_division",
+                                      "verify_proofs", "run_experiments"} & set(self.tools))
         tool_schemas = [t.to_openai_schema() for t in self.tools.values() if t.name in domain_tool_names]
         yield AgentEvent("specialized_skill", {
             "skills": [{"name": skill.name, "title": skill.title, "category": skill.category,

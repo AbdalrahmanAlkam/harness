@@ -6,6 +6,9 @@ from adaptive_harness.tools.file_ops import ReadFileTool, WriteFileTool, EditFil
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 from adaptive_harness.tools.clarification import AskUserTool
 from adaptive_harness.tools.testing import RunPytestTool
+from adaptive_harness.tools.research_swarm import (CompileTypstTool, RunExperimentTool,
+                                                   ScaleDivisionTool, SpawnSubagentTool,
+                                                   VerifyProofTool)
 
 __all__ = [
     "Tool",
@@ -18,4 +21,9 @@ __all__ = [
     "SearchFilesTool",
     "AskUserTool",
     "RunPytestTool",
+    "CompileTypstTool",
+    "RunExperimentTool",
+    "ScaleDivisionTool",
+    "SpawnSubagentTool",
+    "VerifyProofTool",
 ]
