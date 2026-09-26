@@ -21,6 +21,7 @@ class Division(str, Enum):
     THEORY = "theory"
     EMPIRICAL = "empirical"
     ADVERSARIAL = "adversarial"
+    FORMAL = "formal"
 
 
 class Clearance(str, Enum):
@@ -67,6 +68,12 @@ DIVISION_SPECS: Mapping[Division, DivisionSpec] = {
         "cases, and unstated assumptions; grant clearance only when attempts fail.",
         ("Red Team Auditor", "Falsifier", "Assumption Hunter"),
         ("read_file", "search_files", "list_directory", "run_bash", "run_python_repl")),
+    Division.FORMAL: DivisionSpec(
+        Division.FORMAL, "Formal Proof Lead",
+        "Formalise each proposition in Lean 4 and have the kernel machine-check it, so the "
+        "published claim rests on a verified derivation and not only on symbolic computation.",
+        ("Lean Formaliser", "Tactic Specialist", "Axiom Auditor"),
+        ("read_file", "write_file", "edit_file", "run_bash", "run_lean_proof")),
 }
 
 # A falsification attempt must return this shape. Prose alone is ambiguous: read

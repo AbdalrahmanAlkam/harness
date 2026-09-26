@@ -27,7 +27,8 @@ from adaptive_harness.research.experiment import ExperimentRunner, canonical_key
 from adaptive_harness.research.gate import (ConvergenceOutcome, Invariant, InvariantGate,
                                             RelentlessConvergenceLoop, StopReason,
                                             write_cycle_history)
-from adaptive_harness.research.ledger import CommLedger, sha256_file
+from adaptive_harness.research.lean_gate import LEAN_DIRNAME, LeanProofGate
+from adaptive_harness.research.ledger import ACTIONS, CommLedger, sha256_file
 from adaptive_harness.research.paper import PaperBuilder
 from adaptive_harness.research.proof import ProofRunner
 from adaptive_harness.research.roles import (DIVISION_SPECS, FALSIFICATION_VERDICT, Clearance,
@@ -45,6 +46,7 @@ GAP_ROUTING: Mapping[str, Division] = {
     Invariant.ADVERSARIAL_CLEARANCE.value: Division.ADVERSARIAL,
     Invariant.DOCUMENT_INTEGRITY.value: Division.LITERATURE,
     Invariant.CLAIM_ADJUDICATION.value: Division.THEORY,
+    Invariant.FORMAL_VERIFICATION.value: Division.FORMAL,
 }
 
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
@@ -65,6 +67,9 @@ class ResearchWorkspace:
         self.root = Path(self.root)
         for name in ("evidence", "proofs", "experiments", "figures"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
+        # The formal tier lives beside the computational one, never inside it:
+        # a Lean file must not be picked up by the SymPy proof gate.
+        self.lean_dir.mkdir(parents=True, exist_ok=True)
 
     @property
     def ledger_path(self) -> Path:
@@ -73,6 +78,10 @@ class ResearchWorkspace:
     @property
     def proof_dir(self) -> Path:
         return self.root / "proofs"
+
+    @property
+    def lean_dir(self) -> Path:
+        return self.root / "proofs" / LEAN_DIRNAME
 
     @property
     def experiment_dir(self) -> Path:
@@ -158,6 +167,10 @@ class SwarmConfig:
     claim: str = ""
     claim_symbols: tuple[str, ...] = ()
     synthesize: bool = True
+    # Tier 2 of the proof standard. On by default: a run that advertises a
+    # two-tier standard but skips the formal tier would be misleading, so the
+    # opt-out is explicit and recorded in the run's verdict.
+    formalize: bool = True
 
     @property
     def author_mode(self) -> str:
@@ -223,6 +236,9 @@ class ResearchSwarm:
         self.claims: ClaimLedger = ClaimLedger()
         self.experiment_plan_notes: str = ""
         self.planned_experiments: int = 0
+        self.planned_formalisations: int = 0
+        self.formalisation_notes: str = ""
+        self.lean_gate = LeanProofGate(self.workspace.lean_dir)
         self._install_leaders()
 
     def _make_plan(self) -> TopicPlan:
@@ -434,6 +450,87 @@ class ResearchSwarm:
             return False, f"verdict {ledger.headline.value}: {ledger.summary()}", tuple(evidence)
         return True, f"verdict {ledger.headline.value}: {ledger.summary()}", tuple(evidence)
 
+    def _formalise(self) -> None:
+        """Emit the Lean 4 counterpart of the derived propositions.
+
+        This is the second tier of the proof standard. Tier 1 (SymPy) reduces
+        expressions; Tier 2 (Lean) checks the deduction. The two are independent
+        checks on the same mathematical content, so a mistake in one is unlikely
+        to be mirrored in the other.
+        """
+        from adaptive_harness.research.formalise import plan_formalisations
+        if not self.config.formalize:
+            return
+        selected, notes = plan_formalisations(self.topic)
+        self.formalisation_notes = notes
+        self.planned_formalisations = len(selected)
+        existing = {path.stem for path in self.workspace.lean_dir.glob("*.lean")}
+        written: list[str] = []
+        for formalisation in selected:
+            if formalisation.lean_id in existing:
+                continue
+            self.lean_gate.write(formalisation.lean_id, formalisation.source)
+            written.append(formalisation.lean_id)
+        if selected:
+            self.ledger.append(
+                "LEAN_PROOF_SUBMISSION", {"agent_id": leader_agent_id(Division.FORMAL),
+                                          "role": "Formal Proof Lead"},
+                {"agent_id": "lean_kernel", "role": "Lean Formaliser"},
+                {"formalisations": [item.lean_id for item in selected],
+                 "scripts_written": written, "notes": notes,
+                 "supplied_lean_files": sorted(existing)})
+
+    def _evaluate_formal(self) -> tuple[bool, str, tuple[str, ...]]:
+        """Pre-compilation clearance for the formal tier.
+
+        The standard applies to *asserted theorems*, so what is required depends
+        on the verdict:
+
+        * ``PROVEN`` — the paper asserts a theorem, so every Lean file must be
+          machine-checked. An empty proof set blocks publication, because
+          advertising a two-tier standard while skipping the formal tier is the
+          failure this gate exists to prevent.
+        * ``DISPROVEN`` — nothing is asserted; the refutation *is* the result,
+          and it is certified by an exact witness that the kernel checked. A Lean
+          proof of a falsehood is neither expected nor meaningful, so the tier is
+          satisfied by construction and any Lean file that was checked is noted.
+        * ``INCONCLUSIVE``/``UNTESTED`` — no theorem is published, so there is
+          nothing to formalise; the paper says so explicitly instead.
+        """
+        if not self.config.formalize:
+            return True, "formal verification disabled for this run; claims are SymPy-only", ()
+
+        self.lean_gate.receipts = self.lean_gate.verify_all()
+        self.lean_gate.to_index(self.workspace.root / "lean_receipts.json")
+        for receipt in self.lean_gate.receipts:
+            if receipt.certified:
+                self.ledger.append(
+                    "LEAN_PROOF_VERIFIED", {"agent_id": "lean_kernel", "role": "Lean Kernel"},
+                    {"agent_id": leader_agent_id(Division.FORMAL), "role": "Formal Proof Lead"},
+                    {"proof_id": receipt.proof_id, "name": receipt.name,
+                     "status": receipt.status, "hash": receipt.sha256,
+                     "theorems": list(receipt.theorems), "axioms": list(receipt.axioms),
+                     "lean_version": receipt.lean_version, "verified_at": receipt.verified_at})
+            else:
+                self.ledger.append(
+                    "LEAN_PROOF_REJECTED", {"agent_id": "lean_kernel", "role": "Lean Kernel"},
+                    {"agent_id": leader_agent_id(Division.FORMAL), "role": "Formal Proof Lead"},
+                    {"proof_id": receipt.proof_id, "name": receipt.name,
+                     "status": receipt.status, "errors": list(receipt.errors[:3])})
+
+        certified = [item for item in self.lean_gate.receipts if item.certified]
+        checked = f"{len(certified)} of {len(self.lean_gate.receipts)} Lean file(s) certified"
+        verdict = self.claims.headline
+        if verdict is Verdict.DISPROVEN:
+            witness = self.claims.disproven[0].finding if self.claims.disproven else ""
+            return True, (f"no theorem is asserted; the claim is refuted by the exact witness "
+                          f"({witness[:80]}), which is itself machine-checked. {checked}"), ()
+        if verdict is not Verdict.PROVEN:
+            return True, (f"no theorem is published at verdict {verdict.value}, so the formal tier "
+                          f"is not applicable. {checked}"), ()
+        ok, detail, evidence = self.lean_gate.clearance()
+        return ok, detail, evidence
+
     def _evaluate_proofs(self) -> tuple[bool, str, tuple[str, ...]]:
         scripts = self.proofs.scripts()
         if not scripts:
@@ -549,12 +646,24 @@ class ResearchSwarm:
             return False, f"paper.pdf did not build cleanly: {detail}", ()
         return True, f"paper.pdf built cleanly ({result.size_bytes} bytes, {result.typst_version})", ()
 
+    def _lean_sources(self) -> dict[str, str]:
+        """Read the formal sources for the paper's reproducibility appendix."""
+        sources: dict[str, str] = {}
+        for path in sorted(self.workspace.lean_dir.glob("*.lean")):
+            try:
+                sources[path.name] = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        return sources
+
     def _paper_inputs(self) -> Any:
         """Assemble the citable artifact set from the latest verified receipts."""
         from adaptive_harness.research.paper import PaperInputs
+        receipts = list(self.lean_gate.receipts)
+        certified = [item for item in receipts if item.certified]
         return PaperInputs(
             title=self._paper_title(),
-            abstract=self._paper_abstract(),
+            abstract=self._paper_abstract(len(certified)),
             topic=self.topic,
             propositions=self.plan.propositions,
             adjudications=self.claims.adjudications,
@@ -565,7 +674,11 @@ class ResearchSwarm:
             gate=self._last_report,
             outcome=self._last_outcome,
             ledger=self.ledger,
-            figures=tuple(path.name for path in sorted(self.workspace.figure_dir.glob("*.svg"))))
+            figures=tuple(path.name for path in sorted(self.workspace.figure_dir.glob("*.svg"))),
+            lean_receipts=tuple(certified),
+            lean_sources=self._lean_sources() if certified else None,
+            lean_version=self.lean_gate.lean_version,
+            mathlib_available=bool(certified) and self.lean_gate._mathlib_available())
 
     def _paper_title(self) -> str:
         """Title the paper after what it actually concluded, not the raw topic slug."""
@@ -583,7 +696,7 @@ class ResearchSwarm:
             return f"On the identity {self.config.claim}"
         return self.topic
 
-    def _paper_abstract(self) -> str:
+    def _paper_abstract(self, certified: int = 0) -> str:
         """A real abstract: what was asked, what was shown, and what it means."""
         strategy = self.plan.strategy
         if "power-law-moments" in strategy and "balanced-allocation" in strategy:
@@ -597,7 +710,10 @@ class ResearchSwarm:
                     "and that its exact excess over the Cauchy-Schwarz bound is determined by the "
                     "remainder of the batch size upon division by the number of servers. Every "
                     "statement is a proposition whose symbolic form is constructed from a "
-                    "definition and decided by an executed derivation script.")
+                    "definition and decided by an executed derivation script."
+                    + (f" {certified} of these results additionally carry a Lean 4 proof that the "
+                       f"Lean kernel machine-checks, so the argument rests on a verified "
+                       f"deduction and not only on symbolic computation." if certified else ""))
         if self.plan.propositions:
             return (f"We investigate {self.topic}. The propositions below are constructed from "
                     f"their definitions and decided by executing self-adjudicating derivation "
@@ -620,6 +736,7 @@ class ResearchSwarm:
             Invariant.EMPIRICAL_REPLICATION: self._evaluate_experiments,
             Invariant.ADVERSARIAL_CLEARANCE: self._evaluate_adversarial,
             Invariant.CLAIM_ADJUDICATION: self._evaluate_claim,
+            Invariant.FORMAL_VERIFICATION: self._evaluate_formal,
             Invariant.DOCUMENT_INTEGRITY: self._evaluate_document,
         })
 
@@ -768,6 +885,7 @@ class ResearchSwarm:
         self._write_objective_spec(objective)
         self._synthesize()
         self._synthesize_experiments()
+        self._formalise()
         loop = RelentlessConvergenceLoop(
             gate=self.build_gate(),
             cycle_fn=lambda report, index, budget: self.cycle(report, index, budget),

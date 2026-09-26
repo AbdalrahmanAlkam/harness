@@ -16,6 +16,7 @@ from adaptive_harness.tools.lean import (BENIGN_AXIOMS, LeanDiagnostic, LeanErro
                                          RunLeanProofTool, axiom_audit_source,
                                          declared_names, find_placeholders,
                                          strip_lean_comments)
+from adaptive_harness.research.claim import Verdict
 from adaptive_harness.research.lean_gate import LeanProofGate, theorems_in
 
 TOOLCHAIN = LeanToolchain()
@@ -250,3 +251,142 @@ def test_sorry_is_caught_before_compiling(tmp_path: Path):
     assert "placeholder" in (result.error or "")
     # The artifact is retained for inspection, with its refusal recorded.
     assert (tmp_path / "lean" / "Never.lean").is_file()
+
+
+# -- the formalisation library --------------------------------------------
+
+def test_every_library_proof_is_accepted_by_lean(tmp_path: Path):
+    """No proof may ship unverified.
+
+    The library holds hand-written Lean, so it can rot: a tactic change in a new
+    Lean release would silently make a published theorem unprovable. This test
+    compiles every entry and fails loudly if one stops verifying.
+    """
+    from adaptive_harness.research.formalise import LIBRARY
+    from adaptive_harness.research.lean_gate import LeanProofGate
+
+    gate = LeanProofGate(tmp_path / "lean")
+    for formalisation in LIBRARY:
+        gate.write(formalisation.lean_id, formalisation.source)
+    receipts = gate.verify_all()
+    assert len(receipts) == len(LIBRARY)
+    for receipt, formalisation in zip(receipts, sorted(LIBRARY, key=lambda f: f.lean_id)):
+        assert receipt.certified, f"{formalisation.lean_id} did not verify: {receipt.errors[:2]}"
+        # Certification already implies no sorry; assert the axiom set directly
+        # so a future status change cannot hide a sorryAx dependency.
+        assert "sorryAx" not in receipt.axioms
+        assert set(receipt.axioms) <= BENIGN_AXIOMS
+    ok, detail, _ = gate.clearance()
+    assert ok, detail
+
+
+def test_formalisation_selection_is_honest_about_no_match():
+    from adaptive_harness.research.formalise import plan_formalisations
+
+    chosen, notes = plan_formalisations("gauss sum of natural numbers")
+    assert [item.lean_id for item in chosen] == ["LEAN-GAUSS"]
+    none, notes = plan_formalisations("zzz qqq unmatchable")
+    assert none == ()
+    assert "No formalisation" in notes
+
+
+def test_formalisations_are_matched_to_propositions():
+    from adaptive_harness.research.claim import Proposition
+    from adaptive_harness.research.formalise import formalisations_for
+
+    unrelated = (Proposition("PROP-99", "theorem", "unrelated"),)
+    assert formalisations_for(unrelated) == ()
+    supported = (Proposition("PROP-05", "lemma", "imbalance"),)
+    assert [item.lean_id for item in formalisations_for(supported)] == ["LEAN-BALANCED"]
+
+
+def test_gate_refuses_clearance_without_lean(tmp_path: Path, monkeypatch):
+    """An unavailable toolchain must fail clearance, never pass vacuously."""
+    from adaptive_harness.research.lean_gate import LeanProofGate
+
+    gate = LeanProofGate(tmp_path / "lean")
+    gate.write("Gauss", GAUSS_LEAN)
+    # Simulate a machine with no Lean by detaching the toolchain's binary.
+    monkeypatch.setattr(gate.toolchain, "lean", None)
+    ok, detail, _ = gate.clearance()
+    assert not ok
+    assert "unavailable" in detail
+
+
+def test_gate_refuses_clearance_with_no_proofs(tmp_path: Path):
+    from adaptive_harness.research.lean_gate import LeanProofGate
+
+    gate = LeanProofGate(tmp_path / "lean")
+    gate.verify_all()
+    ok, detail, _ = gate.clearance()
+    assert not ok
+    assert "no Lean proof" in detail
+
+
+# -- the formal tier inside the swarm --------------------------------------
+
+@needs_lean
+def test_proven_claim_requires_a_certified_lean_proof(tmp_path: Path):
+    """An asserted theorem may not be published without the formal tier."""
+    from adaptive_harness.research import ResearchSwarm, SwarmConfig
+
+    swarm = ResearchSwarm("gauss sum of the first n natural numbers", root=tmp_path,
+                          config=SwarmConfig(max_cycles=1))
+    swarm._synthesize()
+    swarm._formalise()
+    swarm._adjudicate()
+    assert swarm.claims.headline is Verdict.PROVEN
+    ok, detail, _ = swarm._evaluate_formal()
+    assert ok, detail
+    assert "sorryAx" in detail
+
+
+@needs_lean
+def test_refuted_claim_needs_no_lean_proof(tmp_path: Path):
+    """A refutation is certified by its exact witness, not by a Lean proof."""
+    from adaptive_harness.research import ResearchSwarm, SwarmConfig
+
+    swarm = ResearchSwarm("quadratic expansion", root=tmp_path,
+                          config=SwarmConfig(max_cycles=1,
+                                             claim="(x + y)**2 == x**2 + y**2",
+                                             claim_symbols=("x", "y")))
+    swarm._synthesize()
+    swarm._formalise()
+    swarm._adjudicate()
+    assert swarm.claims.headline is Verdict.DISPROVEN
+    ok, detail, _ = swarm._evaluate_formal()
+    assert ok, detail
+    assert "no theorem is asserted" in detail
+
+
+@needs_lean
+def test_lean_files_land_in_proofs_lean_and_not_in_the_sympy_gate(tmp_path: Path):
+    """The two tiers must not contaminate each other."""
+    from adaptive_harness.research import ResearchSwarm
+    from adaptive_harness.research.formalise import LIBRARY
+
+    swarm = ResearchSwarm("gauss sum of the first n natural numbers", root=tmp_path)
+    swarm._formalise()
+    lean_files = list(swarm.workspace.lean_dir.glob("*.lean"))
+    assert lean_files
+    assert {path.name for path in lean_files} <= {f"{f.lean_id}.lean" for f in LIBRARY}
+    # The SymPy gate globs proofs/*.py only, so Lean files are invisible to it.
+    assert all(path.suffix == ".py" for path in swarm.proofs.scripts())
+    assert all(path.suffix == ".lean" for path in lean_files)
+
+
+@needs_lean
+def test_paper_carries_the_lean_boxes_and_listings(tmp_path: Path):
+    from adaptive_harness.research import ResearchSwarm
+
+    swarm = ResearchSwarm("gauss sum of the first n natural numbers, and balanced routing", root=tmp_path)
+    outcome = swarm.run()
+    assert outcome.solved, outcome.render()
+    paper = Path(swarm.workspace.paper_typ).read_text()
+    assert "lean-box" in paper
+    assert "Formal Foundations" in paper
+    assert "proofs/lean/LEAN-GAUSS.lean" in paper
+    assert "sorryAx" in paper
+    # The appendix carries the listings so a reader can reproduce the check.
+    assert "Lean 4 Listings" in paper
+    assert "gauss_two_mul" in paper

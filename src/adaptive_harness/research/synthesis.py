@@ -673,6 +673,86 @@ refute("the quantile did not invert the CDF")
         rationale="Verified by denesting the nested power exactly."),)
 
 
+def _gauss_sum() -> tuple[Proposition, ...]:
+    """Gauss's sum, in the form the Lean tier also formalises.
+
+    The division-free statement is used in both tiers so they check the same
+    mathematical content: 2 * sumFirst n = n * (n + 1). SymPy discharges the
+    algebra of the induction step; Lean discharges the induction itself, which
+    is the part SymPy cannot do.
+    """
+    closed_body = """
+from sympy import Rational, simplify, symbols
+k, n = symbols("k n", integer=True, nonnegative=True)
+
+# The closed form is consistent with its own doubling identity.
+total = Rational(1, 2) * n * (n + 1)
+if simplify(2 * total - n * (n + 1)) == 0:
+    hold("2 * (n(n+1)/2) = n(n+1), so the closed form is algebraically well formed")
+refute("the closed form failed its own doubling identity")
+"""
+    step_body = """
+from sympy import expand, simplify, symbols
+k = symbols("k", integer=True, nonnegative=True)
+
+# The induction step, given 2*S(k) = k(k+1), reduces to polynomial arithmetic.
+# This is the same step the Lean proof discharges, minus the induction itself.
+lhs = 2 * (Rational(1, 2) * k * (k + 1) + (k + 1))
+rhs = (k + 1) * (k + 2)
+if simplify(expand(lhs - rhs)) == 0:
+    hold("2*(S(k) + (k+1)) = (k+1)(k+2): the induction step is algebraically valid")
+refute(f"the induction step residual was {simplify(expand(lhs - rhs))}")
+
+# A spot check that the recursive definition and the closed form agree, which
+# SymPy can decide outright for a concrete index.
+total = 0
+for i in range(1, 13):
+    total += i
+if simplify(2 * total - 12 * 13) == 0:
+    hold("the recursive sum and the closed form agree at n = 12")
+refute("the recursive definition disagreed with the closed form at n = 12")
+"""
+    notation = (("n", "the number of terms, $n in NN$"),
+                ("S(n)", "the sum of the first $n$ natural numbers"))
+    return (
+        Proposition(
+            prop_id="PROP-GAUSS", kind="theorem",
+            name="Gauss's sum in division-free form",
+            hypotheses=("$n in NN$, and $S(n)$ is the sum of the first $n$ natural numbers.",
+                        ),
+            statement="$2 S(n) = n (n + 1)$. The division-free form is used so that both proof "
+                      "tiers check identical content without a divisibility argument.",
+            display=("2 S(n) = n (n + 1), quad text(i.e.) quad S(n) = frac(n (n + 1), 2)",),
+            proof_sketch="SymPy discharges the algebra: the closed form satisfies its own doubling "
+                         "identity, and the induction step reduces to polynomial arithmetic once "
+                         "$2 S(k) = k (k + 1)$ is assumed. The induction itself is beyond a "
+                         "symbolic algebra system and is discharged separately in Lean 4, where "
+                         "`induction` over `Nat` establishes it.",
+            consequence="Provides the reference total used to calibrate the empirical harness, and "
+                        "the worked example for the two-tier proof standard.",
+            notation=notation,
+            script=_script("Gauss's sum, division-free", "gauss", closed_body),
+            rationale="Algebraic consistency of the closed form, checked exactly."),
+        Proposition(
+            prop_id="PROP-GAUSS-STEP", kind="lemma",
+            name="The induction step of Gauss's sum",
+            hypotheses=("Same hypotheses as Proposition 1, with $k in NN$ and $2 S(k) = k (k+1)$ "
+                        "assumed.",),
+            statement="$2 (S(k) + (k + 1)) = (k + 1) (k + 2)$, so the doubling identity is "
+                      "preserved by one step of the recursion.",
+            proof_sketch="Substituting the closed form for $S(k)$ and expanding both sides reduces "
+                         "the step to a polynomial identity, which is what the script checks "
+                         "symbolically. A direct evaluation of the recursive definition at a "
+                         "concrete index confirms that the recursion and the closed form describe "
+                         "the same quantity.",
+            consequence="Together with the base case, which is immediate, this closes the induction.",
+            notation=notation,
+            script=_script("Gauss's induction step", "gauss", step_body),
+            rationale="The step is polynomial and therefore exactly decidable; the induction over "
+                      "all n is the part certified in Lean."),
+    )
+
+
 def _gaussian_transform() -> tuple[Proposition, ...]:
     """The Fourier transform of a Gaussian, the canonical heavy-tail contrast."""
     body = """
@@ -716,6 +796,10 @@ _LIBRARY: tuple[_Builder, ...] = (
              ("balanced", "split", "allocation", "routing", "load balance", "round robin",
               "reassignment", "cauchy"),
              _balanced_allocation),
+    _Builder("gauss",
+             ("gauss", "triangular number", "sum of the first", "natural numbers", "sumfirst",
+              "n(n+1)/2", "sum of 1 to n"),
+             _gauss_sum),
     _Builder("gaussian-transform",
              ("fourier", "gaussian", "characteristic function", "subexponential", "transform"),
              _gaussian_transform),

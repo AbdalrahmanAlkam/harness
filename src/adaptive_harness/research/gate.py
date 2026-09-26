@@ -37,6 +37,7 @@ class Invariant(str, Enum):
     ADVERSARIAL_CLEARANCE = "adversarial_clearance"
     DOCUMENT_INTEGRITY = "document_integrity"
     CLAIM_ADJUDICATION = "claim_adjudication"
+    FORMAL_VERIFICATION = "formal_verification"
 
 
 class StopReason(str, Enum):
