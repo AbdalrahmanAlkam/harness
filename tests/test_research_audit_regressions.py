@@ -115,7 +115,9 @@ def test_live_director_authors_claims_without_builtin_synthesis(tmp_path: Path, 
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.name == "claim_manifest.json":
             target.write_text(json.dumps({"claims": [{"id": "PROP-01", "name": "Identity",
-                "statement": "x + 0 = x", "hypotheses": ["x is an integer"]}],
+                "statement": "x + 0 = x", "hypotheses": ["x is an integer"],
+                "sympy_expression": "x + 0 == x",
+                "lean_statement": "example (x : Nat) : x + 0 = x := Nat.add_zero x"}],
                 "empirical_required": False}))
             swarm.workspace.objective_spec.write_text("# Explicit objective\n")
         else:
@@ -258,7 +260,8 @@ def test_missing_lead_assignment_is_visible_to_later_workers(tmp_path: Path, mon
         if agent.role_name == "Executive Director":
             swarm.workspace.objective_spec.write_text("# Objective\n")
             target.write_text(json.dumps({"claims": [{"id": "PROP-01", "name": "Claim",
-                "statement": "1+1=2", "lean_statement": "1 + 1 = 2"}]}))
+                "statement": "one plus one is two", "sympy_expression": "1 + 1 == 2",
+                "lean_statement": "example : (1:Nat) + 1 = 2 := rfl"}]}))
         return {"ran": True, "success": False}
 
     monkeypatch.setattr(swarm, "_run_worker", only_director_writes)
@@ -266,7 +269,91 @@ def test_missing_lead_assignment_is_visible_to_later_workers(tmp_path: Path, mon
     assignment = swarm.workspace.root / "formal_assignments.md"
     assert assignment.is_file()
     assert "lead did not leave a written assignment" in assignment.read_text()
-    assert "Lean target: `1 + 1 = 2`" in assignment.read_text()
+    assert "Lean target: `example : (1:Nat) + 1 = 2 := rfl`" in assignment.read_text()
+
+
+def test_a_claim_without_an_exact_expression_is_rejected_not_attempted(tmp_path: Path,
+                                                                       monkeypatch):
+    """A claim the exact computer cannot decide cannot be settled.
+
+    Accepting one produced 15,000-line attempts to build a Lean evaluator in Python,
+    every one of which failed. The manifest is now rejected, and the reason is
+    recorded so the Director can be told what was wrong.
+    """
+    swarm = ResearchSwarm("undecidable", root=tmp_path,
+                          config=SwarmConfig(llm_client_factory=lambda: object()))
+
+    def director_writes_a_lean_flavoured_claim(agent, division, directive, *,
+                                               success_criterion, target, **_kwargs):
+        if agent.role_name == "Executive Director":
+            swarm.workspace.objective_spec.write_text("# Objective\n")
+            target.write_text(json.dumps({"claims": [{
+                "id": "PROP-01", "name": "Reduction",
+                "statement": "Nat.succ n + m reduces definitionally to Nat.succ (n + m)",
+                "lean_statement": "example (n m : Nat) : Nat.succ n + m = Nat.succ (n + m) := rfl"}]}))
+        return {"ran": True, "success": True, "tool_calls": 1}
+
+    monkeypatch.setattr(swarm, "_run_worker", director_writes_a_lean_flavoured_claim)
+    swarm._prepare_live_research("prove a reduction lemma")
+    assert swarm.plan.propositions == ()
+    assert "sympy_expression" in swarm.plan.notes
+    # The leads are never dispatched, because there is nothing to decompose.
+    assert not list(swarm.workspace.root.glob("*_assignments.md"))
+
+
+def test_a_claim_without_a_lean_statement_is_also_rejected(tmp_path: Path, monkeypatch):
+    swarm = ResearchSwarm("no lean", root=tmp_path,
+                          config=SwarmConfig(llm_client_factory=lambda: object()))
+
+    def director_writes(agent, division, directive, *, success_criterion, target, **_kwargs):
+        if agent.role_name == "Executive Director":
+            swarm.workspace.objective_spec.write_text("# Objective\n")
+            target.write_text(json.dumps({"claims": [{
+                "id": "PROP-01", "name": "Identity", "statement": "two plus two is four",
+                "sympy_expression": "2 + 2 == 4"}]}))
+        return {"ran": True, "success": True, "tool_calls": 1}
+
+    monkeypatch.setattr(swarm, "_run_worker", director_writes)
+    swarm._prepare_live_research("prove arithmetic")
+    assert swarm.plan.propositions == ()
+    assert "lean_statement" in swarm.plan.notes
+
+
+def test_the_kernel_writes_the_decider_from_the_directors_expression(tmp_path: Path,
+                                                                    monkeypatch):
+    """The computational verdict is SymPy's, not a language model's."""
+    import subprocess
+    import sys
+
+    swarm = ResearchSwarm("kernel decides", root=tmp_path,
+                          config=SwarmConfig(llm_client_factory=lambda: object()))
+
+    def director_writes(agent, division, directive, *, success_criterion, target, **_kwargs):
+        if agent.role_name == "Executive Director":
+            swarm.workspace.objective_spec.write_text("# Objective\n")
+            target.write_text(json.dumps({"claims": [{
+                "id": "PROP-01", "name": "Identity",
+                "statement": "the sum of two and two is four",
+                "sympy_expression": "2 + 2 == 4",
+                "lean_statement": "example : (2:Nat) + 2 = 4 := rfl"}]}))
+        return {"ran": True, "success": True, "tool_calls": 1}
+
+    monkeypatch.setattr(swarm, "_run_worker", director_writes)
+    swarm._prepare_live_research("prove arithmetic")
+    assert [item.prop_id for item in swarm.plan.propositions] == ["PROP-01"]
+    assert swarm.plan.propositions[0].exactly_decidable
+    swarm._synthesize()
+    script = swarm.workspace.proof_dir / "prop-01.py"
+    assert script.is_file()
+    completed = subprocess.run([sys.executable, str(script)], capture_output=True,
+                               text=True, timeout=120)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "residual is 0" in completed.stdout
+    kernel_entries = [entry for entry in swarm.ledger.by_action("TASK_ASSIGNED")
+                      if entry.recipient["agent_id"] == "derivation_kernel"]
+    assert kernel_entries, "the kernel's decider emission was not recorded"
+    assert kernel_entries[0].payload["kernel_decided"] == ["PROP-01"]
+    assert kernel_entries[0].payload["scripts_written"] == ["prop-01.py"]
 
 
 def test_live_artifact_worker_writes_target_before_verification_loop(tmp_path: Path, monkeypatch):

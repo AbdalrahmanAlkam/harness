@@ -182,12 +182,17 @@ def test_a_claimed_success_with_a_verified_artifact_is_accepted_with_its_receipt
     swarm.control.begin(worker, task_id=task.task_id)
     target = swarm.workspace.root / task.artifact
     _write(swarm, task.artifact, PROOF_BODY)
+    # A theory claim is only complete with its natural-language derivation beside
+    # the decision script.
+    _write(swarm, str(Path(task.artifact).with_suffix(".md")), "# derivation\n")
     swarm.proofs.receipts = _proof_receipt(target)
     summary = {"ran": True, "success": True, "tool_calls": 2, "trajectory": [],
                "stop_reason": "completed", "error": None}
     result = swarm._settle(task, swarm.agents[worker], summary, target=target)
     assert result["accepted"] is True
     assert swarm.board.get(task.task_id).evidence_ids == ("PROP_01",)
+    assert swarm.board.get(task.task_id).artifact.endswith(".md"), \
+        "the completed artifact is the derivation, not just the script"
     assert swarm.control.record(worker).state is WorkerState.COMPLETED
 
 
@@ -454,14 +459,17 @@ def test_an_interrupted_run_resumes_without_repeating_completed_work(tmp_path: P
     """A restart must not re-bill the Director, the leads, or finished tasks."""
     script = [("write_file", {"path": "00_objective_spec.md", "content": "# spec\n"}),
               ("write_file", {"path": "claim_manifest.json", "content": json.dumps({
-                  "claims": [{"id": "PROP-01", "name": "c", "statement": "2 + 2 = 4",
+                  "claims": [{"id": "PROP-01", "name": "c",
+                              "statement": "the sum of two and two is four",
                               "hypotheses": [], "kind": "theorem",
+                              "sympy_expression": "2 + 2 == 4",
                               "lean_statement": "example : (2:Nat) + 2 = 4 := by decide"}]})})]
     first = _swarm(tmp_path, script)
     first._prepare_live_research("prove 2+2=4")
     task = _new_task(first, gap="mathematical_soundness", artifact="proofs/prop-01.py")
     first.board.lease(task.task_id, "theory_prover_01")
     _write(first, task.artifact, PROOF_BODY)
+    _write(first, "proofs/prop-01.md", "# derivation\n")
     first._close_task(task, "theory_prover_01", WorkerState.COMPLETED,
                       evidence_ids=("PROOF-001",))
     first.board.save(first.workspace.root / "task_board.json")

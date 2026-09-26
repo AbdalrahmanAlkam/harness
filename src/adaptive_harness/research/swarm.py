@@ -23,7 +23,8 @@ import textwrap
 from typing import Any, Callable, Mapping, Sequence
 
 from adaptive_harness.research.claim import (EXIT_COUNTEREXAMPLE, EXIT_HOLDS, ClaimLedger,
-                                              ParsedClaim, Proposition, TopicPlan, Verdict, parse_claim)
+                                              ParsedClaim, Proposition, TopicPlan, Verdict,
+                                              exact_decider, parse_claim)
 from adaptive_harness.research.coordination import (TASK_BOARD_FILENAME, CoordinationError,
                                                     MessageBus, MessageKind, StopKind,
                                                     SwarmControl, Task, TaskBoard, WorkerCancelled,
@@ -494,30 +495,40 @@ class ResearchSwarm:
 
     # -- convergence loop ---------------------------------------------------
     def _synthesize(self) -> None:
-        """Have the kernel derive propositions and write their decider scripts.
+        """Have the kernel write a decider for every claim that carries one.
 
-        This is what makes a run do research rather than merely audit research:
-        given a topic, the kernel constructs machine-checkable statements and
-        emits a self-adjudicating script for each, which is then written into
-        ``proofs/`` where the ordinary proof gate picks it up.
+        This is what makes a run do research rather than merely audit research.
+        On the live path the Director supplies the exact expression and *the kernel*
+        writes the self-adjudicating script, so the computational verdict is
+        SymPy's and not a language model's. The theory worker's remaining job is the
+        natural-language derivation and any claim the expression cannot settle —
+        which is a real contribution rather than a transcription exercise.
         """
         if not self.config.synthesize:
             return
         existing = {path.stem for path in self.workspace.proof_dir.glob("*.py")}
         written: list[str] = []
+        undetermined: list[str] = []
         for prop in self.plan.propositions:
+            if not prop.script:
+                undetermined.append(prop.prop_id)
+                continue
             target = self.workspace.proof_dir / f"{prop.prop_id.lower()}.py"
             if target.stem in existing and target.is_file():
                 continue
             target.write_text(prop.script, encoding="utf-8")
             written.append(target.name)
-        if written or self.plan.propositions:
+        if written or self.plan.propositions or undetermined:
             self.ledger.append(
                 "TASK_ASSIGNED", {"agent_id": leader_agent_id(Division.THEORY),
                                   "role": "Theoretical Lead"},
                 {"agent_id": "derivation_kernel", "role": "Derivation Kernel"},
                 {"strategy": self.plan.strategy, "propositions": len(self.plan.propositions),
-                 "scripts_written": written, "notes": self.plan.notes})
+                 "scripts_written": written,
+                 "kernel_decided": [prop.prop_id for prop in self.plan.propositions
+                                   if prop.script],
+                 "worker_authored_required": undetermined,
+                 "notes": self.plan.notes})
 
     def _synthesize_experiments(self) -> None:
         """Emit the corroborating simulations that test the derived propositions."""
@@ -1902,7 +1913,14 @@ class ResearchSwarm:
             if task is not None and task.attempts > 1 and task.note:
                 prior = (f"This is attempt {task.attempts}. The previous attempt at this "
                          f"exact artifact ended with: {task.note[:400]} Do not repeat it.\n")
-            if target.suffix in {".py", ".lean", ".typ"} and not target.is_file():
+            # A kernel-written decider is not a gap: the worker's artifact for that
+            # claim is the derivation beside it, so the write-first pass is skipped
+            # and the worker goes straight to arguing the claim.
+            kernel_wrote_target = (division is Division.THEORY and target.suffix == ".py"
+                                   and target.is_file() and task is not None
+                                   and task.artifact.endswith(".py"))
+            if target.suffix in {".py", ".lean", ".typ"} and not target.is_file() \
+                    and not kernel_wrote_target:
                 receipts = ""
                 if target.suffix == ".typ":
                     manifest = self.workspace.root / "receipt_manifest.json"
@@ -1920,6 +1938,15 @@ class ResearchSwarm:
                     target=target, tool_names_override=("write_file",), max_steps_override=2)
                 if bootstrap.get("cancelled"):
                     return self._settle(task, agent, bootstrap, cancelled=True)
+            criterion = (f"Success: write proofs/{target.stem}.md giving the hypotheses, the "
+                         f"step-by-step exact derivation of the claim, and the exact scope of "
+                         f"what was proved. The decision script {target.name} already exists, "
+                         f"written by the harness from the Director's declared exact expression; "
+                         f"do not rewrite it and do not weaken the claim. If you think the claim "
+                         f"is false, state the exact counterexample in the derivation."
+                         if kernel_wrote_target else
+                         f"Success: {target.name} exists and running it with the Python REPL or "
+                         f"run_bash exits 0.{criterion}")
             outcome = self._run_worker(agent, division,
                                        f"Close the {gap} gap for topic '{self.topic}'. "
                                        f"Read {division.value}_assignments.md, "
@@ -1928,6 +1955,13 @@ class ResearchSwarm:
                                        "from prior workers' results instead of repeating completed work. "
                                        f"Your directive: {agent.directive} "
                                        + prior
+                                       + (f"The claim is: {prop.statement}. Hypotheses: "
+                                          f"{'; '.join(prop.hypotheses)}. The harness has already "
+                                          f"decided it by exact computation from the expression "
+                                          f"{prop.sympy_expression}. Your job is the mathematical "
+                                          f"derivation that a reader can follow, written to "
+                                          f"proofs/{target.stem}.md. "
+                                          if kernel_wrote_target and prop is not None else "")
                                        + (f"Claim: {prop.statement}. Hypotheses: "
                                           f"{'; '.join(prop.hypotheses)}. " if prop else "")
                                        + (f"The exact Lean proposition is: {prop.lean_statement}. "
@@ -2010,6 +2044,18 @@ class ResearchSwarm:
         artifact = self._relpath(target) if target is not None else Path(task.artifact)
         evidence = self._artifact_evidence(artifact)
         produced = bool(target is not None and target.is_file())
+        # A theory claim needs the natural-language derivation as well as the
+        # decision script. When the kernel wrote the script, the script's presence
+        # says nothing about whether the worker did its work, so requiring only the
+        # script would let an idle worker claim completion.
+        worker = self.agents.get(agent.agent_id)
+        if produced and worker is not None and worker.division is Division.THEORY \
+                and self._live_research_mode():
+            derivation = target.with_suffix(".md")
+            if not derivation.is_file():
+                produced = False
+            else:
+                artifact = self._relpath(derivation)
         if produced and result.get("success"):
             self.control.settle_worker(agent.agent_id, WorkerState.COMPLETED,
                                        reason=result.get("error") or "",
@@ -2079,10 +2125,26 @@ class ResearchSwarm:
                           "half_width_95, and relative fields. Compute the interval from raw "
                           "samples and fail if the prediction lies outside it.")
             if division is Division.THEORY and self._live_research_mode():
+                # The kernel already wrote the decider for every claim that carried
+                # an exact expression, and the adjudication gate requires the
+                # natural-language derivation beside it. So the worker's deliverable
+                # is the *argument*, not a transcription of arithmetic SymPy has
+                # already done. Telling it to write the script is what produced
+                # 15,000-line category errors.
+                decider_exists = target.is_file()
+                if decider_exists:
+                    return (f"Success: proofs/{target.stem}.md exists and states the hypotheses, "
+                            f"a step-by-step exact derivation of the claim, and the precise scope "
+                            f"of what was proved. The decision script {name} was written by the "
+                            f"harness from the Director's declared exact expression; do not "
+                            f"rewrite it and do not weaken the claim. If you believe the claim is "
+                            f"false, say so in the derivation with the exact counterexample "
+                            f"instead of editing the script.")
                 extra += (f" Also write proofs/{target.stem}.md with hypotheses, a "
-                          "step-by-step exact derivation, and the scope of what was proved.")
+                          f"step-by-step exact derivation, and the scope of what was proved.")
             return (f"Success: {name} exists and running it with the Python REPL or run_bash exits "
                     f"0.{extra}")
+
         if division is Division.ADVERSARIAL:
             return ("Success: report a concrete counterexample with the exact input that produced "
                     "it, or state that the declared search returned empty.")
@@ -2187,6 +2249,11 @@ class ResearchSwarm:
 
         if self._live_research_mode():
             self._prepare_live_research(objective)
+            # The Director supplies each claim's exact expression; the kernel turns
+            # those into self-adjudicating scripts. Deciding the computational tier
+            # is arithmetic, not authoring, and leaving it to a language model is
+            # what made every live run fail.
+            self._synthesize()
         else:
             self._write_objective_spec(objective)
             self._synthesize()
@@ -2239,6 +2306,44 @@ class ResearchSwarm:
             pdf=str(self.workspace.paper_pdf) if self.workspace.paper_pdf.is_file() else None,
             agents=tuple(self.agents.values()))
 
+    def _claim_spec_directive(self) -> str:
+        """How the Director must state a claim so both tiers can actually decide it.
+
+        This is the single highest-leverage instruction in the run. A claim phrased
+        as a fact about a proof assistant's internals — "Nat.succ n + m reduces
+        definitionally", "the HAdd instance" — has no exactly-decidable
+        computational content. A SymPy worker handed such a claim has nothing to
+        compute, so it writes a Lean evaluator in Python, and that fails. Observed
+        across three live runs: every attempt produced a 15,000-line script and a
+        non-zero exit.
+
+        So the Director is told to state the *mathematics* and to supply the exact
+        expression separately, with a worked example. A worked example is not
+        decoration here: prose alone did not change the behaviour.
+        """
+        return (
+            "CRITICAL — each mathematical claim needs three separate fields, and they must "
+            "say different things. (1) 'statement': the mathematics itself, in ordinary language, "
+            "with no reference to how any tool reduces or represents it. Do NOT write 'Nat.succ n "
+            "+ m reduces definitionally' or 'the HAdd instance resolves it'; write 'for all "
+            "integers n and m, the successor of n added to m equals the successor of n plus m'. "
+            "(2) 'sympy_expression': the claim as an exact SymPy identity, written literally as "
+            "'<lhs> == <rhs>' in SymPy syntax. This is what the computational tier decides, and "
+            "the kernel decides it directly, so it must be something SymPy can settle exactly. "
+            "(3) 'lean_statement': the exact Lean proposition, same scope and hypotheses as the "
+            "statement, for example 'example (n m : Nat) : Nat.succ n + m = Nat.succ (n + m) "
+            ":= rfl'. "
+            "Include one central claim and at most two supporting lemmas. Every claim must carry "
+            "a nonempty 'sympy_expression' and a nonempty 'lean_statement'. "
+            "WORKED EXAMPLE for the topic '2 + 2 = 4': statement 'the sum of the natural number "
+            "two and two is four'; sympy_expression '2 + 2 == 4'; lean_statement 'example : "
+            "(2 : Nat) + 2 = 4 := rfl'. For the binomial theorem: statement 'the square of a sum "
+            "of two integers equals the sum of their squares plus twice their product'; "
+            "sympy_expression '(x + y)**2 == x**2 + 2*x*y + y**2'; lean_statement 'example (x y : "
+            "Nat) : (x + y)^2 = x^2 + 2*x*y + y^2 := by ring_nf'. "
+            "Keep empirical predictions out of the mathematical claims array. "
+        )
+
     def _prepare_live_research(self, objective: str) -> None:
         """Let the Director and leads define a new topic before any worker writes proofs.
 
@@ -2274,12 +2379,9 @@ class ResearchSwarm:
                 "Use write_file to create 00_objective_spec.md with variable domains, boundary "
                 "cases, assumptions, and a falsifiable goal. Also write claim_manifest.json as "
                 "JSON with a nonempty 'claims' array. Each claim needs id (PROP-01 style), "
-                "name, statement, hypotheses (array), and kind. Include one central mathematical "
-                    "claim and at most two supporting lemmas. Each mathematical claim needs a "
-                    "lean_statement field containing the exact Lean proposition to be proved, "
-                    "with the same scope and hypotheses as its natural-language statement. "
-                    "Keep empirical predictions out of the "
-                "mathematical claims array. Use only claims you can assign to independent SymPy "
+                "name, statement, hypotheses (array), and kind. "
+                + self._claim_spec_directive()
+                + "Use only claims you can assign to independent SymPy "
                 "and Lean workers. Set top-level 'empirical_required' to true when a simulation "
                 "can test the statement. Do not write proof scripts yourself.",
                 success_criterion="Both the objective specification and valid claim manifest exist.",
@@ -2312,11 +2414,26 @@ class ResearchSwarm:
                     raise ValueError("hypotheses must be an array of strings")
                 if item.get("kind") == "numerical_simulation":
                     continue
+                expression = str(item.get("sympy_expression")
+                                 or item.get("exact_expression")
+                                 or item.get("sympy_statement") or "").strip()
+                lean = str(item.get("lean_statement", "")).strip()
+                if not expression:
+                    raise ValueError(
+                        f"claim {item['id']} has no 'sympy_expression'; a claim the exact "
+                        "computer cannot decide cannot be settled, and asking a worker to "
+                        "invent one produced scripts that failed every time")
+                if not lean:
+                    raise ValueError(
+                        f"claim {item['id']} has no 'lean_statement'; the formal tier is part "
+                        "of the declared proof standard")
                 propositions.append(Proposition(
                     prop_id=item["id"], kind=str(item.get("kind", "theorem")),
                     name=str(item.get("name", item["id"])),
                     statement=statement, hypotheses=tuple(hypotheses),
-                    lean_statement=str(item.get("lean_statement", ""))))
+                    lean_statement=lean,
+                    sympy_expression=expression,
+                    script=exact_decider(expression, statement=statement)))
             if not propositions or len({item.prop_id for item in propositions}) != len(propositions):
                 raise ValueError("claim ids must be unique")
             self.plan = TopicPlan(self.topic, tuple(propositions), strategy="llm-authored",
