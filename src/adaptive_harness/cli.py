@@ -675,6 +675,11 @@ def research(
                                          help="Worker tool loops a division may run at once; 1 is serial"),
     worker_timeout: Optional[float] = typer.Option(None, "--worker-timeout",
                                                   help="Seconds a single worker tool loop may run before TIMED_OUT"),
+    task_lease: float = typer.Option(1800.0, "--task-lease",
+                                     help="Seconds a worker may hold a task before another may "
+                                          "take it; renewed automatically while the worker runs"),
+    task_attempts: int = typer.Option(3, "--task-attempts", min=1,
+                                      help="Attempts per task before it is written off"),
     overseer_stop: int = typer.Option(3, "--overseer-stop", min=1,
                                       help="Runtime-overseer escalations in one attempt before a lead "
                                            "stops the worker; 1 is aggressive, higher is patient"),
@@ -720,6 +725,9 @@ def research(
                          max_parallel_workers=parallel_workers,
                          worker_timeout_s=worker_timeout, resume=resume,
                          overseer_stop_threshold=overseer_stop,
+                         task_lease_s=task_lease,
+                         task_lease_renew_s=max(30.0, task_lease / 6.0),
+                         max_task_attempts=task_attempts,
                          seed=seed,
                          llm_client_factory=client_factory,
                          claim=claim,

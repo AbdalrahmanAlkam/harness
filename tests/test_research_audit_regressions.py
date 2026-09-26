@@ -376,5 +376,7 @@ def test_live_artifact_worker_writes_target_before_verification_loop(tmp_path: P
     swarm._produce(Division.THEORY, swarm.agents[worker_id],
                    "mathematical_soundness", [])
     assert calls[0]["tool_names_override"] == ("write_file",)
-    assert calls[1] == {}
+    # The second stage runs the real tool loop, not the write-only pass.
+    assert "tool_names_override" not in calls[1]
+    assert "max_steps_override" not in calls[1]
     assert (swarm.workspace.proof_dir / "prop-01.py").is_file()

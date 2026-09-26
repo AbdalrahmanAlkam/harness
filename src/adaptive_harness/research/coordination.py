@@ -935,6 +935,8 @@ class SwarmControl:
         self._run_pause = StopSignal()
         self._run_stop = StopSignal()
         self.stopped_by = ""
+        self._heartbeat: threading.Thread | None = None
+        self._heartbeat_stop: threading.Event | None = None
 
     # -- roster -------------------------------------------------------------
     def register(self, agent_id: str, *, role: str = "", division: str = "",
@@ -1233,6 +1235,50 @@ class SwarmControl:
     def should_stop(self, _report: Any = None) -> bool:
         """The ``should_stop`` hook the convergence loop calls between cycles."""
         return self.run_stopped
+
+    # -- lease heartbeat ----------------------------------------------------
+    def start_heartbeat(self, interval_s: float = 300.0) -> None:
+        """Keep the leases of running workers alive on a background clock.
+
+        Renewal from inside a worker's event handler is not sufficient. A single
+        tool call — a Lean build, a long simulation — can outlast the lease while
+        the worker has no opportunity to run any code, and a lease that lapses on
+        a live owner hands the task to the next leaser, which then writes the same
+        artifact. That is the collision the board exists to prevent, arriving
+        through a clock rather than through a missing check.
+
+        So the heartbeat is a daemon thread that renews for every worker the
+        control plane currently records as RUNNING. It never fails a worker, and it
+        stops with the run.
+        """
+        if interval_s <= 0 or self._heartbeat is not None:
+            return
+        stop = threading.Event()
+        self._heartbeat_stop = stop
+
+        def beat() -> None:
+            while not stop.wait(interval_s):
+                for record in self.running():
+                    task_id = record.task_id
+                    if not task_id or self.board is None:
+                        continue
+                    try:
+                        self.board.renew(task_id, record.agent_id)
+                    except (CoordinationError, KeyError):
+                        # The task is settled or gone. Nothing to keep alive.
+                        continue
+
+        thread = threading.Thread(target=beat, name="swarm-lease-heartbeat", daemon=True)
+        self._heartbeat = thread
+        thread.start()
+
+    def stop_heartbeat(self) -> None:
+        stop, self._heartbeat_stop = self._heartbeat_stop, None
+        thread, self._heartbeat = self._heartbeat, None
+        if stop is not None:
+            stop.set()
+        if thread is not None:
+            thread.join(timeout=5)
 
     # -- reporting ----------------------------------------------------------
     def _emit(self, message: str) -> None:

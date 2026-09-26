@@ -904,6 +904,7 @@ def test_a_worker_that_exceeds_its_budget_is_timed_out_and_retryable(tmp_path: P
         time.sleep(0.8)  # let the budget lapse while the model is still parked
     finally:
         release.set()
+        swarm.control.stop_heartbeat()
     worker.join(timeout=30)
     assert not worker.is_alive()
     assert "exception" not in result, result["exception"]
@@ -959,3 +960,58 @@ def test_a_retry_is_told_why_the_previous_attempt_failed(tmp_path: Path):
     assert retried, "the retry never learned from the failure"
     assert "attempt 2" in retried[0]
     assert "sympy.has does not exist" in retried[0]
+
+
+def test_a_long_attempt_keeps_its_lease_so_no_sibling_can_steal_the_artifact(tmp_path: Path):
+    """The lease must be renewed while a worker runs.
+
+    Without renewal a worker that outlasted its lease lost the task mid-attempt,
+    and the next leaser started writing the same file — the exact collision the
+    board exists to prevent, reappearing through a clock.
+    """
+    swarm = _swarm(tmp_path, worker_max_steps=200, task_lease_s=0.4, task_lease_renew_s=0.05)
+    # The heartbeat is what makes a long attempt safe; run() starts it, so the
+    # test has to as well.
+    swarm.control.start_heartbeat(swarm.config.task_lease_renew_s)
+    agent_id = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "long run", ["run_bash"])
+    task = _new_task(swarm)
+    _write(swarm, task.artifact, PROOF_BODY)
+    _write(swarm, str(Path(task.artifact).with_suffix(".md")), "# derivation\n")
+    swarm.board.lease(task.task_id, agent_id)
+    parked, release = threading.Event(), threading.Event()
+
+    def factory():
+        client = _BlockingClient(parked, release)
+        client.default_model = "stealth/space-bunny-alpha"
+        return client
+
+    swarm.config.llm_client_factory = factory
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            result.update(swarm._produce(Division.THEORY, swarm.agents[agent_id],
+                                         "mathematical_soundness", [], task=task))
+        except BaseException as exc:  # noqa: BLE001 - surfaced as an assertion below
+            result["exception"] = f"{type(exc).__name__}: {exc}"
+
+    swarm.control.begin(agent_id, task_id=task.task_id)
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    try:
+        assert parked.wait(timeout=30)
+        # Far longer than the lease, with the model still mid-attempt and no
+        # opportunity to run any code of its own.
+        time.sleep(1.2)
+        held = swarm.board.get(task.task_id)
+        assert held.owner == agent_id, "the lease expired mid-attempt"
+        # And a rival genuinely cannot take the task or the artifact.
+        with pytest.raises(Exception) as refused:
+            swarm.board.lease(task.task_id, "rival_worker")
+        assert "already leased" in str(refused.value)
+    finally:
+        release.set()
+        swarm.control.stop_heartbeat()
+    worker.join(timeout=30)
+    assert not worker.is_alive()
+    assert "exception" not in result, result["exception"]

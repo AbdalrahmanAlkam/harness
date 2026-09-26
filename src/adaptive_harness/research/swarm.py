@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 import re
 import textwrap
+import time
 from typing import Any, Callable, Mapping, Sequence
 
 from adaptive_harness.research.claim import (EXIT_COUNTEREXAMPLE, EXIT_HOLDS, ClaimLedger,
@@ -208,6 +209,10 @@ class SwarmConfig:
     # A lease that outlives its owner would strand the board, and a lease shorter
     # than a single tool loop would let two workers share one artifact.
     task_lease_s: float = 1800.0
+    # How often a running worker refreshes its lease. Must be well under
+    # ``task_lease_s`` or a long attempt loses its task mid-flight and a sibling
+    # starts writing the same artifact.
+    task_lease_renew_s: float = 300.0
     max_task_attempts: int = 3
     # How many workers of one division may run their tool loops at once. 1
     # restores the historical serial behaviour; the default runs a division's
@@ -1510,7 +1515,8 @@ class ResearchSwarm:
                     *, success_criterion: str, target: Path,
                     tool_names_override: tuple[str, ...] | None = None,
                     max_steps_override: int | None = None,
-                    extra_writes: Sequence[Path] = ()) -> dict[str, Any]:
+                    extra_writes: Sequence[Path] = (),
+                    task_id: str = "") -> dict[str, Any]:
         """Run one worker as a multi-step, tool-using subagent.
 
         This replaces a single-shot text completion. The worker is a real agent
@@ -1765,7 +1771,8 @@ class ResearchSwarm:
                     "Success: either exhibit a concrete counterexample with the exact input that "
                     f"produced it, or state that the search was empty. Then reply with ONLY "
                     f"{FALSIFICATION_VERDICT}"),
-                target=target)
+                target=target,
+                task_id=task.task_id if task is not None else "")
             verdict = FalsificationVerdict.parse(outcome.get("summary"))
             if not outcome.get("tool_calls"):
                 verdict = FalsificationVerdict(Clearance.PENDING,
@@ -1935,7 +1942,8 @@ class ResearchSwarm:
                        f"Exact Lean target: {prop.lean_statement}. " if prop else "")
                     + receipts,
                     success_criterion=f"The exact target file {target.name} exists.",
-                    target=target, tool_names_override=("write_file",), max_steps_override=2)
+                    target=target, tool_names_override=("write_file",), max_steps_override=2,
+                    task_id=task.task_id if task is not None else "")
                 if bootstrap.get("cancelled"):
                     return self._settle(task, agent, bootstrap, cancelled=True)
             criterion = (f"Success: write proofs/{target.stem}.md giving the hypotheses, the "
@@ -1973,7 +1981,8 @@ class ResearchSwarm:
                                        + ("Read receipt_manifest.json and cite every verified "
                                           "tag in paper.typ. Run compile_typst and fix all warnings. "
                                           if target == self.workspace.paper_typ else ""),
-                                       success_criterion=criterion, target=target)
+                                       success_criterion=criterion, target=target,
+                                       task_id=task.task_id if task is not None else "")
             self.ledger.append("STATUS_REPORT", {"agent_id": agent.agent_id, "role": agent.role_name},
                                {"agent_id": leader_agent_id(division),
                                 "role": DIVISION_SPECS[division].leader_title},
@@ -2246,6 +2255,8 @@ class ResearchSwarm:
 
         self._status_callback = emit
         self.control.on_status = emit
+        # Keep running workers' leases alive independently of their tool loops.
+        self.control.start_heartbeat(self.config.task_lease_renew_s)
 
         if self._live_research_mode():
             self._prepare_live_research(objective)
@@ -2282,6 +2293,7 @@ class ResearchSwarm:
         emit(f"convergence loop finished: {outcome.stop_reason.value}")
         self._last_outcome = outcome
         self._last_report = outcome.final_report
+        self.control.stop_heartbeat()
         self.board.save(self.workspace.root / TASK_BOARD_FILENAME)
         # Re-render once with the terminal state so the delivered PDF reports
         # the verdict it was published under, not the previous cycle's.
