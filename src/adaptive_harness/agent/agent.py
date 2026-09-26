@@ -416,11 +416,11 @@ class DeveloperAgent:
         heuristic_domain = self.domain_classifier.classify(user_input)
         if self.forced_mode is None and classifier_name != "semif" and heuristic_domain.confidence >= 0.8:
             domain_res = heuristic_domain
-        if (self.forced_mode is None and requests_file_changes(original_input) and
-                re.search(r"\b(?:file|folder|directory|code|app|function|module|project)\b|"
-                          r"\b[\w./-]+\.(?:py|js|ts|html|css|json|md|toml)\b", original_input, re.I)):
-            # An explicit request to create or edit project files should not
-            # lose its coding tools to a noisy domain prediction.
+        mutation_required = (requests_file_changes(original_input) if self.require_file_changes is None
+                             else self.require_file_changes)
+        if self.forced_mode is None and mutation_required:
+            # File changes requested by the user take precedence over a
+            # classifier's read-only audit or research label.
             domain_res = DomainAssessment(DomainMode.CODING, 0.95)
         predicted_level = ThinkingLevel(thinking_prediction.label)
         heuristic_thinking = self.thinking_classifier.classify(user_input)
@@ -502,8 +502,6 @@ class DeveloperAgent:
 
         # Add user message to history
         self.messages.append({"role": "user", "content": user_input})
-        mutation_required = (requests_file_changes(original_input) if self.require_file_changes is None
-                             else self.require_file_changes)
         successful_mutations = 0
         skill_guidance = "\n".join(
             f"Active skill: {skill.title}. {skill.instructions} Completion checks: {', '.join(skill.invariants) or 'none'}."

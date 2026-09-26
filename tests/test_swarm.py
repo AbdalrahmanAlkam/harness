@@ -129,6 +129,7 @@ def test_swarm_rejects_mismatched_and_unserializable_worker_results(tmp_path):
 
 def test_swarm_worker_coder_gets_all_core_tools_and_writes_real_file(tmp_path):
     schemas = []
+    coder_prompts = []
 
     class Client:
         default_model = "z-ai/glm-5.3-flash"
@@ -142,6 +143,7 @@ def test_swarm_worker_coder_gets_all_core_tools_and_writes_real_file(tmp_path):
                 return LLMResponse(tool_calls=[ToolCall(id="sec", name="read_file",
                                                         arguments={"path": "gps_app/index.html"})])
             if "write_file" in names:
+                coder_prompts.append(kwargs["messages"][0]["content"])
                 return LLMResponse(tool_calls=[
                     ToolCall(id="html", name="write_file", arguments={
                         "path": "gps_app/index.html", "content": "<!doctype html><title>GPS</title><link rel='stylesheet' href='style.css'><script src='main.js'></script>"}),
@@ -165,6 +167,7 @@ def test_swarm_worker_coder_gets_all_core_tools_and_writes_real_file(tmp_path):
     assert (tmp_path / "gps_app/main.js").is_file()
     assert any({"write_file", "edit_file", "read_file", "list_directory", "search_files",
                 "run_bash", "run_pytest"}.issubset(names) for names in schemas)
+    assert any("write-enabled Coder subagent" in prompt for prompt in coder_prompts)
 
 
 # --- Remediation regressions -----------------------------------------------

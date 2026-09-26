@@ -291,7 +291,7 @@ class DeveloperAgentWorker:
             if (assignment.workspace_root / "tests").is_dir():
                 tools.append(RunPytestTool(workspace_root=root))
         prompts = PromptRegistry.for_workspace(assignment.workspace_root)
-        role_prompt = (prompts.get("system.default") if assignment.may_edit else
+        role_prompt = (prompts.get("system.default") + "\n" + prompts.get("swarm.role.coder") if assignment.may_edit else
                        prompts.get("swarm.role.security") if assignment.role is SwarmRole.SECURITY else
                        prompts.get("swarm.role.read_only"))
         agent = DeveloperAgent(llm_client=self.llm_client_factory() if self.llm_client_factory else None,

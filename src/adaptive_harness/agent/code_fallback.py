@@ -14,8 +14,14 @@ _EDIT_INTENT = re.compile(r"\b(?:create|write|build|implement|edit|modify|make|a
 
 
 def requests_file_changes(prompt: str) -> bool:
-    return bool(_EDIT_INTENT.search(prompt)) and not bool(re.search(
-        r"^\s*(?:explain|describe|review|inspect|read|show|how|why)\b", prompt, re.I))
+    if not _EDIT_INTENT.search(prompt):
+        return False
+    if not re.search(r"^\s*(?:explain|describe|review|inspect|read|show|how|why)\b", prompt, re.I):
+        return True
+    # "Review and fix" requests implementation even though its first verb
+    # is observational. "Show how to fix" remains read-only.
+    return bool(re.search(r"\b(?:and|then)\s+(?:also\s+)?(?:create|write|build|implement|edit|modify|make|add|fix|refactor|generate)\b",
+                          prompt, re.I))
 
 
 def extract_file_calls(response: str, prompt: str) -> list[ToolCall]:

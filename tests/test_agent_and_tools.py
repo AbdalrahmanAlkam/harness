@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from adaptive_harness.agent.agent import AgentEvent, DeveloperAgent
+from adaptive_harness.agent.code_fallback import requests_file_changes
 from adaptive_harness.classifiers.ambiguity_classifier import AmbiguityClassifier
 from adaptive_harness.classifiers.complexity_router import ComplexityRouter
 from adaptive_harness.classifiers.skill_classifier import SkillClassifier
@@ -57,6 +58,35 @@ def test_llm_client_mock_mode():
     resp_tool = client.complete(messages=[{"role": "user", "content": "run tests with pytest"}])
     assert len(resp_tool.tool_calls) == 1
     assert resp_tool.tool_calls[0].name == "run_bash"
+
+
+@pytest.mark.parametrize("prompt", [
+    "audit and fix security vulnerabilities",
+    "review and fix the bugs",
+    "fix everything",
+])
+def test_explicit_repairs_keep_write_tools(tmp_path: Path, prompt: str):
+    calls = []
+
+    class Client:
+        default_model = "mock"
+
+        def complete(self, **kwargs):
+            calls.append(kwargs)
+            return LLMResponse(content="done", model="mock")
+
+    agent = DeveloperAgent(llm_client=Client(), workspace_root=str(tmp_path))
+    events = list(agent.run_stream(prompt, max_steps=1))
+    domain = next(event.payload for event in events if event.event_type == "domain_mode")
+    names = {tool["function"]["name"] for tool in calls[0]["tools"]}
+    assert requests_file_changes(prompt)
+    assert domain["mode"] == "coding"
+    assert {"write_file", "edit_file", "run_bash", "run_pytest"} <= names
+
+
+def test_explanation_of_a_fix_remains_read_only():
+    assert not requests_file_changes("show how to fix a bug")
+    assert not requests_file_changes("review this code")
 
 
 def test_turbo_skips_semantic_question_but_keeps_destructive_gate(tmp_path: Path):
