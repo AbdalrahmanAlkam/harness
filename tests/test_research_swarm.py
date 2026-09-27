@@ -333,6 +333,7 @@ def test_artifact_tree_is_created_on_construction(tmp_path: Path):
     assert swarm.workspace.objective_spec.is_file() is False  # written on run()
 
 
+@pytest.mark.slow
 def test_unsolved_run_reports_honestly_and_stays_terminated(tmp_path: Path):
     """No artifacts: the loop must escalate, then concede with UNSOLVED."""
     swarm = ResearchSwarm("unsolved", root=tmp_path, config=SwarmConfig(max_cycles=4))
@@ -405,6 +406,7 @@ def test_typst_string_escaping_does_not_corrupt_paths():
     assert typst_escape("a_b") == "a\\_b"
 
 
+@pytest.mark.slow
 def test_solved_run_produces_a_verified_ledger_and_a_pdf(tmp_path: Path):
     """The full green path: proofs, experiments, red team, and a clean build."""
     # The swarm derives its own slug, so seed the directory it will actually use.
@@ -534,6 +536,7 @@ def test_research_tools_are_exposed_only_in_investigative_modes(tmp_path: Path):
 
 # -- live authoring --------------------------------------------------------
 
+@pytest.mark.slow
 def test_live_author_writes_artifacts_and_records_them(tmp_path: Path):
     """The --author path: a model callback produces content that is persisted.
 
@@ -573,6 +576,7 @@ def test_live_author_writes_artifacts_and_records_them(tmp_path: Path):
     assert any("artifact" in entry.payload for entry in swarm.ledger.by_action("STATUS_REPORT"))
 
 
+@pytest.mark.slow
 def test_silent_author_leaves_the_gate_unsatisfied(tmp_path: Path):
     """An author that produces nothing must not let a topic look solved."""
     swarm = ResearchSwarm("balanced routing under heavy-tailed delay", root=tmp_path,
@@ -691,6 +695,7 @@ def test_escape_math_free_preserves_math_spans():
     assert "a\\_b\\_c" in out
 
 
+@pytest.mark.slow
 def test_autonomous_run_settles_a_derivable_topic(tmp_path: Path):
     """The end-to-end promise: a bare topic yields proofs, a verdict, and a PDF."""
     swarm = ResearchSwarm(
@@ -710,6 +715,7 @@ def test_autonomous_run_settles_a_derivable_topic(tmp_path: Path):
     assert "PROVEN" in paper
 
 
+@pytest.mark.slow
 def test_a_false_claim_is_refuted_and_still_publishes(tmp_path: Path):
     """A clean refutation is a successful research outcome, not a failure."""
     swarm = ResearchSwarm("quadratic expansion", root=tmp_path,
@@ -724,6 +730,7 @@ def test_a_false_claim_is_refuted_and_still_publishes(tmp_path: Path):
     assert "DISPROVEN" in Path(swarm.workspace.paper_typ).read_text()
 
 
+@pytest.mark.slow
 def test_unmatched_topic_yields_an_honest_empty_paper(tmp_path: Path):
     """No derivable claim must produce an explicit INCONCLUSIVE, not a fake result."""
     swarm = ResearchSwarm("zzz qqq unmatchable topic", root=tmp_path,

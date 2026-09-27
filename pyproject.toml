@@ -43,3 +43,11 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+# `slow` marks tests that compile real Lean 4 proofs or drive a multi-cycle
+# research swarm. They dominate the wall clock (the swarm and Lean files alone
+# are most of a full run), so day-to-day development skips them with
+# `pytest -m "not slow"`. The default still runs everything, so a plain `pytest`
+# stays the full gate.
+markers = [
+    "slow: compiles a real Lean 4 toolchain or drives a full research swarm",
+]

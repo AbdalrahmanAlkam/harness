@@ -130,6 +130,7 @@ def test_no_model_means_not_requested_rather_than_declined():
 
 # -- end to end ------------------------------------------------------------
 
+@pytest.mark.slow
 def test_uncovered_topic_is_formulated_and_decided(tmp_path: Path):
     swarm = _swarm(tmp_path, GOOD_FORMULATION)
     assert swarm.plan.strategy == "dynamic-formulation"
@@ -146,6 +147,7 @@ def test_uncovered_topic_is_formulated_and_decided(tmp_path: Path):
     assert Path(outcome.pdf).is_file()
 
 
+@pytest.mark.slow
 def test_a_formulated_but_false_claim_is_refused_not_believed(tmp_path: Path):
     """The decisive property: a model's false claim is refuted by exit code."""
     swarm = _swarm(tmp_path, FALSE_FORMULATION)
@@ -159,6 +161,7 @@ def test_a_formulated_but_false_claim_is_refused_not_believed(tmp_path: Path):
     assert "DISPROVEN" in Path(swarm.workspace.paper_typ).read_text()
 
 
+@pytest.mark.slow
 def test_the_formulation_is_recorded_in_the_objective_spec(tmp_path: Path):
     swarm = _swarm(tmp_path, GOOD_FORMULATION)
     swarm.run()
@@ -168,6 +171,7 @@ def test_the_formulation_is_recorded_in_the_objective_spec(tmp_path: Path):
     assert "A difference of squares factors" in spec
 
 
+@pytest.mark.slow
 def test_a_declined_formulation_is_reported_not_hidden(tmp_path: Path):
     swarm = _swarm(tmp_path, None)
     outcome = swarm.run()
@@ -185,6 +189,7 @@ def test_formulation_can_be_disabled(tmp_path: Path):
     assert swarm.plan.propositions == ()
 
 
+@pytest.mark.slow
 def test_covered_topics_are_not_re_formulated(tmp_path: Path):
     """A topic the library covers must not be second-guessed by the model."""
     client_holder: list[FormulatingClient] = []

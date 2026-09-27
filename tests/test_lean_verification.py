@@ -256,6 +256,7 @@ def test_sorry_is_caught_before_compiling(tmp_path: Path):
 
 # -- the formalisation library --------------------------------------------
 
+@pytest.mark.slow
 def test_every_library_proof_is_accepted_by_lean(tmp_path: Path):
     """No proof may ship unverified.
 
@@ -314,6 +315,7 @@ def test_gate_refuses_clearance_without_lean(tmp_path: Path, monkeypatch):
     assert "unavailable" in detail
 
 
+@pytest.mark.slow
 def test_gate_refuses_clearance_with_no_proofs(tmp_path: Path):
     from adaptive_harness.research.lean_gate import LeanProofGate
 
@@ -377,6 +379,7 @@ def test_lean_files_land_in_proofs_lean_and_not_in_the_sympy_gate(tmp_path: Path
 
 
 @needs_lean
+@pytest.mark.slow
 def test_paper_carries_the_lean_boxes_and_listings(tmp_path: Path):
     from adaptive_harness.research import ResearchSwarm
 
@@ -394,6 +397,7 @@ def test_paper_carries_the_lean_boxes_and_listings(tmp_path: Path):
 
 
 @needs_lean
+@pytest.mark.slow
 def test_tampered_lean_file_blocks_the_run(tmp_path: Path):
     """The defining negative control.
 

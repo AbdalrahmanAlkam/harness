@@ -364,6 +364,7 @@ def test_a_proof_script_that_exits_zero_is_not_reported_as_failing(tmp_path: Pat
     assert [receipt.status for receipt in swarm.proofs.receipts] == ["VERIFIED_EXIT_0"]
 
 
+@pytest.mark.slow
 def test_stopping_the_run_ends_the_loop_with_an_attributable_external_stop(tmp_path: Path):
     from adaptive_harness.research.gate import StopReason
     swarm = _swarm(tmp_path, absolute_ceiling=20, max_cycles=20)

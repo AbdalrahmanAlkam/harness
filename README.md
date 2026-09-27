@@ -62,6 +62,19 @@ Verified developer trajectories are stored in `output/experience.db`. Similar ve
 
 Install `pip install 'adaptive-harness[plotting]'` to enable `plot_terminal` line, scatter, and bar charts in science and benchmark tasks. The tool validates bounded finite data and prints an inline terminal chart. The sandboxed `run_python_repl` also exposes optional `plotext` as `plt` for scripts that call `plt.show()`; the optional package must be installed before use.
 
+### Running the tests
+
+A full `pytest` run compiles real Lean 4 proofs and drives several full research swarms, so it takes a few minutes. Those tests carry a `slow` marker, and skipping them brings a run down to well under two minutes:
+
+```bash
+pytest -m "not slow"   # the development loop
+pytest                  # the full gate, including Lean and the swarm
+```
+
+A test is `slow` when it compiles a real Lean 4 toolchain or runs a multi-cycle research swarm. Everything else — the agent loop, tools, TUI, classifiers, storage, and the Typst and system-prompt regressions — runs in seconds. `pytest -k <name>` narrows further, and `pytest --durations=15` shows where the time actually goes.
+
+`pytest -n auto` (via `pytest-xdist`) is *not* recommended: `test_a_worker_that_exceeds_its_budget_is_timed_out_and_retryable` relies on state left by earlier tests in its own file, so it passes or fails depending on how the scheduler distributes that file. Run serially.
+
 ### Copying text
 
 Drag across any text in the chat log to select it; the selection is highlighted and Ctrl+C copies it. With nothing selected, Ctrl+C quits (Ctrl+C again exits immediately during a running task), and Ctrl+Shift+C or Ctrl+Y copy the latest agent reply, or a pending diff when one is awaiting review. `/copy` does the same as Ctrl+Shift+C, and `/output` opens a selectable full-text viewer where Ctrl+Shift+C copies the selection or the whole response.
