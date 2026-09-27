@@ -14,6 +14,11 @@ venv/
 
 output/*.db
 
+# Clipboard mirror: a deliberate copy of whatever the user last selected or
+# copied, so it can hold keys or other secrets. It is a recovery buffer, never
+# a source file, and must never be committed.
+output/clipboard/
+
 .env
 .env.*
 .harness/

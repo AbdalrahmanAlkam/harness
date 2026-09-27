@@ -708,7 +708,6 @@ def research(
     """
     from adaptive_harness.research.swarm import ResearchSwarm, SwarmConfig
 
-    author_fn = None
     client_factory = None
     if author:
         if provider.lower() != "openrouter":

@@ -11,7 +11,7 @@ from adaptive_harness.harness.policy import RoutingPolicy, ThresholdPolicy
 from adaptive_harness.harness.router import Router, RoutingUncertainty
 from adaptive_harness.harness.verifier import Verifier
 from adaptive_harness.models.classifier import TaskClassifier
-from adaptive_harness.models.domain import ExecutionAttempt, ExecutionTrace, Result, Task, VerificationResult
+from adaptive_harness.models.domain import ExecutionAttempt, ExecutionTrace, Task, VerificationResult
 from adaptive_harness.strategies import Strategy, get_default_strategies
 
 
@@ -57,7 +57,6 @@ class Harness:
         attempts: List[ExecutionAttempt] = []
         final_strategy = uncertainty.top1_strategy
         harness_success = False
-        final_result: Optional[Result] = None
 
         for strat_name in trial_plan:
             strategy = self.strategies.get(strat_name)
@@ -83,7 +82,6 @@ class Harness:
             if attempt.success:
                 final_strategy = strat_name
                 harness_success = (strat_name != "fallback")  # Fallback is graceful degradation, not task success
-                final_result = result
                 break
 
         # 4. If all planned strategies failed, trigger fallback if not already executed

@@ -142,7 +142,6 @@ def plot_confidence_vs_accuracy(
 
     bins = np.linspace(0.0, 1.0, n_bins + 1)
     centers = (bins[:-1] + bins[1:]) / 2.0
-    widths = np.diff(bins)
     bin_acc = []
     bin_n = []
 

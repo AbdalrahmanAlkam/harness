@@ -223,7 +223,6 @@ class RelentlessConvergenceLoop:
         self.history.clear()
         workers_total = 0
         stale_cycles = 0
-        last_fingerprint = report.fingerprint
         best_gap_count = len(report.gaps)
         budget = 2
         cycle_index = 0
@@ -256,7 +255,6 @@ class RelentlessConvergenceLoop:
             if progressed:
                 best_gap_count = gap_count
             if progressed:
-                last_fingerprint = report.fingerprint
                 stale_cycles = 0
                 budget = 2
             else:

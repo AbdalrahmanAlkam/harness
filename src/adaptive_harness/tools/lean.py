@@ -400,7 +400,9 @@ class LeanVerifier:
                 error=("Proof contains an unproven placeholder and was rejected: "
                        f"{describe_placeholders(placeholders)}"))
 
-        lean = self.toolchain.require()
+        # Raises with installation guidance when Lean is absent, so a proof is
+        # never reported unverified merely because the toolchain is missing.
+        self.toolchain.require()
         # The axiom audit must be part of the compiled file, so it is appended to
         # a sibling copy that is compiled in place of the original. The recorded
         # digest is always that of the original source, never of the audit.
