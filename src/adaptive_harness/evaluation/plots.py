@@ -140,7 +140,10 @@ def plot_confidence_vs_accuracy(
         for t in traces
     ], dtype=float)
 
-    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    # Must match the edges the metrics use exactly, or the plotted bar lands in a
+    # different bin from the one the ECE was computed over: linspace's 0.7 edge
+    # is 0.7000000000000001, which shifts a confidence of exactly 0.7 down a bin.
+    bins = np.arange(n_bins + 1) / n_bins
     centers = (bins[:-1] + bins[1:]) / 2.0
     bin_acc = []
     bin_n = []

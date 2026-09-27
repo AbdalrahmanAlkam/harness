@@ -35,7 +35,11 @@ def compute_ece(
     confidences = np.max(y_probs, axis=1)
     accuracies = (pred_indices == y_true_indices).astype(float)
 
-    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    # ``i / n_bins`` rather than ``linspace``, whose 0.7 edge is
+    # 0.7000000000000001 and would push a confidence of exactly 0.7 into the
+    # bin below. Keep this identical to evaluation.metrics, which is asserted
+    # to agree with this function.
+    bin_edges = np.arange(n_bins + 1) / n_bins
     bin_accuracies = []
     bin_confidences = []
     bin_counts = []

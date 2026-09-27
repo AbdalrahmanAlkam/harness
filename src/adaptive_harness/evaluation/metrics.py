@@ -26,20 +26,28 @@ def cross_entropy_loss(
     y_true: Union[List[str], np.ndarray],
     y_probs: np.ndarray,
     classes: List[str],
+    base: float = math.e,
 ) -> float:
-    """Computes Multi-Class Cross Entropy Loss: L = - (1/N) * sum_i sum_k y_ik * log(p_ik).
+    """Computes Multi-Class Cross Entropy Loss: L = (1/N) * sum_i -log_b(p_i, y_i).
 
     Penalizes overconfident incorrect routing predictions heavily.
+
+    The default base is ``math.e``, so the loss is in **nats**; that is the
+    historical behaviour and reported numbers do not move. Note that
+    :func:`shannon_entropy` defaults to base 2 and reports **bits** -- the two
+    are different units and must not be compared directly. Pass ``base=2.0``
+    for bits.
     """
     eps = 1e-12
     class_to_idx = {c: i for i, c in enumerate(classes)}
     n_samples = len(y_true)
     total_loss = 0.0
+    log = math.log2 if base == 2.0 else (lambda value: math.log(value, base))
 
     for i, y in enumerate(y_true):
         idx = class_to_idx[y] if isinstance(y, str) else int(y)
         prob = max(y_probs[i, idx], eps)
-        total_loss -= math.log(prob)
+        total_loss -= log(prob)
 
     return float(total_loss / max(n_samples, 1))
 
@@ -87,7 +95,12 @@ def expected_calibration_error(
     confidences = np.max(y_probs, axis=1)
     accuracies = (pred_idx == y_true_idx).astype(float)
 
-    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    # ``i / n_bins`` rather than ``linspace``: linspace yields 0.7000000000000001
+    # for the 0.7 edge, so a confidence of exactly 0.7 fails the ``>= low`` test
+    # and is filed one bin too low, on a reliability diagram that then shows the
+    # point in a bin it does not belong to. Exact division reproduces the
+    # decimal boundary the caller wrote.
+    bin_edges = np.arange(n_bins + 1) / n_bins
     bin_accuracies = []
     bin_confidences = []
     bin_counts = []
