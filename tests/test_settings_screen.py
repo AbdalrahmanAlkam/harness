@@ -91,7 +91,7 @@ async def test_the_screen_renders_a_row_per_setting(tmp_path: Path):
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.press("f7")
         await pilot.pause()
-        rows = app.screen.query(".settings-row")
+        rows = app.screen.query("SettingsRow")
         assert len(rows) == len(app._setting_rows())
 
 

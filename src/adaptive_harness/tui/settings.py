@@ -22,7 +22,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Label, Static
+from textual.widgets import Label, Static
 
 #: Settings whose value is one of a short fixed set. These cycle in place, so
 #: changing them costs one keypress instead of a second dialog.
@@ -73,6 +73,27 @@ class Setting:
     choices: tuple[str, ...] = ()
 
 
+class SettingsRow(Static):
+    """One selectable line in the settings list.
+
+    A ``Button`` cannot be used here: its component stylesheet sets
+    ``border: tall`` and ``line-pad: 1``, and a row sized to two cells has
+    *zero* content rows, so the background painted as a highlighted bar while
+    the label was never drawn. Worse, selecting a row with ``variant`` adds
+    ``-primary``, whose ``border: tall $primary`` outranks a plain
+    ``.settings-row`` rule, so the border came back. A focusable ``Static`` has
+    no such hidden geometry: one cell, one line of text, always visible.
+    """
+
+    can_focus = True
+
+    def on_click(self, event: events.Click) -> None:
+        event.stop()
+        screen = self.screen
+        if isinstance(screen, SettingsScreen):
+            screen.select_at(int((self.id or "row-0").removeprefix("row-")))
+
+
 class SettingsScreen(ModalScreen[str | None]):
     """Browse and change every persistent setting from one place."""
 
@@ -83,15 +104,17 @@ class SettingsScreen(ModalScreen[str | None]):
     #settings-title { height: 2; text-align: center; text-style: bold; color: $accent; }
     #settings-rows { height: 1fr; background: #202b3a; }
     #settings-help { height: 1; color: $text-muted; text-align: center; }
-    .settings-row { width: 100%; height: 2; min-height: 2;
-                    background: #202b3a; color: #ffffff; }
-    .settings-row:hover, .settings-row:focus { border: heavy #72baff; background: #274c77;
-                    color: #ffffff; text-style: bold; }
+    SettingsRow { width: 100%; height: 1; min-height: 1; padding: 0 1;
+                  background: #202b3a; color: #ffffff;
+                  text-align: left; content-align: left middle; }
+    SettingsRow:hover, SettingsRow:focus, SettingsRow.selected {
+                  background: #274c77; color: #ffffff; text-style: bold; }
     #settings-detail { height: 2; color: #cdd6f4; background: #313244; padding: 0 1; }
     """
 
     BINDINGS = [
         Binding("escape", "close", "Close"),
+        Binding("enter", "activate", "Change", show=False),
         Binding("up", "previous", "Previous", show=False),
         Binding("down", "next", "Next", show=False),
     ]
@@ -115,14 +138,14 @@ class SettingsScreen(ModalScreen[str | None]):
     async def on_mount(self) -> None:
         await self._render_rows()
         if self.settings:
-            self.query_one("#settings-0", Button).focus()
+            self._focus_row()
 
     async def _render_rows(self) -> None:
         rows = self.query_one("#settings-rows", VerticalScroll)
         await rows.remove_children()
         await rows.mount_all(
-            Button(self._row_text(index), id=f"settings-{index}",
-                   classes="settings-row", variant="primary" if index == self.selected else "default")
+            SettingsRow(self._row_text(index), id=f"row-{index}",
+                        classes="selected" if index == self.selected else "")
             for index in range(len(self.settings)))
 
     async def refresh_rows(self) -> None:
@@ -147,6 +170,18 @@ class SettingsScreen(ModalScreen[str | None]):
         self.query_one("#settings-detail", Static).update(
             Text(f"{DESCRIPTIONS.get(setting.key, '')}  ·  {hint}"))
 
+    def _mark_selected(self, index: int) -> None:
+        for position in range(len(self.settings)):
+            row = self.query(f"SettingsRow#row-{position}")
+            if not row:
+                continue
+            row = row.first()
+            row.remove_class("selected")
+            if position == index:
+                row.add_class("selected")
+            if position == index:
+                row.update(self._row_text(position))
+
     def _replace(self, index: int, value: str) -> None:
         self.settings[index] = Setting(self.settings[index].key, self.settings[index].label,
                                        value, self.settings[index].kind,
@@ -155,18 +190,22 @@ class SettingsScreen(ModalScreen[str | None]):
     def _focus_row(self) -> None:
         if not self.settings:
             return
-        self.query_one(f"#settings-{self.selected}", Button).focus()
+        self.query_one(f"SettingsRow#row-{self.selected}").focus()
+
+    def select_at(self, index: int) -> None:
+        """Point the selection at a row, from a click or from the keyboard."""
+        if not self.settings or not 0 <= index < len(self.settings):
+            return
+        self._mark_selected(index)
+        self.selected = index
+        self._update_detail()
+        self._focus_row()
 
     def _move(self, delta: int) -> None:
         if not self.settings:
             return
-        button = self.query_one(f"#settings-{self.selected}", Button)
-        if button.has_focus:
-            button.variant = "default"
-        self.selected = max(0, min(self.selected + delta, len(self.settings) - 1))
-        self.query_one(f"#settings-{self.selected}", Button).variant = "primary"
-        self._update_detail()
-        self.query_one(f"#settings-{self.selected}", Button).scroll_visible()
+        self.select_at(max(0, min(self.selected + delta, len(self.settings) - 1)))
+        self.query_one(f"SettingsRow#row-{self.selected}").scroll_visible()
 
     def action_previous(self) -> None:
         self._move(-1)
@@ -174,16 +213,18 @@ class SettingsScreen(ModalScreen[str | None]):
     def action_next(self) -> None:
         self._move(1)
 
-    def on_button_focused(self, event: events.Focus) -> None:
-        if event.button.id and event.button.id.startswith("settings-"):
-            self.selected = int(event.button.id.split("-")[1])
-            self._update_detail()
+    def action_activate(self) -> None:
+        if self.settings:
+            self._activate(self.settings[self.selected])
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if not event.button.id or not event.button.id.startswith("settings-"):
-            return
-        self.selected = int(event.button.id.split("-")[1])
-        self._activate(self.settings[self.selected])
+    def on_settings_row_focused(self, event: events.Focus) -> None:
+        widget = event.widget
+        if isinstance(widget, SettingsRow) and widget.id and widget.id.startswith("row-"):
+            index = int(widget.id.removeprefix("row-"))
+            if index != self.selected:
+                self._mark_selected(index)
+                self.selected = index
+                self._update_detail()
 
     def _activate(self, setting: Setting) -> None:
         if setting.kind == "cycle" and setting.choices:
@@ -192,7 +233,7 @@ class SettingsScreen(ModalScreen[str | None]):
             self._replace(self.selected, following)
             if self.on_change is not None:
                 self.on_change(setting.key, following)
-            self.query_one(f"#settings-{self.selected}", Button).label = self._row_text(self.selected)
+            self.query_one(f"SettingsRow#row-{self.selected}").update(self._row_text(self.selected))
             return
         # Anything richer is owned by the app, which already has a working flow
         # for it. This screen steps aside rather than reimplementing it.

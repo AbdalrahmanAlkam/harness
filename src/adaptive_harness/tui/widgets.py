@@ -592,6 +592,7 @@ class PinnedRichLog(RichLog):
 class ThemeOption(Button):
     def __init__(self, theme_name: str, index: int):
         super().__init__(theme_name.replace("-", " ").title(), id=f"theme-{index}", classes="theme-option")
+        _make_row_readable(self)
         self.theme_name = theme_name
 
     def _preview(self) -> None:
@@ -605,6 +606,37 @@ class ThemeOption(Button):
         self._preview()
 
 
+def _make_row_readable(button: Button) -> None:
+    """Give a `Button` row one cell of content and a visible label.
+
+    A `Button` wears ``border: tall`` -- one cell top and bottom -- and
+    ``line-pad: 1``. A row sized to two cells therefore has *zero* content rows:
+    the border and background paint, which looks like a highlighted bar, while
+    the label is never drawn at all.
+
+    CSS cannot be relied on to fix this. ``Button.-primary`` carries
+    ``border: tall $primary``, whose specificity beats a plain ``.row`` rule, so
+    selecting a row by ``variant`` brings the border straight back; and a
+    screen's ``DEFAULT_CSS`` loses to the widget's own component stylesheet. Only
+    inline styles always win, so the geometry is set here.
+
+    The border is removed rather than the row being made taller. A three-cell row
+    would fix the text but overflow the scrolling list, and a ``VerticalScroll``
+    consumes the arrow keys once it overflows, which silently breaks the
+    up/down navigation the pickers are driven by.
+    """
+    # A border is (width, style) per edge, so a width of zero removes it. The
+    # literal "none" looks like it should work but raises on a widget that has
+    # not been mounted yet, which is exactly when a row is built.
+    button.styles.border = (0, "red")
+    button.styles.height = 1
+    button.styles.min_height = 1
+    button.styles.padding = (0, 1)
+    button.styles.text_align = "left"
+    button.styles.content_align_horizontal = "left"
+    button.styles.content_align_vertical = "middle"
+
+
 class ThemePickerModal(ModalScreen[str | None]):
     """Preview themes on hover/focus; Enter saves and Escape restores."""
 
@@ -614,9 +646,10 @@ class ThemePickerModal(ModalScreen[str | None]):
                   background: #1e1e2e; color: #ffffff; border: round #89b4fa; padding: 1 2; }
     #theme-title { height: 2; text-align: center; text-style: bold; color: $accent; }
     #theme-scroll { height: 1fr; }
-    .theme-option { width: 100%; height: 2; min-height: 2; margin-bottom: 0;
+    /* Geometry is set inline by _make_row_readable; only colour lives here. */
+    .theme-option { width: 100%; margin-bottom: 0;
                     background: #202b3a; color: #ffffff; }
-    .theme-option:hover, .theme-option:focus { border: heavy #72baff;
+    .theme-option:hover, .theme-option:focus { border: none;
                     background: #274c77; color: #ffffff; text-style: bold; }
     #theme-help { height: 2; color: $text; text-align: center; }
     """
@@ -680,9 +713,9 @@ class QuickSelectModal(ModalScreen[str | None]):
     #quick-results { height: 1fr; }
     #quick-detail { height: 3; color: #ffffff; background: #313244; padding: 0 1; }
     #quick-help { height: 1; color: $text-muted; text-align: center; }
-    .quick-choice { width: 100%; height: 2; min-height: 2;
-                    background: #202b3a; color: #ffffff; }
-    .quick-choice:hover, .quick-choice:focus { border: heavy #72baff;
+    /* Geometry is set inline by _make_row_readable; only colour lives here. */
+    .quick-choice { width: 100%; background: #202b3a; color: #ffffff; }
+    .quick-choice:hover, .quick-choice:focus { border: none;
                     background: #274c77; color: #ffffff; text-style: bold; }
     #quick-results { background: #202b3a; color: #ffffff; }
     #quick-search { background: #202b3a; color: #ffffff; }
@@ -722,10 +755,13 @@ class QuickSelectModal(ModalScreen[str | None]):
         if not self.visible_choices:
             await results.mount(Static("No matching choices."))
             return
-        await results.mount_all(
-            Button(label, id=f"quick-{index}", classes="quick-choice",
-                   variant="primary" if index == self.selected_index else "default")
-            for index, (_, label) in enumerate(self.visible_choices))
+        rows = []
+        for index, (_, label) in enumerate(self.visible_choices):
+            button = Button(label, id=f"quick-{index}", classes="quick-choice",
+                            variant="primary" if index == self.selected_index else "default")
+            _make_row_readable(button)
+            rows.append(button)
+        await results.mount_all(rows)
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "quick-search":
