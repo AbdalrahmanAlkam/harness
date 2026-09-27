@@ -246,12 +246,18 @@ class DeveloperAgent:
                          backup_providers=source.backup_providers)
 
     def _summarize_tool_output(self, tool_name: str, output: str) -> str:
-        """Ask the secondary model to compress one tool result."""
+        """Ask the secondary model to compress one tool result.
+
+        ``complete`` takes no ``max_tokens``; the length cap is applied to the
+        reply in the filter. Passing an unsupported keyword raised TypeError,
+        which the filter's fail-open guard then swallowed -- so the feature was
+        silently inert against the real client while every stubbed test passed.
+        """
         instruction = self.prompts.get("tool_filter.summarize", tool=tool_name)
         response = self._secondary_llm_client().complete(
             messages=[{"role": "system", "content": instruction},
                       {"role": "user", "content": output[:20_000]}],
-            temperature=0.0, max_tokens=400)
+            temperature=0.0)
         return getattr(response, "content", "") or ""
 
     def enable_swarm(self, enabled: bool) -> None:

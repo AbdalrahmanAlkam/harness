@@ -160,6 +160,50 @@ def test_the_recall_tool_cannot_be_filtered_away(tmp_path: Path):
     assert "read_full_output" in agent.tools
 
 
+def test_the_summariser_works_against_the_real_client_signature(tmp_path: Path):
+    """Regression: `complete` takes no `max_tokens`.
+
+    Passing it raised TypeError inside the real call, and the filter's fail-open
+    guard swallowed the error, so the feature was inert in production while every
+    stubbed test passed. The assertion is deliberately about a real
+    LLMClient.complete call rather than a stub.
+    """
+    import inspect
+
+    from adaptive_harness.llm.client import LLMClient
+
+    assert "max_tokens" not in inspect.signature(LLMClient.complete).parameters
+
+    client = ScriptedClient("run_bash", {"command": "pytest"})
+    agent = _agent(tmp_path, client, NoisyBash(NOISY))
+    # No exception, and a real string comes back for the filter to use.
+    summary = agent._summarize_tool_output("run_bash", NOISY)
+    assert isinstance(summary, str) and summary
+
+
+def test_a_configured_secondary_model_still_filters_with_a_real_client(tmp_path: Path):
+    """A separate client for the secondary model must not disable the feature."""
+    class Primary(LLMClient):
+        def __init__(self):
+            super().__init__(force_mock=True)
+            self.turn = 0
+
+        def complete(self, **kwargs):
+            messages = list(kwargs.get("messages") or [])
+            if any("compressing the output" in str(m.get("content", "")) for m in messages):
+                return LLMResponse(content="SUMMARY: 300 passing tests.")
+            self.turn += 1
+            if self.turn == 1:
+                return LLMResponse(content="", tool_calls=[{"id": "c1", "name": "run_bash",
+                                                            "arguments": {"command": "pytest"}}])
+            return LLMResponse(content="Done.")
+
+    agent = _agent(tmp_path, Primary(), NoisyBash(NOISY), secondary_model="cheap/small")
+    events = list(agent.run_stream("run the tests"))
+    assert [e for e in events if e.event_type == "output_filtered"], (
+        "the gate must still fire when a secondary model is configured")
+
+
 def test_a_broken_secondary_model_does_not_break_the_run(tmp_path: Path):
     class BrokenClient(ScriptedClient):
         def complete(self, **kwargs):

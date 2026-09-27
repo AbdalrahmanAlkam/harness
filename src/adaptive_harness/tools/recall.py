@@ -45,13 +45,20 @@ class ReadFullOutputTool(Tool):
                 error=(f"Unknown or expired token {token}. It was filtered earlier in this "
                        f"session but the archive no longer holds it; re-run the tool to see "
                        f"its output again."))
-        if len(archived) > self.limit:
+        truncated = len(archived) > self.limit
+        if truncated:
             head = self.limit * 2 // 3
             tail = self.limit - head - 60
-            body = (archived[:head].rstrip()
+            # Say so up front. The notice in the transcript promises the full
+            # output, and quietly returning a slice would make the model reason
+            # about text it never saw.
+            banner = (f"[showing the first {head:,} and last {tail:,} of "
+                      f"{len(archived):,} characters — this read is capped]\n\n")
+            body = (banner + archived[:head].rstrip()
                     + f"\n… {len(archived) - head - tail:,} characters omitted …\n"
                     + archived[-tail:].lstrip())
         else:
             body = archived
         return ToolResult(success=True, output=body,
-                          metadata={"token": token, "truncated": len(archived) > self.limit})
+                          metadata={"token": token, "truncated": truncated,
+                                    "total_chars": len(archived)})

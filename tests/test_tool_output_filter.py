@@ -220,8 +220,19 @@ def test_read_full_output_truncates_a_huge_archive_entry():
     result = ReadFullOutputTool(archive, limit=1000).execute(token=token)
     assert result.success
     assert result.metadata["truncated"] is True
+    assert result.metadata["total_chars"] == 40_000 + len("tool=run_pytest\n")
+    # The cap is announced, not hidden: the transcript promised the full output.
+    assert "this read is capped" in result.output
     assert "characters omitted" in result.output
-    assert len(result.output) < 1200
+    assert len(result.output) < 1300
+
+
+def test_an_uncapped_read_does_not_claim_to_be_capped():
+    archive = ToolOutputArchive()
+    token = archive.store("run_bash", "z" * 500)
+    result = ReadFullOutputTool(archive, limit=20_000).execute(token=token)
+    assert result.metadata["truncated"] is False
+    assert "this read is capped" not in result.output
 
 
 # -- the real backend ------------------------------------------------------
