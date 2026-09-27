@@ -346,6 +346,10 @@ class AdaptiveHarnessApp(App):
         self._show_telemetry = True
         self._last_tool_output = ""
         self._last_agent_content = ""
+        # The composed system prompt is rebuilt before every request but is
+        # almost always byte-identical to the previous one. Remembering the last
+        # copy lets the log reprint it only when it actually changes.
+        self._last_shown_system_prompt: str | None = None
         self._clarification_future: concurrent.futures.Future[str] | None = None
         self._session_restore_warning = ""
         self._preference_warning = ""
@@ -1101,6 +1105,8 @@ class AdaptiveHarnessApp(App):
         self.agent.active_skills.clear()
         self._last_tool_output = ""
         self._last_agent_content = ""
+        # A new conversation is a fresh chance to audit what the model was told.
+        self._last_shown_system_prompt = None
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self._reasoning_tokens = 0
@@ -1911,9 +1917,21 @@ class AdaptiveHarnessApp(App):
         elif et == "system_prompt":
                 ingested = ", ".join(f"{key}={value}" for key, value in (p.get("ingested") or {}).items()
                                      if value not in (False, None, "", []))
-                log.write(Text(f"◈ Ingested system prompt ({len(p['content']):,} chars)"
+                content = p["content"]
+                unchanged = content == self._last_shown_system_prompt
+                self._last_shown_system_prompt = content
+                log.write(Text(f"◈ Ingested system prompt ({len(content):,} chars)"
                                f"{': ' + ingested if ingested else ''}", style="dim"))
-                log.write(Text(p["content"], style="dim"))
+                if unchanged:
+                    # Reprinting a byte-identical prompt on every turn buried
+                    # the conversation and read as though the prompt were being
+                    # injected over and over. The model only ever receives one
+                    # system message, so the repeat carried no information the
+                    # summary line does not already give.
+                    log.write(Text("unchanged since the previous prompt · /prompts to review",
+                                   style="dim"))
+                else:
+                    log.write(Text(content, style="dim"))
         elif et == "prompt_injection":
                 label = {"runtime_overseer": "classifier · runtime overseer",
                          "claim_check": "classifier · claim check",
