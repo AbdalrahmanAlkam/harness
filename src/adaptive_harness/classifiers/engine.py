@@ -18,6 +18,10 @@ DOMAIN_LABELS = ["coding", "research", "science", "audit"]
 THINKING_LABELS = ["none", "low", "medium", "deep"]
 TIER_LABELS = ["fast", "standard", "reasoning"]
 VERIFICATION_LABELS = ["success", "syntax_error", "test_failure", "file_error", "runtime_error"]
+#: Whether a tool's output carries evidence worth spending the main model's
+#: context on. The distinction is about *information*, not size: a long stack
+#: trace is signal, and a short "ok" can be noise.
+OUTPUT_VALUE_LABELS = ["signal", "noise"]
 
 TRAINING = {
     "coding": ["fix the Python bug", "refactor the API", "implement a new feature", "write unit tests", "review the git diff", "compile this project"],
@@ -36,6 +40,18 @@ TRAINING = {
     "test_failure": ["pytest assertion failed", "unit test failed", "test suite reported failures", "expected value differs from actual"],
     "file_error": ["file not found", "path does not exist", "missing directory", "no such file or directory"],
     "runtime_error": ["process crashed", "nonzero exit code", "uncaught exception", "tool operation failed"],
+    # Judged on the *content* of a tool result, not on the task: these examples
+    # are what tool output looks like when it does and does not carry evidence.
+    "signal": ["Traceback (most recent call last): NameError: name 'foo' is not defined",
+               "E   AssertionError: expected 3 got 4",
+               "FAILED tests/test_api.py::test_create - KeyError: 'id'",
+               "error: could not resolve dependency: package `serde` not found",
+               "src/main.rs:42:8: mismatched types, expected u32 found &str",
+               "FAILURE: Build failed with an exception. Could not resolve all files for configuration ':app'"],
+    "noise": ["test_build_a PASSED", "test_build_b PASSED", "test_build_c PASSED",
+              "ok ok ok ok ok", "[ 50 percent] Building", "[ 60 percent] Building",
+              "loading module loading symbol linking stripping installing",
+              "progress chatter with no errors, no values and no decisions"],
 }
 
 SEMIF_DESCRIPTIONS = {
@@ -61,6 +77,8 @@ SEMIF_DESCRIPTIONS = {
     "test_failure": "Unit test assertions failed or pytest reported test failures.",
     "file_error": "File or directory path was not found or does not exist.",
     "runtime_error": "Uncaught exception, crash, or non-zero exit status.",
+    "signal": "Tool output carrying real evidence: errors, stack traces, assertion failures, diffs, or concrete values the agent must act on.",
+    "noise": "Tool output that is only progress, repetition, padding, or passing-test chatter, carrying no evidence the agent needs.",
     "HEALTHY_PROGRESS": "The agent is making verified progress with distinct useful tool actions.",
     "LOOPING_DETECTED": "The agent repeats the same command or edit and cycles without a new strategy.",
     "HALLUCINATION_DETECTED": "The agent claims files, symbols, or passing checks despite contrary tool evidence.",
@@ -154,7 +172,8 @@ class SklearnBackend(BaseClassifierBackend):
         start = time.perf_counter()
         if set(labels).issubset(set(self.skill.pipeline.classes_)):
             probabilities = _normalize(self.skill.classify(text).probabilities, labels)
-        elif set(labels) in (set(DOMAIN_LABELS), set(THINKING_LABELS), set(TIER_LABELS), set(VERIFICATION_LABELS)):
+        elif set(labels) in (set(DOMAIN_LABELS), set(THINKING_LABELS), set(TIER_LABELS),
+                              set(VERIFICATION_LABELS), set(OUTPUT_VALUE_LABELS)):
             key = tuple(sorted(labels))
             if key not in self._pipelines:
                 from sklearn.feature_extraction.text import TfidfVectorizer
