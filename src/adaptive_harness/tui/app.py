@@ -2101,6 +2101,13 @@ class AdaptiveHarnessApp(App):
                                    style="dim"))
                 else:
                     log.write(Text(content, style="dim"))
+        elif et == "output_filtered":
+                saved = max(0, p["raw_chars"] - p["kept_chars"])
+                log.write(Text(
+                    f"◈ {p['tool']} output judged low-value · {p['raw_chars']:,} → "
+                    f"{p['kept_chars']:,} chars, about {saved // 4:,} tokens saved · "
+                    f"{p['token']} to read it all · summarised by {p['secondary_model']}",
+                    style="dim"))
         elif et == "prompt_injection":
                 label = {"runtime_overseer": "classifier · runtime overseer",
                          "claim_check": "classifier · claim check",

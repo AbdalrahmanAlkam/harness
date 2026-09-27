@@ -75,6 +75,31 @@ A test is `slow` when it compiles a real Lean 4 toolchain or runs a multi-cycle 
 
 `pytest -n auto` (via `pytest-xdist`) is *not* recommended: `test_a_worker_that_exceeds_its_budget_is_timed_out_and_retryable` relies on state left by earlier tests in its own file, so it passes or fails depending on how the scheduler distributes that file. Run serially.
 
+### Settings
+
+F7, or `/settings`, opens one screen listing every persistent setting with its current value. This is the place to look; each setting is still reachable from its own command, but the set of things you can change no longer has to be known in advance.
+
+A setting with a short fixed set — mode, thinking, safety, step policy, swarm, isolation, output filter — advances on Enter. The two model rows open the searchable catalogue; provider, max steps, classifier, and theme hand off to the command that already owns them. Everything changed here is written to the session row and to `~/.config/adaptive-harness/config.json` together, so `/new` and a restart agree with what the screen showed.
+
+### Keeping the main model's context clean
+
+Every tool result is replayed on every subsequent request, so one verbose `run_pytest` is paid for again and again until compaction rescues it. The harness therefore asks the local classifier whether each result is worth the main model's context, and only when it is judged noise is a **secondary** model asked to compress it.
+
+```
+◈ run_pytest output judged low-value · 48,120 → 412 chars, about 11,927 tokens saved ·
+  OUTPUT-3 to read it all · summarised by anthropic/claude-haiku-3.5
+```
+
+Set a cheap secondary model in the settings screen, or with `--secondary-model`. Left unset, the primary model does the compression: the context is still saved, only the money is not, which is the reason to choose one. The secondary model is only ever asked to compress — it never sees the task, so choosing badly cannot corrupt an answer.
+
+Three properties make this safe rather than lossy:
+
+- **Errors are never compressed.** A failure is the evidence the agent needs, and the classifier is not consulted for one.
+- **The gate fails open.** An unavailable backend, an unsupported label set, a summariser that errors, or a summary that merely echoes its input all leave the original text exactly as it was. Losing context is worse than wasting it.
+- **Nothing is destroyed.** The original is kept behind a short `OUTPUT-n` token in a bounded archive. If the summary is not enough, the model calls `read_full_output` with the token and gets everything. A token that has aged out says so plainly and tells the model to re-run the tool.
+
+`signal` versus `noise` is a judgement about information, not size: a long stack trace is signal, and a short `ok` can be noise. Switch the whole thing off with the Output filter setting.
+
 ### Copying text
 
 Drag across any text in the chat log to select it; the selection is highlighted and Ctrl+C copies it. With nothing selected, Ctrl+C quits (Ctrl+C again exits immediately during a running task), and Ctrl+Shift+C or Ctrl+Y copy the latest agent reply, or a pending diff when one is awaiting review. `/copy` does the same as Ctrl+Shift+C, and `/output` opens a selectable full-text viewer where Ctrl+Shift+C copies the selection or the whole response.

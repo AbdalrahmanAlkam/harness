@@ -6,6 +6,27 @@ All notable changes to Adaptive Agent Harness. The entries under
 
 ## [Unreleased]
 
+### Added
+- **A settings screen.** F7 or `/settings` lists every persistent setting with
+  its live value, instead of one command and one function key per knob. Short
+  fixed sets cycle in place; the two model rows open the existing catalogue
+  picker; everything else delegates to the command that already owns it, so the
+  screen never becomes a second implementation of a setting's behaviour.
+- **A configurable secondary model.** The cheap model asked to compress noisy
+  tool output. Unset, the primary model does the compression -- the main model's
+  context is still saved, only the cost is not. The secondary model is only ever
+  asked to compress and never sees the task, so choosing badly cannot corrupt an
+  answer.
+- **Classifier-gated tool-output filtering.** Every tool result is replayed on
+  every subsequent request, so one verbose `run_pytest` is paid for repeatedly.
+  The local classifier now judges whether a result is worth the main model's
+  context, and only noise is compressed. Errors are never compressed and the
+  classifier is not consulted for one. The gate fails open: an unavailable
+  backend, a failing summariser, or a summary that merely echoes its input all
+  leave the text untouched. The original is archived behind a short `OUTPUT-n`
+  token and the model can spend it with `read_full_output`, so filtering is not
+  lossy. The filter is switchable from the settings screen.
+
 ### Changed
 - **A fresh session now starts in coding mode with the swarm off.** The
   harness is a software engineering tool first, and multi-agent delegation
