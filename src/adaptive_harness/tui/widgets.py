@@ -2,20 +2,27 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 import shlex
 from rich.panel import Panel
 from rich.console import Group
 from rich.rule import Rule
+from rich.segment import Segment
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from rich.syntax import Syntax
 from adaptive_harness.llm.client import MODEL_TIERS
 from textual.app import ComposeResult
 from textual import events
+from textual.content import Content
 from textual.message import Message
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
+from textual.selection import Selection
+from textual.style import Style as TextualStyle
+from textual.strip import Strip
+from textual.visual import Visual
 from textual.widgets import Button, Input, Label, RichLog, Static, TextArea
 
 
@@ -34,7 +41,48 @@ THEME_CHOICES = (
 )
 
 
-class ClassifierTelemetryWidget(Static):
+class RichSelectableMixin:
+    """Make a widget that renders a Rich object selectable and copyable.
+
+    ``textual.widget.Widget.get_selection`` only extracts text when the widget's
+    render is a ``Text`` or a ``Content``. Any Rich renderable — a ``Panel``,
+    ``Table``, ``Group``, or ``Syntax`` — is wrapped by ``visualize`` into a
+    ``RichVisual``, the ``isinstance`` check fails, and the method returns
+    ``None``. Textual's compositor still *highlights* such a region, so the
+    widget looks draggable and selectable while a copy silently yields nothing.
+
+    This mixin closes that gap by extracting from the same strips the
+    compositor draws, so a drag over any Rich-rendered panel yields real text.
+    Plain ``Text``/``Content`` widgets keep Textual's own implementation.
+    """
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        visual = self._render()
+        if isinstance(visual, (Text, Content)):
+            return super().get_selection(selection)
+        # Selection offsets are content relative, so the strips are rendered at
+        # the content width. Height is unbounded because a drag may reach past
+        # the visible viewport into rows the widget has not scrolled to.
+        width = max(1, self.scrollable_content_region.width or self.content_size.width)
+        strips = Visual.to_strips(self, visual, width, None, TextualStyle(),
+                                  apply_selection=False)
+        lines = [strip.text.rstrip() for strip in strips]
+        if not lines:
+            return None
+        # A drag that ends on empty space below the content would otherwise ask
+        # for rows that do not exist.
+        start, end = selection.start, selection.end
+        if start is not None and start.y >= len(lines):
+            return None
+        if end is not None and end.y >= len(lines):
+            end = None
+        if start is not None and end is not None and (start.y, start.x) > (end.y, end.x):
+            start, end = end, start
+        extracted = Selection(start, end).extract("\n".join(lines))
+        return (extracted, "\n") if extracted else None
+
+
+class ClassifierTelemetryWidget(RichSelectableMixin, Static):
     """Real-time classifier telemetry panel displaying live probabilities, entropy, and tier."""
 
     DEFAULT_CSS = """
@@ -394,8 +442,39 @@ class CommandPalette(Static):
         return output
 
 
+def _overlay_style(strip: Strip, style: Style) -> Strip:
+    """Layer ``style`` on top of the strip's existing styling.
+
+    ``Strip.apply_style`` inserts the style as a *base* layer, so any colour the
+    strip already carries wins and the highlight would be invisible. Overlaying
+    keeps the chat log's own colours and paints the selection on top of them.
+    """
+    segments = [
+        Segment(segment.text,
+                None if segment.control or segment.style is None else segment.style + style,
+                segment.control)
+        for segment in strip
+    ]
+    return Strip(segments, strip.cell_length)
+
+
 class PinnedRichLog(RichLog):
-    """A log that stops following output while the reader scrolls upward."""
+    """A log that stops following output while the reader scrolls upward.
+
+    ``RichLog`` advertises ``ALLOW_SELECT`` but is not actually selectable:
+    ``Widget.get_selection`` only understands widgets whose ``render()`` returns
+    a ``Text``/``Content``, and ``RichLog`` is a ``ScrollView`` that renders
+    ``Strip`` objects. The inherited implementation therefore returns ``None``
+    for every selection, which is why copying from the chat log was impossible.
+
+    Three pieces are restored here, mirroring ``textual.widgets.Log``:
+
+    * ``render_line`` stamps absolute content offsets onto every strip so the
+      compositor can map a mouse position back to a (row, column) pair in the
+      log's own coordinate space, even when the view is scrolled,
+    * ``render_line`` paints the selection highlight for the visible span,
+    * ``get_selection`` extracts the selected text from the rendered strips.
+    """
 
     ALLOW_SELECT = True
 
@@ -407,6 +486,65 @@ class PinnedRichLog(RichLog):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.pinned = False
+
+    def render_line(self, y: int) -> Strip:
+        """Render one viewport row, tagged with content offsets and selection."""
+        scroll_x, scroll_y = self.scroll_offset
+        content_y = scroll_y + y
+        strip = super().render_line(y).apply_offsets(scroll_x, content_y)
+        selection = self.text_selection
+        if selection is None:
+            return strip
+        span = selection.get_span(content_y)
+        if span is None:
+            return strip
+        start, end = span
+        limit = strip.cell_length
+        start = max(0, min(start, limit))
+        end = limit if end < 0 else max(start, min(end, limit))
+        if end <= start:
+            return strip
+        try:
+            style = self.screen.get_component_rich_style("screen--selection")
+        except Exception:  # pragma: no cover - component style is always defined
+            return strip
+        # ``Strip.divide`` drops the trailing piece when a cut lands on 0, which
+        # would truncate the line, so the three spans are cropped explicitly.
+        return Strip.join([strip.crop(0, start),
+                           _overlay_style(strip.crop(start, end), style),
+                           strip.crop(end)])
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        """Extract the selected text from the rendered strips.
+
+        Selection offsets are content relative, so they index ``self.lines``
+        directly rather than the scrolled viewport. Trailing padding is
+        stripped so a drag to the right edge does not copy blank columns.
+
+        The chat log is usually much taller than its content, so the pointer
+        routinely lands on a blank row past the last line. ``Selection.extract``
+        indexes the text without bounds checking and would raise ``IndexError``
+        there, taking the whole app down mid-drag, so the row range is clamped
+        before extraction.
+        """
+        lines = [strip.text.rstrip() for strip in self.lines]
+        if not lines:
+            return None
+        start, end = selection.start, selection.end
+        if start is not None and start.y >= len(lines):
+            return None
+        if end is not None and end.y >= len(lines):
+            end = None
+        if start is not None and end is not None and (start.y, start.x) > (end.y, end.x):
+            start, end = end, start
+        extracted = Selection(start, end).extract("\n".join(lines))
+        return (extracted, "\n") if extracted else None
+
+    def selection_updated(self, selection: Selection | None) -> None:
+        # ``RichLog`` caches rendered lines; the highlight is baked into them,
+        # so the cache has to go whenever the selection moves.
+        self._line_cache.clear()
+        self.refresh()
 
     def _set_pinned(self, pinned: bool) -> None:
         if self.pinned != pinned:
@@ -910,9 +1048,13 @@ class OutputViewerModal(ModalScreen[None]):
         if not selection:
             selection = self.query_one("#output-text", TextArea).selected_text
         copied = selection if selection else self.content
-        self.app.copy_to_clipboard(copied)
+        if not copied:
+            self.query_one("#output-help", Static).update("Nothing to copy yet · Esc close")
+            return
         label = "Selection" if selection else "Full response"
-        self.query_one("#output-help", Static).update(f"✓ {label} copied to clipboard · Esc close")
+        self.app.deliver_to_clipboard(copied)
+        self.query_one("#output-help", Static).update(
+            f"{label} copied · {self.app.last_clipboard_note()} · Esc close")
 
     def on_mount(self) -> None:
         self.query_one("#output-text", TextArea).focus()

@@ -18,19 +18,22 @@ from rich.markdown import Markdown
 from textual import work
 from textual.app import App, ComposeResult
 from textual import events
-from textual.containers import Container, Horizontal, Vertical
+from textual.binding import Binding
+from textual.containers import Container, Horizontal
+from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from adaptive_harness.agent.agent import AgentEvent, DeveloperAgent
 from adaptive_harness.agent.swarm import DeveloperAgentWorker, SwarmCoordinator
 from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.classifiers.engine import create_backend
-from adaptive_harness.classifiers.domain_classifier import parse_domain_mode
+from adaptive_harness.classifiers.domain_classifier import DomainMode, parse_domain_mode
 from adaptive_harness.classifiers.thinking_classifier import parse_thinking_level, BUDGET_TOKENS, effort_for_level
 from adaptive_harness.llm.effort import supported_efforts
 from adaptive_harness.data.storage import ExperienceRepository
 from adaptive_harness.data.config import (ConfigManager, PromptHistoryStore,
-                                          DEFAULT_MODEL, DEFAULT_MODEL_SELECTION, DEFAULT_SWARM_MODE)
+                                          DEFAULT_DOMAIN_MODE, DEFAULT_MODEL, DEFAULT_MODEL_SELECTION,
+                                          DEFAULT_SWARM_MODE)
 from adaptive_harness.data.credentials import CredentialsManager
 from adaptive_harness.data.sessions import SessionStore
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
@@ -41,8 +44,19 @@ from adaptive_harness.tui.widgets import (ClarificationModal, ClassifierTelemetr
     HistoryInput, PinnedRichLog, ThemePickerModal, QuickSelectModal, OutputViewerModal,
     CommandPalette, DiffReviewModal, THEME_CHOICES)
 from adaptive_harness.tui.formatting import format_model_markdown
+from adaptive_harness.tui import clipboard
 from adaptive_harness.workspace.worktree import WorktreeManager, WorktreeTask, WorktreeError
 
+
+SAFETY_PROFILES = ("turbo", "balanced", "cautious", "strict")
+STEP_POLICIES = ("classifier", "fixed", "unbounded")
+SWITCH_MODES = ("auto", "on", "off")
+
+#: Session settings that a `/new` must carry forward instead of dropping.
+SESSION_SETTING_KEYS = (
+    "mode", "thinking", "safety", "step_policy", "max_steps",
+    "swarm_mode", "isolation_mode",
+)
 
 COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/steps", "/prompts", "/safety", "/classifier", "/new",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
@@ -62,8 +76,8 @@ COMMAND_DESCRIPTIONS = {
     "/safety": "Choose interaction profile",
     "/theme": "Preview and save a terminal theme",
     "/classifier": "Switch local classification engine",
-    "/new": "Start a new session",
-    "/reset": "Clear current session state",
+    "/new": "Start a new session (keeps your settings)",
+    "/reset": "Clear session state; /reset defaults also resets settings",
     "/clear": "Clear the chat log",
     "/history": "Show earlier prompts",
     "/help": "Show commands and shortcuts",
@@ -76,7 +90,7 @@ COMMAND_DESCRIPTIONS = {
     "/skill": "Force or disable a skill",
     "/output": "Select or copy the latest agent response",
     "/tool-output": "Inspect the latest tool result",
-    "/copy": "Copy selected chat text",
+    "/copy": "Copy selected chat text, or the latest reply",
     "/export": "Export this session",
     "/diff": "Review isolated changes",
     "/isolation": "Set worktree isolation: auto, on, off",
@@ -95,6 +109,22 @@ def matching_commands(value: str) -> list[tuple[str, str]]:
     matched = [command for command in COMMANDS if command[1:].startswith(needle)]
     matched.extend(command for command in COMMANDS if command not in matched and fuzzy(command))
     return [(command, COMMAND_DESCRIPTIONS[command]) for command in matched]
+
+
+class HarnessScreen(Screen):
+    """Default screen that resolves the ``ctrl+c`` ambiguity.
+
+    ``textual.screen.Screen`` already binds ``ctrl+c`` to ``screen.copy_text``,
+    which silently shadows the application's own ``ctrl+c`` -> quit binding and
+    does nothing at all when no text is selected. Screen bindings win over app
+    bindings, so the advertised "Quit" shortcut was unreachable. Binding the
+    key here keeps a single, predictable meaning: copy the selection when there
+    is one, otherwise quit.
+    """
+
+    BINDINGS = [
+        Binding("ctrl+c,super+c", "app.copy_or_quit", "Copy / Quit", show=False),
+    ]
 
 
 class AdaptiveHarnessApp(App):
@@ -118,12 +148,23 @@ class AdaptiveHarnessApp(App):
     #main-container {
         height: 1fr;
     }
-    #chat-log {
+    /* The border and padding live on the frame, not on the log itself.
+       Textual's compositor cannot map a pointer inside a widget's border or
+       padding back to log content: it returns raw viewport coordinates
+       instead of the content offsets, so any drag starting or ending in that
+       gutter selects the wrong rows. With a zero-gutter log, every point
+       inside the widget is also a point inside its content. */
+    #chat-frame {
         width: 1fr;
         height: 100%;
         background: $background;
         border: solid $primary;
         padding: 1;
+    }
+    #chat-log {
+        width: 1fr;
+        height: 100%;
+        background: $background;
     }
     #input-container {
         height: 3;
@@ -152,7 +193,6 @@ class AdaptiveHarnessApp(App):
     """
 
     BINDINGS = [
-        ("ctrl+c", "quit", "Quit"),
         ("ctrl+l", "clear_screen", "Clear Log"),
         ("ctrl+shift+c", "copy_output", "Copy Output"),
         ("ctrl+y", "copy_output", "Copy Output"),
@@ -239,7 +279,11 @@ class AdaptiveHarnessApp(App):
         self.semif_device = semif_device
         self.semif_4bit = semif_4bit
         self.semif_temperature = semif_temperature
-        initial_mode = parse_domain_mode(mode)
+        cli_mode = parse_domain_mode(mode)
+        # A CLI flag pins the mode; without one the session starts in the
+        # built-in default and a remembered preference may still override it.
+        self._default_mode = parse_domain_mode(DEFAULT_DOMAIN_MODE) or DomainMode.CODING
+        initial_mode = cli_mode or self._default_mode
         initial_thinking = parse_thinking_level(thinking)
         initial_effort = effort_for_level(initial_thinking) if initial_thinking else None
         if not requested_auto_model and initial_thinking is not None:
@@ -248,7 +292,7 @@ class AdaptiveHarnessApp(App):
                     initial_effort and initial_effort not in supported):
                 raise ValueError(f"{self.default_model} supports reasoning efforts: "
                                  f"{', '.join(supported) or 'auto only'}")
-        self._cli_mode_override = initial_mode
+        self._cli_mode_override = cli_mode
         self._cli_thinking_override = initial_thinking
         self._cli_step_policy_override = step_policy
         self._cli_max_steps_override = max_steps
@@ -256,6 +300,17 @@ class AdaptiveHarnessApp(App):
             raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
         self._cli_safety_override = safety
         self._default_safety = "turbo"
+        # Settings pinned on the command line are never written back to the
+        # stored profile, so a one-off launch flag stays a one-off. The step
+        # policy always arrives with its default value, so it only counts as
+        # pinned once the user asked for something other than "classifier".
+        self._cli_pinned_preferences = {
+            "mode": self._cli_mode_override is not None,
+            "thinking": self._cli_thinking_override is not None,
+            "safety": self._cli_safety_override is not None,
+            "step_policy": self._cli_step_policy_override not in (None, "classifier"),
+            "max_steps": self._cli_max_steps_override is not None,
+        }
         self._model_catalog: list[CatalogModel] = []
         self._activity = "Ready"
         self._activity_pulse = False
@@ -293,6 +348,8 @@ class AdaptiveHarnessApp(App):
         self._last_agent_content = ""
         self._clarification_future: concurrent.futures.Future[str] | None = None
         self._session_restore_warning = ""
+        self._preference_warning = ""
+        self._last_clipboard = clipboard.ClipboardDelivery("", "none")
         self._quit_when_finished = False
         self.prompt_tokens = 0
         self.completion_tokens = 0
@@ -324,6 +381,7 @@ class AdaptiveHarnessApp(App):
             overseer_backend=create_backend("onnx", overseer_model) if overseer_model else None,
         )
         self.agent.subagent_event_callback = self._subagent_event
+        self._apply_saved_preferences()
         if session_id:
             self._restore_session(preserve_cli_overrides=True)
 
@@ -332,10 +390,14 @@ class AdaptiveHarnessApp(App):
         return urlparse(self.base_url or os.environ.get("OPENROUTER_BASE_URL", "")).hostname in {
             "localhost", "127.0.0.1", "::1"}
 
+    def get_default_screen(self) -> HarnessScreen:
+        return HarnessScreen(id="_default")
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="main-container"):
-            yield PinnedRichLog(id="chat-log", min_width=1, wrap=True, highlight=True, markup=True)
+            with Container(id="chat-frame"):
+                yield PinnedRichLog(id="chat-log", min_width=1, wrap=True, highlight=True, markup=True)
             yield ClassifierTelemetryWidget(id="telemetry")
             yield CommandPalette(id="command-palette")
 
@@ -385,6 +447,13 @@ class AdaptiveHarnessApp(App):
             log.write(Text(f"Connected to {self.agent.llm_client.base_url} using {self.agent.llm_client.default_model}\n", style="green"))
         if self._session_restore_warning:
             log.write(Text(self._session_restore_warning, style="yellow"))
+        if self._preference_warning:
+            log.write(Text(self._preference_warning, style="yellow"))
+        restored = self.config.preferences()
+        if restored:
+            log.write(Text("Restored saved settings · " + " · ".join(
+                f"{key}={value}" for key, value in sorted(restored.items()) if value)
+                + " · /reset defaults clears them", style="dim"))
         if self.config.last_error:
             log.write(Text(self.config.last_error, style="yellow"))
         if self.session.messages:
@@ -456,6 +525,8 @@ class AdaptiveHarnessApp(App):
                                  "safety": self.agent.safety_profile,
                                  "step_policy": self.agent.step_policy,
                                  "max_steps": str(self.agent.max_steps or ""),
+                                 "swarm_mode": self.swarm_mode,
+                                 "isolation_mode": self.isolation_mode,
                                  "prompt_tokens": str(self.prompt_tokens),
                                  "completion_tokens": str(self.completion_tokens),
                                  "reasoning_tokens": str(self._reasoning_tokens),
@@ -495,38 +566,38 @@ class AdaptiveHarnessApp(App):
         else:
             self.agent.llm_client.default_model = PROVIDERS[self.provider_name].default_model
         self.agent.set_workspace(self.session.workspace)
+        # Settings absent from an older session row fall back to the remembered
+        # preferences rather than to hardcoded defaults.
         try:
             self.agent.forced_mode = (self._cli_mode_override if preserve_cli_overrides and self._cli_mode_override
-                                      else parse_domain_mode(settings.get("mode", "auto")))
+                                      else parse_domain_mode(settings["mode"]) if settings.get("mode")
+                                      else self.agent.forced_mode)
             self.agent.forced_thinking = (self._cli_thinking_override if preserve_cli_overrides and self._cli_thinking_override
-                                          else parse_thinking_level(settings.get("thinking", "auto")))
+                                          else parse_thinking_level(settings["thinking"]) if settings.get("thinking")
+                                          else self.agent.forced_thinking)
         except ValueError as exc:
             self.agent.forced_mode = None
             self.agent.forced_thinking = None
             self._session_restore_warning = f"Saved mode or thinking level is invalid ({exc}); using auto."
-        saved_effort = effort_for_level(self.agent.forced_thinking) if self.agent.forced_thinking else None
-        supported = supported_efforts(self.agent.explicit_model or self.agent.llm_client.default_model,
-                                      self.provider_name)
-        if (self.agent.forced_thinking is ThinkingLevel.NONE and supported) or (
-                saved_effort and saved_effort not in supported):
-            self.agent.forced_thinking = None
+        if self._validate_thinking_effort():
             self._session_restore_warning = "Saved reasoning effort is unavailable for this model; using auto."
         self.agent.safety_profile = (self._cli_safety_override if preserve_cli_overrides and self._cli_safety_override
-                                     else settings.get("safety", self._default_safety))
-        if self.agent.safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
-            self.agent.safety_profile = "turbo"
+                                     else settings.get("safety") or self.agent.safety_profile)
+        if self.agent.safety_profile not in SAFETY_PROFILES:
+            self.agent.safety_profile = self._default_safety
         self.agent.step_policy = (self._cli_step_policy_override
-                                  if preserve_cli_overrides and self._cli_step_policy_override
-                                  else settings.get("step_policy", "classifier"))
-        if self.agent.step_policy not in {"classifier", "fixed", "unbounded"}:
+                                  if preserve_cli_overrides and self._cli_pinned_preferences["step_policy"]
+                                  else settings.get("step_policy") or self.agent.step_policy)
+        if self.agent.step_policy not in STEP_POLICIES:
             self.agent.step_policy = "classifier"
         if preserve_cli_overrides and self._cli_max_steps_override:
             self.agent.max_steps = self._cli_max_steps_override
-        else:
-            try:
-                self.agent.max_steps = int(settings["max_steps"]) if settings.get("max_steps") else None
-            except (TypeError, ValueError):
-                self.agent.max_steps = None
+        elif settings.get("max_steps"):
+            self.agent.max_steps = self._parse_max_steps(settings["max_steps"])
+        for attribute in ("swarm_mode", "isolation_mode"):
+            if settings.get(attribute) in SWITCH_MODES:
+                setattr(self, attribute, settings[attribute])
+        self.agent.enable_swarm(self.swarm_mode != "off")
         for field, setting in (("prompt_tokens", "prompt_tokens"),
                                ("completion_tokens", "completion_tokens"),
                                ("_reasoning_tokens", "reasoning_tokens"),
@@ -566,9 +637,104 @@ class AdaptiveHarnessApp(App):
             except (OSError, ValueError):
                 pass
 
+    def _apply_saved_preferences(self) -> None:
+        """Restore the settings the user last chose so they never fall back.
+
+        Precedence is CLI flag > saved session > saved preference > default.
+        This runs before any explicit session is restored, so loading a session
+        with ``/session load`` still wins over the remembered defaults.
+        """
+        try:
+            saved = self.config.preferences()
+        except (OSError, ValueError):
+            return
+        if not saved:
+            return
+        for attribute in ("swarm_mode", "isolation_mode"):
+            if saved.get(attribute) in SWITCH_MODES:
+                setattr(self, attribute, saved[attribute])
+        self.agent.enable_swarm(self.swarm_mode != "off")
+        if self._cli_mode_override is None and saved.get("mode"):
+            try:
+                self.agent.forced_mode = parse_domain_mode(saved["mode"])
+            except ValueError:
+                self._preference_warning = f"Saved mode '{saved['mode']}' is unknown; using auto."
+        if self._cli_thinking_override is None and saved.get("thinking"):
+            try:
+                self.agent.forced_thinking = parse_thinking_level(saved["thinking"])
+            except ValueError:
+                self._preference_warning = (
+                    f"Saved reasoning level '{saved['thinking']}' is unknown; using auto.")
+            else:
+                if self._validate_thinking_effort():
+                    self._preference_warning = (
+                        "Saved reasoning level is unavailable for this model; using auto.")
+        if self._cli_safety_override is None and saved.get("safety") in SAFETY_PROFILES:
+            self.agent.safety_profile = saved["safety"]
+        if self._cli_step_policy_override is None and saved.get("step_policy") in STEP_POLICIES:
+            self.agent.step_policy = saved["step_policy"]
+        if self._cli_max_steps_override is None:
+            self.agent.max_steps = self._parse_max_steps(saved.get("max_steps"))
+
+    def _validate_thinking_effort(self) -> bool:
+        """Drop a remembered reasoning level the active model cannot honour.
+
+        Returns:
+            True when the level had to be reset to auto.
+        """
+        if self.agent.forced_thinking is None:
+            return False
+        supported = supported_efforts(self.agent.explicit_model or self.agent.llm_client.default_model,
+                                      self.provider_name)
+        effort = effort_for_level(self.agent.forced_thinking)
+        if (self.agent.forced_thinking is ThinkingLevel.NONE and supported) or (
+                effort and effort not in supported):
+            self.agent.forced_thinking = None
+            return True
+        return False
+
+    @staticmethod
+    def _parse_max_steps(value: str | None) -> Optional[int]:
+        try:
+            parsed = int(value) if value else None
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed and parsed >= 1 else None
+
+    def _persist_preferences(self, *, force: bool = False) -> None:
+        """Write the live settings back to the private config so they survive.
+
+        Settings pinned by a command line flag are left untouched unless
+        ``force`` is set: a one-off ``--mode security`` must not silently
+        rewrite the profile the user gets on every future launch. ``force`` is
+        used by an explicit ``/reset defaults``.
+        """
+        try:
+            self.config.save_preferences(**{
+                key: value for key, value in (
+                    ("mode", self.agent.forced_mode.value if self.agent.forced_mode else "auto"),
+                    ("thinking", self.agent.forced_thinking.value if self.agent.forced_thinking else "auto"),
+                    ("safety", self.agent.safety_profile),
+                    ("step_policy", self.agent.step_policy),
+                    ("max_steps", str(self.agent.max_steps or "")),
+                    ("swarm_mode", self.swarm_mode),
+                    ("isolation_mode", self.isolation_mode),
+                ) if force or not self._cli_pinned_preferences.get(key)
+            })
+        except OSError as exc:
+            self._preference_warning = f"Settings could not be saved: {exc}"
+
     def on_unmount(self) -> None:
+        """Flush state exactly once, whatever route the app took out."""
         if self._clarification_future and not self._clarification_future.done():
             self._clarification_future.set_result("Action cancelled by user")
+        if self._review_manager and self._review_task:
+            try:
+                self._review_manager.abort(self._review_task)
+            except WorktreeError:
+                pass
+            self._review_manager = self._review_task = None
+        self._persist_preferences()
         if not self._busy:
             self._save_session()
         self.session_store.close()
@@ -603,18 +769,56 @@ class AdaptiveHarnessApp(App):
         log.clear()
         log._set_pinned(False)
 
-    def action_copy_output(self) -> None:
-        selected = self.screen.get_selected_text()
-        content = selected.strip() if selected and selected.strip() else (self._last_agent_content or self._review_patch)
-        if not content:
-            self.query_one("#chat-log", RichLog).write(Text("No agent output to copy yet.", style="yellow"))
-            return
+    def deliver_to_clipboard(self, text: str) -> clipboard.ClipboardDelivery:
+        """Copy ``text`` to the best available clipboard and remember the result.
+
+        The result is always recoverable, and the caller is told which route
+        worked so a silent no-op can never be mistaken for a successful copy.
+        A failure to write the escape sequence still produces a recovery file
+        rather than losing the text.
+        """
+        emitted, warnings = True, ()
         try:
-            self.copy_to_clipboard(content)
-            self.query_one("#chat-log", RichLog).write(Text("✓ Selected text copied." if selected else
-                "✓ Latest agent response copied. Select chat text with the mouse to copy a passage.", style="green"))
-        except Exception as exc:
-            self.query_one("#chat-log", RichLog).write(Text(f"Clipboard unavailable: {exc}", style="yellow"))
+            self.copy_to_clipboard(text)
+        except Exception as exc:  # pragma: no cover - driver level failure
+            emitted = False
+            warnings = (f"The terminal clipboard write failed ({type(exc).__name__}).",)
+        self._last_clipboard = clipboard.deliver(
+            text, emit_osc52=emitted,
+            mirror_directory=Path(self.workspace_root) / clipboard.MIRROR_DIRECTORY,
+            extra_warnings=warnings)
+        return self._last_clipboard
+
+    def last_clipboard_note(self) -> str:
+        """A short human summary of the most recent copy."""
+        delivery = self._last_clipboard
+        if delivery.mirror_path is not None:
+            return f"clipboard: {delivery.method} · saved {delivery.mirror_path}"
+        return f"clipboard: {delivery.method}"
+
+    def action_copy_output(self) -> None:
+        """Copy the current selection, or the latest agent response as a fallback."""
+        log = self.query_one("#chat-log", RichLog)
+        selected = self.screen.get_selected_text()
+        if not selected or not selected.strip():
+            selected = self._last_agent_content or self._review_patch
+        if not selected:
+            log.write(Text("Nothing to copy yet. Drag across the chat log to select text, "
+                           "or run a task first.", style="yellow"))
+            return
+        delivery = self.deliver_to_clipboard(selected)
+        style = "green" if delivery.delivered else "yellow"
+        message = delivery.summary()
+        if not delivery.delivered:
+            message += " Install wl-clipboard/xclip, or run: xclip -selection clipboard"
+        log.write(Text(message, style=style))
+
+    def action_copy_or_quit(self) -> None:
+        """``ctrl+c``: copy the selection when there is one, otherwise quit."""
+        if self.screen.get_selected_text():
+            self.action_copy_output()
+            return
+        self.action_quit()
 
     def action_quit(self) -> None:
         if self._busy and not self._quit_when_finished:
@@ -654,13 +858,6 @@ class AdaptiveHarnessApp(App):
         self._review_patch = ""
         self.query_one("#telemetry", ClassifierTelemetryWidget).update_telemetry(workspace_isolation="Direct workspace")
         log.write(Text(result, style="bold green" if decision == "merge" else "yellow"))
-
-    def on_unmount(self) -> None:
-        if self._review_manager and self._review_task:
-            try:
-                self._review_manager.abort(self._review_task)
-            except WorktreeError:
-                pass
 
     def action_choose_model(self) -> None:
         if self._busy:
@@ -767,13 +964,15 @@ class AdaptiveHarnessApp(App):
         self._refresh_status()
 
     def _set_safety(self, profile: str) -> None:
-        if profile not in {"turbo", "balanced", "cautious", "strict"}:
+        if profile not in SAFETY_PROFILES:
             self.query_one("#chat-log", RichLog).write(Text("Choose turbo, balanced, cautious, or strict.", style="yellow"))
             return
         self.agent.safety_profile = profile
         self._save_session()
+        self._persist_preferences()
         self._refresh_status()
-        self.query_one("#chat-log", RichLog).write(Text(f"✓ Interaction profile: {profile}", style="green"))
+        self.query_one("#chat-log", RichLog).write(
+            Text(f"✓ Interaction profile: {profile} (remembered for future sessions)", style="green"))
 
     def action_choose_session(self) -> None:
         if self._busy:
@@ -859,17 +1058,47 @@ class AdaptiveHarnessApp(App):
             self.query_one("#chat-log", RichLog).write(Text(f"✓ Theme saved: {theme}", style="green"))
         self.push_screen(ThemePickerModal(original, tuple(t for t in THEME_CHOICES if t in self.available_themes)), callback=selected)
 
-    def _reset_session(self, *, new: bool, title: str = "New session") -> None:
+    def session_store_settings_value(self, key: str) -> str:
+        """The live value of a setting, in the string form the session row uses."""
+        return {
+            "mode": self.agent.forced_mode.value if self.agent.forced_mode else "auto",
+            "thinking": self.agent.forced_thinking.value if self.agent.forced_thinking else "auto",
+            "safety": self.agent.safety_profile,
+            "step_policy": self.agent.step_policy,
+            "max_steps": str(self.agent.max_steps or ""),
+            "swarm_mode": self.swarm_mode,
+            "isolation_mode": self.isolation_mode,
+        }[key]
+
+    def _restore_default_settings(self) -> None:
+        """Reset every sticky setting to the launch-time CLI/default value."""
+        self.agent.forced_mode = self._cli_mode_override or self._default_mode
+        self.agent.forced_thinking = self._cli_thinking_override
+        self.agent.safety_profile = self._cli_safety_override or self._default_safety
+        self.agent.step_policy = (self._cli_step_policy_override
+                                 if self._cli_pinned_preferences["step_policy"] else "classifier")
+        self.agent.max_steps = self._cli_max_steps_override
+        self.swarm_mode = DEFAULT_SWARM_MODE
+        self.isolation_mode = "off"
+        self.agent.enable_swarm(self.swarm_mode != "off")
+        # An explicit reset clears the stored profile, CLI pins included.
+        self._persist_preferences(force=True)
+
+    def _reset_session(self, *, new: bool, title: str = "New session",
+                       restore_defaults: bool = False) -> None:
         if new:
             self._save_session()
             self.session = self.session_store.create(self.workspace_root, title)
+            # Carry the live settings into the fresh row so reopening it is a
+            # no-op rather than a silent reset.
+            self.session.settings = {key: self.session_store_settings_value(key)
+                                     for key in SESSION_SETTING_KEYS}
         else:
             self.session.title = title
+        if restore_defaults:
+            self._restore_default_settings()
         self.agent.messages = [{"role": "system", "content": self.agent.system_prompt}]
         self.agent.active_skills.clear()
-        self.agent.forced_mode = self._cli_mode_override
-        self.agent.forced_thinking = self._cli_thinking_override
-        self.agent.safety_profile = self._cli_safety_override or self._default_safety
         self._last_tool_output = ""
         self._last_agent_content = ""
         self.prompt_tokens = 0
@@ -896,7 +1125,16 @@ class AdaptiveHarnessApp(App):
         log.clear()
         log._set_pinned(False)
         log.write(Text(f"━━━ {'New session' if new else 'Session reset'} · {self.session.id} ━━━", style="bold cyan"))
+        if restore_defaults:
+            log.write(Text("Settings restored to launch defaults.", style="dim yellow"))
+        else:
+            log.write(Text(f"Mode {self.session_store_settings_value('mode')} · "
+                           f"thinking {self.session_store_settings_value('thinking')} · "
+                           f"safety {self.agent.safety_profile} · "
+                           f"swarm {self.swarm_mode} · isolation {self.isolation_mode} "
+                           f"(settings carry over · /reset defaults clears them)", style="dim"))
         self._save_session()
+        self._persist_preferences()
         self._refresh_status()
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -950,7 +1188,10 @@ class AdaptiveHarnessApp(App):
         log.write("  /models                - Search live OpenRouter catalog")
         log.write("  /tier <fast|standard|reasoning> - Force model tier")
         log.write("  /copy                   - Copy selected chat text or latest agent reply")
-        log.write("  Ctrl+Shift+C            - Copy selected chat text or latest agent reply")
+        log.write("  Ctrl+Shift+C, Ctrl+Y    - Copy selected chat text or latest agent reply")
+        log.write("  Ctrl+C                  - Copy the selection, or quit when nothing is selected")
+        log.write("  [dim]Mouse drag over the chat log selects text; every copy is also saved to output/clipboard/ "
+                 "so it can be recovered even if the terminal drops OSC 52.[/dim]")
         log.write("  /safety <turbo|balanced|cautious|strict> - Set tool confirmation level")
         log.write("  /mode <coding|research|science|security|auto> - Set operational mode")
         log.write("  /thinking <auto|low|medium|high|xhigh|max> - Set model reasoning effort (deep = high)")
@@ -966,7 +1207,8 @@ class AdaptiveHarnessApp(App):
         log.write("  /output                - Open a selectable full-text view of the latest agent response")
         log.write("  /tool-output           - Open a selectable view of the latest tool result")
         log.write("  /usage                 - Show all session token types and reported cost")
-        log.write("  /new | /reset          - Start a new session or reset current one")
+        log.write("  /new | /reset          - Start a new session or reset current one (settings carry over)")
+        log.write("  /reset defaults        - Also restore mode/thinking/safety/swarm to launch defaults")
         log.write("  /theme [name]          - Preview and save terminal theme (F2)")
         log.write("  /history               - Show recent prompts; Up/Down recalls prompts")
         log.write("  /export [markdown|json] - Save the session to output/sessions/")
@@ -1038,14 +1280,17 @@ class AdaptiveHarnessApp(App):
         elif cmd == "/diff":
             self.action_review_diff()
         elif cmd in {"/isolation", "/swarm"}:
-            if arg not in {"auto", "on", "off"}:
+            if arg not in SWITCH_MODES:
                 log.write(Text(f"Usage: {cmd} auto|on|off", style="yellow"))
             else:
                 setattr(self, "isolation_mode" if cmd == "/isolation" else "swarm_mode", arg)
                 if cmd == "/swarm":
                     # Model-driven delegation stays available unless fully off.
                     self.agent.enable_swarm(arg != "off")
-                log.write(Text(f"{cmd[1:].title()} mode: {arg}", style="green"))
+                self._save_session()
+                self._persist_preferences()
+                self._refresh_status()
+                log.write(Text(f"{cmd[1:].title()} mode: {arg} (saved for future sessions)", style="green"))
         elif cmd == "/clear":
             self.action_clear_screen()
         elif cmd == "/help":
@@ -1053,7 +1298,11 @@ class AdaptiveHarnessApp(App):
         elif cmd == "/new":
             self._reset_session(new=True, title=arg or "New session")
         elif cmd == "/reset":
-            self._reset_session(new=False)
+            argument = arg.strip().casefold()
+            if argument not in {"", "defaults", "settings"}:
+                log.write(Text("Use /reset or /reset defaults (also clears saved settings).", style="yellow"))
+            else:
+                self._reset_session(new=False, restore_defaults=argument in {"defaults", "settings"})
         elif cmd == "/history":
             recent = self.history_store.entries[-15:]
             log.write(Text("Recent prompts:" if recent else "No saved prompts yet.", style="bold cyan"))
@@ -1155,8 +1404,10 @@ class AdaptiveHarnessApp(App):
                 domain_mode=self.agent.forced_mode.value if self.agent.forced_mode else "—",
                 domain_selection="forced" if self.agent.forced_mode else "auto")
             self._save_session()
+            self._persist_preferences()
             self._refresh_status()
-            log.write(Text(f"✓ Mode: {self.agent.forced_mode.value if self.agent.forced_mode else 'auto'}", style="green"))
+            log.write(Text(f"✓ Mode: {self.agent.forced_mode.value if self.agent.forced_mode else 'auto'}"
+                           f" (remembered for future sessions)", style="green"))
         elif cmd == "/thinking":
             active_model = self.agent.explicit_model or self.agent.llm_client.default_model
             supported = supported_efforts(active_model, self.provider_name)
@@ -1184,8 +1435,10 @@ class AdaptiveHarnessApp(App):
                 thinking_tokens=BUDGET_TOKENS[self.agent.forced_thinking] if self.agent.forced_thinking else 0,
                 thinking_selection="forced" if self.agent.forced_thinking else "auto")
             self._save_session()
+            self._persist_preferences()
             self._refresh_status()
-            log.write(Text(f"✓ Thinking: {self.agent.forced_thinking.value if self.agent.forced_thinking else 'auto'}", style="green"))
+            log.write(Text(f"✓ Thinking: {self.agent.forced_thinking.value if self.agent.forced_thinking else 'auto'}"
+                           f" (remembered for future sessions)", style="green"))
         elif cmd == "/steps":
             if not arg:
                 cap = "unbounded" if self.agent.max_steps is None else f"{self.agent.max_steps} steps"
@@ -1194,7 +1447,7 @@ class AdaptiveHarnessApp(App):
             if arg.isdigit() and int(arg) >= 1:
                 self.agent.max_steps = int(arg)
                 log.write(Text(f"✓ Step cap set to {arg} (policy {self.agent.step_policy})", style="green"))
-            elif arg in {"classifier", "fixed", "unbounded"}:
+            elif arg in STEP_POLICIES:
                 self.agent.step_policy = arg
                 self.agent.max_steps = None
                 log.write(Text(f"✓ Step policy: {arg} "
@@ -1207,6 +1460,7 @@ class AdaptiveHarnessApp(App):
                 step_policy=self.agent.step_policy,
                 step_limit_display="unbounded" if self.agent.max_steps is None else f"{self.agent.max_steps} steps")
             self._save_session()
+            self._persist_preferences()
             self._refresh_status()
         elif cmd == "/prompts":
             from adaptive_harness.prompts import DEFAULT_CONFIG_DIR
@@ -1405,7 +1659,15 @@ class AdaptiveHarnessApp(App):
                                      ThinkingLevel.HIGH, ThinkingLevel.XHIGH, ThinkingLevel.MAX}
 
     def _should_swarm(self, task: str) -> bool:
-        """Auto mode only pipelines explicit multi-agent requests.
+        """Decide whether to run this task through the multi-agent coordinator.
+
+        The three policies are distinct on purpose:
+
+        * ``off`` (the default) — never delegate, so a task never silently
+          multiplies the bill. An explicit "use multiple agents" in the prompt is
+          not enough on its own; the user opts in with ``/swarm``.
+        * ``on`` — always delegate.
+        * ``auto`` — delegate only when the prompt explicitly asks for it.
 
         Complex edits are model-driven instead: the main agent receives
         delegate_subagent and decides when to spawn roles. Long prompts are

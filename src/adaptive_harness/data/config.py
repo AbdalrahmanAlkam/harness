@@ -11,7 +11,29 @@ import re
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "adaptive-harness"
 DEFAULT_MODEL = "stealth/space-bunny-alpha"
 DEFAULT_MODEL_SELECTION = "manual"
-DEFAULT_SWARM_MODE = "auto"
+
+#: Multi-agent delegation costs tokens and wall-clock time on every task, so it
+#: is opt-in. ``auto`` would leave the choice to the runtime overseer, which
+#: makes cost unpredictable; a user asking for it explicitly is the only signal
+#: that the extra spend is wanted.
+DEFAULT_SWARM_MODE = "off"
+
+#: The harness is a software engineering tool first, so a fresh session starts
+#: in coding mode rather than asking the domain classifier to guess. ``auto``
+#: remains available per session via ``/mode auto``.
+DEFAULT_DOMAIN_MODE = "coding"
+
+#: Settings that survive `/new`, `/reset`, and application restarts so the user
+#: never has to re-pick the same mode, reasoning budget, or swarm policy twice.
+STICKY_PREFERENCE_KEYS = (
+    "mode",
+    "thinking",
+    "safety",
+    "step_policy",
+    "max_steps",
+    "swarm_mode",
+    "isolation_mode",
+)
 
 
 def _private_write(path: Path, content: str) -> None:
@@ -76,6 +98,28 @@ class ConfigManager:
 
     def save_theme(self, theme: str) -> None:
         self.update(theme=theme)
+
+    def preferences(self) -> dict[str, str]:
+        """Return only the settings that persist across sessions.
+
+        Unknown or corrupted keys are ignored rather than trusted, so a hand
+        edited config file can never put the app into an invalid state.
+        """
+        settings = self.load()
+        return {key: settings[key] for key in STICKY_PREFERENCE_KEYS
+                if settings.get(key) not in (None, "")}
+
+    def save_preferences(self, **changes: str | None) -> dict[str, str]:
+        """Persist one or more sticky settings, ignoring unrelated keys."""
+        unknown = set(changes) - set(STICKY_PREFERENCE_KEYS)
+        if unknown:
+            raise ValueError(f"Unknown preferences: {', '.join(sorted(unknown))}")
+        return self.update(**{key: value for key, value in changes.items()
+                              if key in STICKY_PREFERENCE_KEYS})
+
+    def clear_preferences(self) -> dict[str, str]:
+        """Forget every sticky setting so the next launch starts at defaults."""
+        return self.update(**{key: None for key in STICKY_PREFERENCE_KEYS})
 
 
 class PromptHistoryStore:

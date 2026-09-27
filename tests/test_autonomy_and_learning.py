@@ -166,10 +166,23 @@ def test_verified_exemplar_is_injected_before_model_request(tmp_path: Path):
 
 
 def test_explicit_multi_agent_request_selects_swarm(tmp_path: Path):
+    """The multi-agent heuristic belongs to ``auto``, not to the default.
+
+    A clean configuration is ``off`` so delegation is never a surprise bill.
+    An explicit "use multiple agents" request is therefore *not* enough to spend
+    tokens; the user opts in with ``/swarm auto`` or ``/swarm on``.
+    """
     app = AdaptiveHarnessApp(db_path=tmp_path / "ui.db", config_dir=tmp_path / "prefs",
                              workspace_root=str(tmp_path))
-    assert app._should_swarm("using multiple agents build a 3D app")
+    assert not app._should_swarm("using multiple agents build a 3D app")
     assert not app._should_isolate("using multiple agents build a 3D app")
+
+    app.swarm_mode = "auto"
+    assert app._should_swarm("using multiple agents build a 3D app")
+    assert not app._should_swarm("add a docstring to alpha.py")
+
+    app.swarm_mode = "on"
+    assert app._should_swarm("add a docstring to alpha.py")
     app.session_store.close()
 
 
@@ -185,7 +198,7 @@ def test_launch_workspace_and_manual_model_survive_session_resume(tmp_path: Path
     assert app.workspace_root == str(first)
     assert app.agent.explicit_model == "stealth/space-bunny-alpha"
     assert app.agent.llm_client.base_url == "https://openrouter.ai/api/v1"
-    assert app.swarm_mode == "auto" and app.isolation_mode == "off"
+    assert app.swarm_mode == "off" and app.isolation_mode == "off"
     app.session_store.close()
     monkeypatch.chdir(second)
     resumed = AdaptiveHarnessApp(db_path=database, config_dir=tmp_path / "prefs",

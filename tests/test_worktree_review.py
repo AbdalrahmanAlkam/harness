@@ -90,6 +90,9 @@ def test_isolation_and_swarm_modes_select_complex_edits(repo: Path):
     assert app._should_isolate("Refactor the architecture across modules and add tests")
     # Auto mode pipelines only explicit multi-agent requests; complex edits are
     # model-driven via delegate_subagent and long prompts are never hijacked.
+    # The default policy is "off", so the heuristic is only reached once opted in.
+    assert not app._should_swarm("using multiple agents build the scheduler")
+    app.swarm_mode = "auto"
     assert not app._should_swarm("Fix a concurrency deadlock and refactor the architecture")
     assert app._should_swarm("using multiple agents build the scheduler")
     assert not app._should_swarm(

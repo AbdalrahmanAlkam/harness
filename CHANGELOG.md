@@ -1,11 +1,95 @@
 # Changelog
 
-All notable changes to Adaptive Agent Harness. The five entries below cover the
-work in this push; earlier history is summarized in `git log`.
+All notable changes to Adaptive Agent Harness. The entries under
+`[Unreleased]` cover the work in this push; earlier history is summarized in
+`git log`.
 
 ## [Unreleased]
 
+### Changed
+- **A fresh session now starts in coding mode with the swarm off.** The
+  harness is a software engineering tool first, and multi-agent delegation
+  multiplies both cost and latency. Previously the default mode was `auto`
+  (letting the domain classifier guess) and the default swarm policy was
+  `auto`, which meant delegation was reachable without ever being asked for.
+  `/mode auto` and `/swarm auto` remain available and are ordinary sticky
+  settings, so an explicit choice is still remembered; a `--mode` launch flag
+  still wins over both the default and a remembered value.
+
 ### Fixed
+- **The Typst fallback could never succeed.** `resolve_typst` probed the
+  `typst` PyPI package as if it were a command line program
+  (`python -m typst --version`), but that package is a compiled extension
+  module with no `__main__` and no console script. The resolver therefore
+  burned a `pip install`, reported success, probed again, failed, and raised
+  `TypstError` — so on any machine without a native `typst` binary every
+  research run that publishes a paper failed at the last step. Typst is now
+  resolved as an explicit toolchain: a native binary on `PATH` is driven as a
+  subprocess, and otherwise the PyPI package is driven as a *binding* through
+  `typst.compile_with_warnings`, still in a subprocess so the compile keeps its
+  timeout and crash isolation. Warnings are still treated as build breaks, a
+  failed build still deletes any partial PDF so a stale file can never be
+  mistaken for a result, and receipts record which engine produced them.
+- **A silent root mismatch can no longer produce a wrong paper.** The two
+  engines disagree about `--root`: for the native binary it is a *search path*,
+  while for the binding it is only a containment gate and relative assets
+  resolve against the source file's own directory. Compiling anyway could
+  resolve `image("figures/x.png")` to a different file than the CLI would and
+  yield a PDF that looks verified but shows the wrong figure, so the binding now
+  refuses that layout with an actionable message instead of guessing.
+- **Copying from a Rich-rendered panel now works.** `Widget.get_selection`
+  only extracts text when a widget renders `Text` or `Content`; a `Panel`,
+  `Table`, `Group`, or `Syntax` render is wrapped in a `RichVisual` and the
+  base implementation returns `None`. The telemetry sidebar therefore
+  *highlighted* a drag and then copied nothing. A reusable
+  `RichSelectableMixin` now extracts from the same strips the compositor draws,
+  clamps a drag that runs past the end of the content, and leaves Textual's own
+  implementation in place for plain `Text`/`Content` widgets.
+- **Copying text from the chat log now works.** This was not a terminal
+  limitation. `RichLog` advertises `ALLOW_SELECT`, but `Widget.get_selection`
+  only understands widgets that render `Text`/`Content`; a `RichLog` is a
+  `ScrollView` rendering `Strip` objects, so it returned `None` for every
+  selection and every copy silently fell back to the latest agent response.
+  `PinnedRichLog` now tags each rendered line with its content coordinates so
+  the compositor can map a pointer back to log content, paints the selection
+  highlight, and extracts the selected text. The log's border and padding moved
+  to a surrounding frame because Textual cannot map a pointer inside a widget's
+  own gutter back to content, and a drag starting at the left edge used to
+  select entirely the wrong rows. Selections that end past the last line, which
+  the pointer reaches routinely because the log is far taller than its content,
+  are clamped instead of raising `IndexError` mid-drag.
+- **Copies are no longer a silent no-op when the terminal drops OSC 52.**
+  `App.copy_to_clipboard` only emits an escape sequence, which many terminals,
+  multiplexers, and remote sessions discard with no acknowledgement. Delivery is
+  now layered: the payload is always mirrored to `output/clipboard/` (newest 50
+  kept) so a copy is always recoverable, OSC 52 is emitted when the terminal is
+  known or assumed to support it, and `pbcopy`/`wl-copy`/`xclip`/`xsel` are used
+  when OSC 52 is known to be ignored. The fallback is deliberately skipped over
+  SSH, where it would set the clipboard of the wrong machine. The app reports
+  which route was used instead of claiming an unverified success.
+- **Ctrl+C does something again.** `textual.screen.Screen` already binds
+  `ctrl+c` to `screen.copy_text`, and screen bindings shadow app bindings, so
+  the advertised Ctrl+C -> quit shortcut was unreachable and the key did nothing
+  when no text was selected. The default screen now rebinds it: copy the
+  selection if there is one, otherwise quit.
+- **Settings no longer reset on every new session.** `/new` and `/reset`
+  discarded mode, reasoning effort, safety profile, step policy, swarm mode, and
+  worktree isolation, and `swarm_mode`/`isolation_mode` were never persisted at
+  all, so every new session started from `auto`. All of them are now saved to
+  the private config, restored on launch, reported at startup, and carried into
+  newly created sessions. Precedence is CLI flag > loaded session > remembered
+  setting > default; a one-off launch flag no longer overwrites the stored
+  profile, older session rows inherit remembered settings instead of resetting
+  them, and `/reset defaults` is the escape hatch.
+- **A duplicated `on_unmount` is gone.** Two handlers were defined and the
+  second silently shadowed the first, so `self._save_session()` and
+  `self.session_store.close()` never ran: the session database connection was
+  leaked and end-of-run state was never flushed. One handler now saves the
+  session, persists preferences, and cleans up an unmerged worktree.
+- **A saved step policy is reachable again.** The CLI default made the
+  "preserve CLI overrides" check permanently true, so a session's saved step
+  policy could never be restored. A flag now counts as pinned only once it
+  differs from its default.
 - **Cancelling a worker no longer kills unrelated processes.** Process groups were
   attributed by thread id, but leaders and the Director run on the main thread, so
   cancelling one also signalled every process the main thread had started —
