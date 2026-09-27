@@ -44,6 +44,7 @@ from adaptive_harness.tui.widgets import (ClarificationModal, ClassifierTelemetr
     HistoryInput, PinnedRichLog, ThemePickerModal, QuickSelectModal, OutputViewerModal,
     CommandPalette, DiffReviewModal, THEME_CHOICES)
 from adaptive_harness.tui.formatting import format_model_markdown
+from adaptive_harness.tui.settings import CYCLING, DESCRIPTIONS, Setting, SettingsScreen
 from adaptive_harness.tui import clipboard
 from adaptive_harness.workspace.worktree import WorktreeManager, WorktreeTask, WorktreeError
 
@@ -55,15 +56,16 @@ SWITCH_MODES = ("auto", "on", "off")
 #: Session settings that a `/new` must carry forward instead of dropping.
 SESSION_SETTING_KEYS = (
     "mode", "thinking", "safety", "step_policy", "max_steps",
-    "swarm_mode", "isolation_mode",
+    "swarm_mode", "isolation_mode", "secondary_model",
 )
 
 COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/steps", "/prompts", "/safety", "/classifier", "/new",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
             "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export",
-            "/diff", "/isolation", "/swarm")
+            "/diff", "/isolation", "/swarm", "/settings")
 
 COMMAND_DESCRIPTIONS = {
+    "/settings": "Open the settings screen (F7)",
     "/provider": "Switch task model provider",
     "/key": "Manage private provider API keys",
     "/model": "Choose a model or restore auto routing",
@@ -203,6 +205,7 @@ class AdaptiveHarnessApp(App):
         ("f4", "choose_model", "Models"),
         ("f5", "choose_session", "Sessions"),
         ("f6", "toggle_telemetry", "Telemetry"),
+        ("f7", "settings", "Settings"),
     ]
 
     def __init__(
@@ -223,6 +226,7 @@ class AdaptiveHarnessApp(App):
         semif_temperature: float = 1.0,
         mode: str = "auto",
         thinking: str = "auto",
+        secondary_model: Optional[str] = None,
         safety: str | None = None,
         step_policy: str = "classifier",
         max_steps: Optional[int] = None,
@@ -285,6 +289,9 @@ class AdaptiveHarnessApp(App):
         self._default_mode = parse_domain_mode(DEFAULT_DOMAIN_MODE) or DomainMode.CODING
         initial_mode = cli_mode or self._default_mode
         initial_thinking = parse_thinking_level(thinking)
+        # An unset secondary model falls back to the primary one, so the
+        # feature works with no configuration at all.
+        self.secondary_model = (secondary_model or "").strip() or None
         initial_effort = effort_for_level(initial_thinking) if initial_thinking else None
         if not requested_auto_model and initial_thinking is not None:
             supported = supported_efforts(self.default_model, self.provider_name)
@@ -376,6 +383,7 @@ class AdaptiveHarnessApp(App):
             preferences_dir=config_dir,
             forced_mode=initial_mode,
             forced_thinking=initial_thinking,
+            secondary_model=self.secondary_model,
             safety_profile=safety or self._default_safety,
             step_policy=step_policy,
             max_steps=max_steps,
@@ -531,6 +539,8 @@ class AdaptiveHarnessApp(App):
                                  "max_steps": str(self.agent.max_steps or ""),
                                  "swarm_mode": self.swarm_mode,
                                  "isolation_mode": self.isolation_mode,
+                                 "secondary_model": self.secondary_model or "",
+                                 "output_filter": "on" if self.agent.tool_output_filter else "off",
                                  "prompt_tokens": str(self.prompt_tokens),
                                  "completion_tokens": str(self.completion_tokens),
                                  "reasoning_tokens": str(self._reasoning_tokens),
@@ -601,6 +611,10 @@ class AdaptiveHarnessApp(App):
         for attribute in ("swarm_mode", "isolation_mode"):
             if settings.get(attribute) in SWITCH_MODES:
                 setattr(self, attribute, settings[attribute])
+        if settings.get("secondary_model"):
+            self.secondary_model = settings["secondary_model"]
+        if settings.get("output_filter") in {"on", "off"}:
+            self.agent._configure_output_filter(self.secondary_model, settings["output_filter"] == "on")
         self.agent.enable_swarm(self.swarm_mode != "off")
         for field, setting in (("prompt_tokens", "prompt_tokens"),
                                ("completion_tokens", "completion_tokens"),
@@ -657,6 +671,10 @@ class AdaptiveHarnessApp(App):
         for attribute in ("swarm_mode", "isolation_mode"):
             if saved.get(attribute) in SWITCH_MODES:
                 setattr(self, attribute, saved[attribute])
+        if saved.get("secondary_model"):
+            self.secondary_model = saved["secondary_model"]
+        if saved.get("output_filter") in {"on", "off"}:
+            self.agent._configure_output_filter(self.secondary_model, saved["output_filter"] == "on")
         self.agent.enable_swarm(self.swarm_mode != "off")
         if self._cli_mode_override is None and saved.get("mode"):
             try:
@@ -723,6 +741,8 @@ class AdaptiveHarnessApp(App):
                     ("max_steps", str(self.agent.max_steps or "")),
                     ("swarm_mode", self.swarm_mode),
                     ("isolation_mode", self.isolation_mode),
+                    ("secondary_model", self.secondary_model or ""),
+                    ("output_filter", "on" if self.agent.tool_output_filter else "off"),
                 ) if force or not self._cli_pinned_preferences.get(key)
             })
         except OSError as exc:
@@ -886,13 +906,17 @@ class AdaptiveHarnessApp(App):
                         self._show_model_picker(models, error)
             loop.call_soon_threadsafe(show_picker)
 
-    def _show_model_picker(self, models: list[CatalogModel], error: str = "") -> None:
+    def _show_model_picker(self, models: list[CatalogModel], error: str = "",
+                           *, secondary: bool = False) -> None:
         self._activity = "Ready"
         self._refresh_status()
         if error:
             self.query_one("#chat-log", RichLog).write(Text(error, style="yellow"))
         if models:
             self._model_catalog = models
+        if secondary:
+            self._show_secondary_model_picker(models)
+            return
         choices = [("auto", "AUTO  ·  route by task complexity")]
         seen = {"auto"}
         provider_models = ([*MODEL_TIERS.values()] if self.provider_name == "openrouter" else
@@ -915,6 +939,36 @@ class AdaptiveHarnessApp(App):
                 self._set_model(model_id)
         self.push_screen(QuickSelectModal(f"Choose a {self.provider_name.title()} model", choices,
                                           current=self.agent.explicit_model or "auto"), callback=picked)
+
+    def _show_secondary_model_picker(self, models: list[CatalogModel]) -> None:
+        """Choose the cheap model that compresses noisy tool output.
+
+        The first entry is the fallback the feature is specified to have: with
+        no secondary model configured, the primary model does the compression,
+        which still saves its context but saves nothing else.
+        """
+        primary = self.agent.explicit_model or self.agent.llm_client.default_model
+        choices = [("__primary__", f"same as primary  ·  {primary}")]
+        seen = {"__primary__", self.secondary_model or ""}
+        for model in models:
+            if model.id not in seen:
+                context = f" · {model.context_length // 1000}k context" if model.context_length else ""
+                choices.append((model.id, f"{model.name}  ·  {model.id}{context}"))
+                seen.add(model.id)
+        for model_id in MODEL_TIERS.values():
+            if model_id not in seen:
+                choices.append((model_id, f"★ {model_id}"))
+                seen.add(model_id)
+
+        def picked(model_id: str | None) -> None:
+            if model_id is None:
+                return
+            self._set_secondary_model(None if model_id == "__primary__" else model_id)
+            self._push_settings()
+
+        self.push_screen(QuickSelectModal("Secondary model · compresses noisy tool output",
+                                          choices, current=self.secondary_model or "__primary__"),
+                         callback=picked)
 
     def _set_model(self, model_id: str) -> None:
         self.agent.explicit_model = None if model_id.lower() == "auto" else model_id
@@ -1072,7 +1126,120 @@ class AdaptiveHarnessApp(App):
             "max_steps": str(self.agent.max_steps or ""),
             "swarm_mode": self.swarm_mode,
             "isolation_mode": self.isolation_mode,
+            "secondary_model": self.secondary_model or "",
         }[key]
+
+    # -- the settings screen -------------------------------------------------
+
+    def _setting_rows(self) -> list[Setting]:
+        """Every persistent setting, in the order a reader would look for them."""
+        return [
+            Setting("model", "Model",
+                    self.agent.explicit_model or f"auto · {self.agent.llm_client.default_model}", "model"),
+            Setting("secondary_model", "Secondary model",
+                    self.secondary_model or f"same as model · {self.agent.llm_client.default_model}", "model"),
+            Setting("output_filter", "Output filter", "on" if self.agent.tool_output_filter else "off",
+                    "cycle", CYCLING["output_filter"]),
+            Setting("provider", "Provider", self.provider_name, "command"),
+            Setting("mode", "Mode", self.session_store_settings_value("mode"), "cycle", CYCLING["mode"]),
+            Setting("thinking", "Thinking", self.session_store_settings_value("thinking"),
+                    "cycle", CYCLING["thinking"]),
+            Setting("safety", "Safety", self.agent.safety_profile, "cycle", CYCLING["safety"]),
+            Setting("step_policy", "Steps", self.agent.step_policy, "cycle", CYCLING["step_policy"]),
+            Setting("max_steps", "Max steps", str(self.agent.max_steps or "unlimited"), "command"),
+            Setting("swarm_mode", "Swarm", self.swarm_mode, "cycle", CYCLING["swarm_mode"]),
+            Setting("isolation_mode", "Isolation", self.isolation_mode, "cycle", CYCLING["isolation_mode"]),
+            Setting("classifier", "Classifier", self.agent.classifier_backend.name, "command"),
+            Setting("theme", "Theme", self.saved_theme, "command"),
+        ]
+
+    def action_settings(self) -> None:
+        if self._busy:
+            self.query_one("#chat-log", RichLog).write(
+                Text("Wait for the current task to finish.", style="yellow"))
+            return
+        self._push_settings()
+
+    def _push_settings(self) -> None:
+        self.push_screen(SettingsScreen(self._setting_rows(),
+                                        on_change=self._apply_setting,
+                                        on_open=self._open_setting))
+
+    def _apply_setting(self, key: str, value: str) -> None:
+        """Apply one cycled setting, persist it, and refresh the screen."""
+        try:
+            if key == "output_filter":
+                self._set_output_filter(value == "on")
+            elif key == "mode":
+                self.agent.forced_mode = parse_domain_mode(value)
+            elif key == "thinking":
+                self.agent.forced_thinking = parse_thinking_level(value)
+                if self._validate_thinking_effort():
+                    self.query_one("#chat-log", RichLog).write(
+                        Text("That reasoning level is unavailable for this model; using auto.",
+                             style="yellow"))
+            elif key == "safety" and value in SAFETY_PROFILES:
+                self.agent.safety_profile = value
+            elif key == "step_policy" and value in STEP_POLICIES:
+                self.agent.step_policy = value
+            elif key == "swarm_mode" and value in SWITCH_MODES:
+                self.swarm_mode = value
+                self.agent.enable_swarm(value != "off")
+            elif key == "isolation_mode" and value in SWITCH_MODES:
+                self.isolation_mode = value
+        except (ValueError, RuntimeError, OSError) as exc:
+            self.query_one("#chat-log", RichLog).write(
+                Text(f"Could not apply {key}: {exc}", style="red"))
+            return
+        # The session row and the remembered profile move together, so a /new or
+        # a restart sees exactly the values the screen just showed.
+        if key in SESSION_SETTING_KEYS:
+            self.session.settings[key] = self.session_store_settings_value(key)
+        self._save_session()
+        self._persist_preferences(force=True)
+        self._refresh_status()
+        self._refresh_settings_screen()
+
+    def _open_setting(self, key: str) -> None:
+        """Hand a richer setting to the flow that already owns it."""
+        if key == "model":
+            self._activity = "Fetching models"
+            self._refresh_status()
+            loop = asyncio.get_running_loop()
+            threading.Thread(target=self._fetch_model_catalog, args=(loop,), daemon=True,
+                             name="adaptive-harness-model-catalog").start()
+            return
+        if key == "secondary_model":
+            self._show_model_picker(self._model_catalog, secondary=True)
+            return
+        # Everything else already has a working command; reuse it rather than
+        # growing a second implementation of the same behaviour.
+        self._handle_slash_command(f"/{key}")
+
+    def _refresh_settings_screen(self) -> None:
+        """Update the open screen's rows in place after a change."""
+        for screen in self.screen_stack:
+            if isinstance(screen, SettingsScreen):
+                screen.settings = self._setting_rows()
+                # call_later takes the coroutine itself; call_from_thread would
+                # hand the compositor an un-awaited coroutine to render.
+                screen.call_later(screen.refresh_rows)
+                return
+
+    def _set_secondary_model(self, model: str | None) -> None:
+        self.secondary_model = (model or "").strip() or None
+        self.agent._configure_output_filter(self.secondary_model,
+                                            self.agent.tool_output_filter is not None)
+        self.session.settings["secondary_model"] = self.secondary_model or ""
+        self.config.save_preferences(secondary_model=self.secondary_model)
+        self._save_session()
+        self._persist_preferences(force=True)
+        self._refresh_status()
+
+    def _set_output_filter(self, enabled: bool) -> None:
+        self.agent._configure_output_filter(self.secondary_model, enabled)
+        self.config.save_preferences(output_filter="on" if enabled else "off")
+        self._persist_preferences(force=True)
 
     def _restore_default_settings(self) -> None:
         """Reset every sticky setting to the launch-time CLI/default value."""
@@ -1283,6 +1450,8 @@ class AdaptiveHarnessApp(App):
 
         if cmd in ("/exit", "/quit"):
             self.action_quit()
+        elif cmd == "/settings":
+            self.action_settings()
         elif cmd == "/diff":
             self.action_review_diff()
         elif cmd in {"/isolation", "/swarm"}:

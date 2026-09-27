@@ -33,6 +33,8 @@ STICKY_PREFERENCE_KEYS = (
     "max_steps",
     "swarm_mode",
     "isolation_mode",
+    "secondary_model",
+    "output_filter",
 )
 
 

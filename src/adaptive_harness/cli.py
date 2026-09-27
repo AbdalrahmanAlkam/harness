@@ -134,6 +134,9 @@ def tui(
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
     mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Model effort: auto, low, medium, high, xhigh, max (deep = high)"),
+    secondary_model: Optional[str] = typer.Option(
+        None, "--secondary-model",
+        help="Cheap model that compresses low-value tool output (default: the primary model)"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
     step_policy: str = typer.Option("classifier", "--step-policy", help="Tool-step limits: classifier (default; stops circling loops), fixed (hardcoded per-thinking budgets), unbounded"),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", min=1, help="Explicit tool-step cap overriding the step policy"),
@@ -180,6 +183,7 @@ def tui(
                 (PROVIDER_TIERS.get(provider or "openrouter", MODEL_TIERS)[tier] if tier in MODEL_TIERS else None)),
             mode=mode,
             thinking=thinking,
+            secondary_model=secondary_model,
             safety=safety,
             classifier_backend="semif" if semif_model else classifier_backend,
             classifier_model=semif_model or classifier_model,
