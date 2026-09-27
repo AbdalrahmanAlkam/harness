@@ -81,6 +81,18 @@ DEFAULT_PROMPTS: dict[str, str] = {
         "severity, evidence, and a concrete mitigation."
     ),
 
+    # Tool-output compression, asked of the *secondary* model only.
+    "tool_filter.summarize": (
+        "You are compressing the output of the `{tool}` tool so it fits in a small context window. "
+        "The main agent is expected to act on it next.\n\n"
+        "Keep: exact values, file and symbol names, error messages, assertion diffs, exit codes, "
+        "counts, and anything the agent must act on.\n"
+        "Drop: repeated lines, progress percentages, spinner text, passing-test chatter, blank "
+        "padding, and restatements of what is already on screen.\n\n"
+        "Answer with the compressed result only -- no preamble, no commentary, no apology. If the "
+        "output contains no information worth keeping, reply with a single line saying so."
+    ),
+
     # Classifier / runtime-overseer prompt injections (system role messages).
     "intervention.stop_circling": (
         "CLASSIFIER STOP-CIRCLING DIRECTIVE: The classifier detects unnecessary repeated tool calls. "

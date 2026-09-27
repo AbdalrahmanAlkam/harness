@@ -39,6 +39,7 @@ from adaptive_harness.agent.compaction import rank_search_results
 from adaptive_harness.data.preferences import ClarificationMemory
 from adaptive_harness.tools.research import WebSearchTool
 from adaptive_harness.tools.lean import RunLeanProofTool
+from adaptive_harness.tools.recall import ReadFullOutputTool
 from adaptive_harness.tools.research_swarm import CompileTypstTool
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
 from adaptive_harness.tools.delegation import DelegateSubagentTool
@@ -47,6 +48,7 @@ from adaptive_harness.skills.router import SkillRouter
 from adaptive_harness.skills.verifier import SkillVerifier
 from adaptive_harness.classifiers.runtime_overseer import RuntimeOverseer, OverseerState
 from adaptive_harness.agent.context_window import prepare_context
+from adaptive_harness.agent.tool_filter import ToolOutputArchive, ToolOutputFilter
 from adaptive_harness.agent.code_fallback import extract_file_calls, requests_file_changes
 from adaptive_harness.prompts import PromptRegistry, DEFAULT_PROMPTS
 
@@ -139,6 +141,8 @@ class DeveloperAgent:
         step_policy: str = "classifier",
         max_steps: int | None = None,
         prompts: PromptRegistry | None = None,
+        secondary_model: str | None = None,
+        filter_tool_output: bool = True,
     ):
         if safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
             raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
@@ -202,12 +206,53 @@ class DeveloperAgent:
             default_tools.append(WebSearchTool())
         tools_list = tools if tools is not None else default_tools
         self.tools: Dict[str, Tool] = {t.name: t for t in tools_list}
+        self._configure_output_filter(secondary_model, filter_tool_output)
         self.swarm_enabled = False
         self.research_enabled = False
         self.research_swarm: Any = None
         if swarm_enabled:
             self.enable_swarm(True)
         self.messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+
+    def _configure_output_filter(self, secondary_model: str | None, enabled: bool) -> None:
+        """Install the tool-output filter and the tool that recovers filtered text.
+
+        ``secondary_model`` is the cheap model asked to compress noisy output. An
+        unset value falls back to the primary model, which still saves the main
+        model's context but saves no money -- the point of choosing one.
+        """
+        self.secondary_model = secondary_model or None
+        self.tool_output_filter: Optional[ToolOutputFilter] = None
+        if not enabled:
+            self.tools.pop(ReadFullOutputTool.name, None)
+            return
+        self.output_archive = ToolOutputArchive()
+        self.tools[ReadFullOutputTool.name] = ReadFullOutputTool(self.output_archive)
+        # The filter and the recall tool must share one archive, or the token in
+        # the transcript points at a store the tool never reads.
+        self.tool_output_filter = ToolOutputFilter(
+            classifier=self.classifier_backend, summarize=self._summarize_tool_output,
+            archive=self.output_archive)
+
+    def _secondary_llm_client(self) -> LLMClient:
+        """A client bound to the secondary model, falling back to the default."""
+        source = self.llm_client
+        model = self.secondary_model or source.default_model
+        if model == source.default_model:
+            return source
+        return LLMClient(api_key=source.api_key, base_url=source.base_url,
+                         default_model=model, force_mock=source.force_mock,
+                         provider=source.provider, provider_keys=source.provider_keys,
+                         backup_providers=source.backup_providers)
+
+    def _summarize_tool_output(self, tool_name: str, output: str) -> str:
+        """Ask the secondary model to compress one tool result."""
+        instruction = self.prompts.get("tool_filter.summarize", tool=tool_name)
+        response = self._secondary_llm_client().complete(
+            messages=[{"role": "system", "content": instruction},
+                      {"role": "user", "content": output[:20_000]}],
+            temperature=0.0, max_tokens=400)
+        return getattr(response, "content", "") or ""
 
     def enable_swarm(self, enabled: bool) -> None:
         self.swarm_enabled = enabled
@@ -624,9 +669,9 @@ class DeveloperAgent:
             DomainMode.CODING: set(self.tools) - {"check_convergence"},
             # Research mode must be able to typeset and build its own paper, and
             # to machine-check a formal proof, or it cannot deliver either.
-            DomainMode.RESEARCH: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "web_search", "run_bash", "run_pytest", "run_python_repl", "verify_equation", "calculate", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof"},
-            DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof"},
-            DomainMode.AUDIT: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user"},
+            DomainMode.RESEARCH: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "web_search", "run_bash", "run_pytest", "run_python_repl", "verify_equation", "calculate", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof", "read_full_output"},
+            DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof", "read_full_output"},
+            DomainMode.AUDIT: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user", "read_full_output"},
         }[domain_res.mode]
         if self.safety_profile == "turbo":
             domain_tool_names.discard("ask_user")
@@ -929,6 +974,23 @@ class DeveloperAgent:
                     model_output = rank_search_results(model_output, original_input,
                         getattr(self.classifier_backend, "engine", None)
                         if self.classifier_backend.name == "semif" else None)
+                # The classification loop can swap in a fallback backend mid-run,
+                # so the gate is re-pointed at the live one before it judges.
+                # The recall tool is exempt: filtering it would hide the very text
+                # the model just asked to see, and archive it a second time.
+                if self.tool_output_filter is not None and tc.name != ReadFullOutputTool.name:
+                    self.tool_output_filter.classifier = self.classifier_backend
+                    outcome = self.tool_output_filter.process(
+                        tc.name, model_output, success=tool_res.success)
+                    if outcome.filtered:
+                        model_output = outcome.content
+                        yield AgentEvent("output_filtered", {
+                            "tool": tc.name, "token": outcome.token,
+                            "raw_chars": outcome.raw_chars,
+                            "kept_chars": outcome.kept_chars,
+                            "reason": outcome.reason,
+                            "secondary_model": self.secondary_model or self.llm_client.default_model,
+                        })
                 # Preserve tool evidence until the context gauge crosses its
                 # threshold; prepare_context compacts only the request copy.
                 model_error = (tool_res.error or "")[:600]
