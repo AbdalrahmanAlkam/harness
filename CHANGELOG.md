@@ -80,6 +80,14 @@ assert something that had not happened. Those are the substantive changes:
   default and only blocks when you ask it to, because a lexical evidence match
   is a real signal but not a proof, and a gate that cries wolf gets switched
   off.
+- **Permission rules.** `.harness/rules.json` holds ordered allow/deny/ask rules
+  over tool calls, evaluated inside the safety gate so a permissive
+  `--safety-profile` cannot route around them. First match wins and deny wins
+  ties. A deny must say why, a rule pattern must be a valid regex, a broken
+  rules file is reported rather than silently becoming "no rules", and
+  arguments are whitespace-normalized so a rule cannot be defeated by an extra
+  space. Rules are re-read per call, so tightening a policy takes effect on the
+  next tool call rather than the next run.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.

@@ -57,6 +57,7 @@ from adaptive_harness.skills.router import SkillRouter
 from adaptive_harness.skills.verifier import SkillVerifier
 from adaptive_harness.classifiers.runtime_overseer import RuntimeOverseer, OverseerState
 from adaptive_harness.agent.context_window import estimate_tokens, prepare_context
+from adaptive_harness.agent.rules import RULES_PATH, Decision, RuleSet
 from adaptive_harness.agent.final_gate import (
     ACCEPT,
     REVISE,
@@ -427,6 +428,11 @@ class DeveloperAgent:
         # gate that cries wolf gets switched off -- which is worse than having
         # none. It reports whenever on, and blocks only when asked to.
         self.quality_gate_enabled = quality_gate
+        # Permission rules live in the project, so a repository's policy
+        # travels with it rather than living in a user's global config.
+        self.rules_path = Path(workspace_root or '.') / RULES_PATH
+        self.rules_error = ''
+        self._warned_rules_error = False
         if tools is None and self.plugins_enabled:
             self.plugins.discover()
             for plugin_tool in self.plugins.build_tools(workspace_root):
@@ -471,6 +477,30 @@ class DeveloperAgent:
                 project_instruction_files(self.workspace_root))
             self._context_plane.contribute_many(self.plugins.context_fragments())
         return self._context_plane
+
+    def rule_gate(self, tool: str, arguments: Dict[str, Any]) -> tuple[Decision, str]:
+        """Decide a call against the project's permission rules.
+
+        The rules are re-read on every call so an edit takes effect on the next
+        one. A run that has been going for an hour should not need restarting
+        because someone tightened a policy, and re-reading a small JSON file is
+        far cheaper than the tool call it precedes.
+        """
+        rules = RuleSet.load(self.rules_path)
+        if rules.error:
+            # A broken rules file must not stop the harness, and must not
+            # silently become "no rules" -- that would drop a policy quietly.
+            if not self._warned_rules_error:
+                self._warned_rules_error = True
+                self.rules_error = rules.error
+            return Decision.NONE, ""
+        if not len(rules):
+            return Decision.NONE, ""
+        decision = rules.decide(tool, arguments)
+        if decision in {Decision.NONE, Decision.ALLOW}:
+            return decision, ""
+        matched = rules.matched_rule(tool, arguments)
+        return decision, (matched.reason if matched else "")
 
     def _turn_fixed_tokens(self) -> int:
         """What the conversation already costs, which the plane must respect."""
@@ -1323,10 +1353,31 @@ class DeveloperAgent:
                             stop_reason = "quality_gate_unsubstantiated"
                 break
 
+            # Calls refused by policy, keyed by call id. The refusal is applied
+            # where the tool result is appended, because the transcript is only
+            # well-formed once every declared tool_call has a result.
+            policy_denials: dict[str, str] = {}
             # Obtain authorization before adding tool calls to conversation history.
             for tc in llm_resp.tool_calls:
+                # Rules are evaluated first, inside the gate, so a permissive
+                # profile cannot route around them. A rule that `--safety-profile
+                # turbo` can bypass is not a rule.
+                rule_decision, rule_reason = self.rule_gate(tc.name, tc.arguments)
+                if rule_decision is Decision.DENY:
+                    # Recorded, not answered here. The transcript is only
+                    # well-formed once the assistant message declares its tool
+                    # calls and every one has a matching result, so the refusal
+                    # is applied where the result is appended.
+                    yield AgentEvent("tool_blocked", {"name": tc.name,
+                                                       "reason": rule_reason})
+                    policy_denials[tc.id] = rule_reason
+                    continue
                 risky_command = self.tool_risk_classifier.evaluate(tc.name, tc.arguments,
                     catastrophic_only=self.safety_profile == "turbo")
+                if rule_decision is Decision.ASK:
+                    # The rule asks regardless of profile, which is the point of
+                    # having rules rather than only profiles.
+                    risky_command = risky_command or rule_reason or "policy requires approval"
                 # The strict profile asks before anything that changes state.
                 # This used to be a hardcoded list of six tool names, so any tool
                 # added later -- including one a user installed -- reached
@@ -1394,7 +1445,17 @@ class DeveloperAgent:
                                                           "arguments": hooked_args})
                         tc.arguments = hooked_args
 
-                tool = self.tools.get(tc.name) if tc.name in domain_tool_names else None
+                # A call refused by policy never reaches a tool. It still needs a
+                # result in the transcript, or the declared tool_call is left
+                # unanswered and the next request is rejected. Marking the tool
+                # unavailable routes it through the existing refusal path rather
+                # than duplicating the whole result-construction path.
+                refusal = policy_denials.get(tc.id)
+                if refusal is not None:
+                    tool_res = ToolResult(success=False, output="",
+                                          error=f"Refused by policy: {refusal}")
+                tool = (None if refusal is not None else
+                        self.tools.get(tc.name) if tc.name in domain_tool_names else None)
                 t_start = time.perf_counter()
                 # Shell and test tools may write files; mutation evidence is the
                 # observable file state before/after, not the tool name.
@@ -1410,7 +1471,7 @@ class DeveloperAgent:
                         tool_res = tool.execute(**tc.arguments)
                     except Exception as exc:
                         tool_res = ToolResult(success=False, output="", error=f"Tool error: {type(exc).__name__}: {exc}")
-                else:
+                elif tool is None and refusal is None:
                     tool_res = ToolResult(success=False, output="", error=f"Tool `{tc.name}` is unavailable in {domain_res.mode.value} mode")
                 if tool_res.success and (tc.name in {"write_file", "edit_file"} or
                     tc.name == "delegate_subagent" and (tool_res.metadata or {}).get("role") == "coder"):
