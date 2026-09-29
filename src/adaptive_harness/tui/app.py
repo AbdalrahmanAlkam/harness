@@ -15,6 +15,7 @@ from typing import Optional
 from rich.syntax import Syntax
 from rich.text import Text
 from rich.markdown import Markdown
+from rich.prompt import Prompt
 from textual import work
 from textual.app import App, ComposeResult
 from textual import events
@@ -52,6 +53,15 @@ from adaptive_harness.workspace.worktree import WorktreeManager, WorktreeTask, W
 SAFETY_PROFILES = ("turbo", "balanced", "cautious", "strict")
 STEP_POLICIES = ("classifier", "fixed", "unbounded")
 SWITCH_MODES = ("auto", "on", "off")
+
+#: Which slash command owns each setting the screen cannot cycle in place.
+#: The names differ from the setting keys, so this is explicit rather than
+#: derived: `max_steps` is set through `/steps`, not `/max_steps`.
+_SETTING_COMMANDS = {
+    "max_steps": "/steps",
+    "provider": "/provider",
+    "classifier": "/classifier",
+}
 
 #: Session settings that a `/new` must carry forward instead of dropping.
 SESSION_SETTING_KEYS = (
@@ -1213,8 +1223,26 @@ class AdaptiveHarnessApp(App):
             self._show_model_picker(self._model_catalog, secondary=True)
             return
         # Everything else already has a working command; reuse it rather than
-        # growing a second implementation of the same behaviour.
-        self._handle_slash_command(f"/{key}")
+        # growing a second implementation of the same behaviour. The mapping is
+        # explicit because the setting key and the command name are not always
+        # the same: `max_steps` is owned by `/steps`, and dispatching `/{key}`
+        # verbatim sent the user to an "Unknown command" error and dropped them
+        # out of the settings screen.
+        command = _SETTING_COMMANDS.get(key)
+        if command is None:
+            self.query_one("#chat-log", RichLog).write(
+                Text(f"No flow is wired up for the {key} setting yet.", style="yellow"))
+            return
+        # `/provider` and `/classifier` print their current value and exit when
+        # given no argument, which reads as a dead end from a settings screen.
+        # Ask for the value so the row actually changes something.
+        if command in {"/provider", "/classifier"}:
+            value = Prompt.ask(f"{command.lstrip('/')}", default="")
+            if not value.strip():
+                return
+            self._handle_slash_command(f"{command} {value.strip()}")
+            return
+        self._handle_slash_command(command)
 
     def _refresh_settings_screen(self) -> None:
         """Update the open screen's rows in place after a change."""

@@ -226,12 +226,19 @@ class ExperienceRepository:
         with self._get_connection() as conn:
             total = conn.execute("SELECT COUNT(*) as cnt FROM executions").fetchone()["cnt"]
             if total == 0:
+                # Every key the populated branch returns, so a caller never
+                # has to special-case an empty database. `report` is one of the
+                # first commands a new user runs, and it crashed with a
+                # KeyError here before.
                 return {
                     "total_executions": 0,
                     "success_rate": 0.0,
                     "recovery_count": 0,
                     "avg_time_ms": 0.0,
                     "avg_attempts": 0.0,
+                    "avg_confidence": 0.0,
+                    "avg_entropy": 0.0,
+                    "strategy_distribution": {},
                 }
 
             row = conn.execute(

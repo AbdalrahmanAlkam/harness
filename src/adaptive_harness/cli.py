@@ -7,6 +7,7 @@ from typing import Optional
 import json
 import os
 import signal
+import sys
 import typer
 from rich.console import Console
 from rich.markup import escape
@@ -49,6 +50,28 @@ app = typer.Typer(
     help="Adaptive Agent Harness CLI: ML routing brain with verification and fallback recovery.",
 )
 console = Console()
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        from adaptive_harness import __version__
+
+        console.print(f"adaptive-harness {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    version: bool = typer.Option(
+        False, "--version", callback=_version_callback, is_eager=True,
+        help="Show the installed version and exit."),
+) -> None:
+    """Adaptive Agent Harness.
+
+    Start with `dev "your task"` for a single headless run, or `tui` for the
+    interactive terminal interface. Run `research "a topic"` for the autonomous
+    research swarm, which verifies its own results before reporting a verdict.
+    """
 
 
 @app.command()
@@ -100,6 +123,11 @@ def run(
     if task_text:
         trace = harness.run(task_text)
         print_execution_trace(trace)
+        # Exit non-zero when the task was not solved, so a CI job or a shell
+        # script can detect failure. `run` always returning 0 meant an unsolved
+        # task was indistinguishable from a solved one.
+        if not getattr(trace, "success", True):
+            raise typer.Exit(1)
         return
 
     # Interactive REPL mode
@@ -153,7 +181,7 @@ def tui(
     skill: Optional[list[str]] = typer.Option(None, "--skill", help="Force a built-in or custom skill (repeatable)"),
     db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Path to experience database"),
 ):
-    """Launches the interactive Textual TUI development environment with pervasive classifiers."""
+    """Launch the interactive terminal interface. Requires a TTY."""
     from adaptive_harness.tui.app import AdaptiveHarnessApp
     from adaptive_harness.llm.client import MODEL_TIERS
     from adaptive_harness.llm.providers import PROVIDER_TIERS
@@ -208,6 +236,14 @@ def tui(
                 tui_app.agent.active_skills[name] = catalog.read(name)
             except (ValueError, OSError) as exc:
                 raise typer.BadParameter(str(exc), param_hint="--skill") from exc
+    # A full-screen Textual app on a non-TTY (a pipe, cron, CI, `nohup`) waits
+    # forever for a keypress that can never arrive. Fail with the one command
+    # that does work headlessly instead of hanging.
+    if not (sys.stdout.isatty() and sys.stdin.isatty()):
+        console.print("[bold red]The TUI needs an interactive terminal.[/bold red]")
+        console.print("It cannot run piped, redirected, or under a process manager.")
+        console.print("For a headless run use: [bold]adaptive-harness dev \"your task\"[/bold]")
+        raise typer.Exit(2)
     tui_app.run()
 
 
@@ -244,7 +280,7 @@ def dev(
     skill: Optional[list[str]] = typer.Option(None, "--skill", help="Enable a named workspace or user skill"),
     db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Path to experience database"),
 ):
-    """Runs a developer task through the DeveloperAgent with pervasive classification and verification."""
+    """Run one software-engineering task end to end, and exit non-zero if it is not completed."""
     from adaptive_harness.agent.agent import DeveloperAgent
     from adaptive_harness.llm.client import LLMClient
     from adaptive_harness.llm.client import MODEL_TIERS
@@ -667,6 +703,10 @@ def research(
                               help="A checkable claim as 'lhs == rhs' in SymPy syntax, decided directly"),
     symbols: str = typer.Option("", "--symbols", help="Comma-separated free symbols for --claim"),
     seed: int = typer.Option(20260926, "--seed", help="Pinned seed for every experiment"),
+    install_typst: bool = typer.Option(
+        False, "--install-typst",
+        help="Allow the harness to pip install the pinned Typst binding if no "
+             "engine is found. Off by default: it mutates your environment."),
     max_cycles: Optional[int] = typer.Option(None, "--max-cycles",
                                              help="Operator safety valve; the loop is not turn-limited by default"),
     patience: int = typer.Option(2, "--patience", help="No-progress cycles tolerated before escalating"),
@@ -734,6 +774,7 @@ def research(
                          seed=seed,
                          llm_client_factory=client_factory,
                          claim=claim,
+                         auto_install_typst=install_typst,
                          claim_symbols=tuple(name.strip() for name in symbols.split(",") if name.strip()))
     swarm = ResearchSwarm(topic, root=root, config=config)
     console.print(f"[bold cyan]Research swarm[/bold cyan] {topic}")

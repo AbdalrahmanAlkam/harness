@@ -191,7 +191,10 @@ class SwarmConfig:
     step_policy: str = "classifier"
     safety_profile: str = "turbo"
     typst_root: Path | None = None
-    auto_install_typst: bool = True
+    # Off by default: installing into the user's interpreter mid-run, with no
+    # prompt, is not something a shipped tool may do unasked. The CLI exposes
+    # `--install-typst` for a user who opts in.
+    auto_install_typst: bool = False
     # A checkable claim stated as "lhs == rhs", which the kernel decides directly
     # instead of matching the topic against its derivation library.
     claim: str = ""

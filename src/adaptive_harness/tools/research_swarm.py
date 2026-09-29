@@ -131,7 +131,7 @@ class CompileTypstTool(Tool):
         "output_pdf_path": {"type": "string"},
     }, "required": ["typst_path"]}
 
-    def __init__(self, workspace_root: str | Path | None = None, *, allow_install: bool = True):
+    def __init__(self, workspace_root: str | Path | None = None, *, allow_install: bool = False):
         from adaptive_harness.research.typst import TypstCompiler
         self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
         self.compiler = TypstCompiler(root=self.workspace_root, allow_install=allow_install)

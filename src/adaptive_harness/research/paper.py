@@ -194,7 +194,7 @@ class PaperBuilder:
     """Render a Typst mathematical paper from verified propositions and compile it."""
 
     def __init__(self, workspace_root: str | Path, *, typst_root: str | Path | None = None,
-                 allow_install_typst: bool = True):
+                 allow_install_typst: bool = False):
         self.workspace_root = Path(workspace_root).resolve()
         self.typst_root = Path(typst_root).resolve() if typst_root else self.workspace_root
         self.allow_install_typst = allow_install_typst

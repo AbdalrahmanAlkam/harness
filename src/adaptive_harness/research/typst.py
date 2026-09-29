@@ -90,6 +90,10 @@ class TypstToolchain:
 # Typst writes progress notes to stderr that are not diagnostics.
 _BENIGN_STDERR = ("reading", "writing", "compiling")
 
+#: Pinned so an explicitly requested install is reproducible rather than
+#: picking up whatever the index serves that day.
+TYPST_BINDING_VERSION = "0.15.0"
+
 #: Prefix marking the runner's single machine-readable line of stdout.
 _RESULT_MARKER = "@@adaptive-harness-typst@@"
 
@@ -127,10 +131,18 @@ def _probe_binding() -> str | None:
 
 
 def _install_binding() -> bool:
-    """Install the ``typst`` extension module into the running interpreter."""
+    """Install the ``typst`` extension module into the running interpreter.
+
+    Only ever reached when the caller passed ``allow_install=True``, which
+    requires an explicit opt-in. A shipped CLI mutating the user's environment
+    mid-run, with no prompt and no pin, is not acceptable: the version is
+    pinned so a run cannot silently pick up a different build, and a failure
+    reports rather than retrying.
+    """
     try:
-        completed = subprocess.run([sys.executable, "-m", "pip", "install", "typst"],
-                                   capture_output=True, text=True, timeout=600, check=False)
+        completed = subprocess.run(
+            [sys.executable, "-m", "pip", "install", f"typst=={TYPST_BINDING_VERSION}"],
+            capture_output=True, text=True, timeout=600, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return False
     if completed.returncode != 0:
@@ -141,7 +153,7 @@ def _install_binding() -> bool:
     return True
 
 
-def resolve_toolchain(*, allow_install: bool = True) -> TypstToolchain:
+def resolve_toolchain(*, allow_install: bool = False) -> TypstToolchain:
     """Return a usable Typst toolchain, preferring the native binary."""
     binary = shutil.which("typst")
     if binary:
@@ -167,7 +179,7 @@ def resolve_toolchain(*, allow_install: bool = True) -> TypstToolchain:
         "or `pip install typst`, then re-run the compilation step.")
 
 
-def resolve_typst(*, allow_install: bool = True) -> tuple[str, str]:
+def resolve_typst(*, allow_install: bool = False) -> tuple[str, str]:
     """Return ``(executable_prefix, version)`` for a usable Typst toolchain.
 
     The prefix is the native binary's path, and empty for the PyPI binding,
@@ -199,7 +211,7 @@ def _count_pages(pdf: Path) -> int | None:
 class TypstCompiler:
     """Compile Typst sources into publication-grade PDFs."""
 
-    def __init__(self, *, root: str | Path | None = None, allow_install: bool = True,
+    def __init__(self, *, root: str | Path | None = None, allow_install: bool = False,
                  timeout_s: float = 300.0):
         self.root = Path(root).resolve() if root else None
         self.allow_install = allow_install
