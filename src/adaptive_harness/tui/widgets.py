@@ -854,11 +854,11 @@ class ClarificationModal(ModalScreen[str]):
         overflow-y: auto;
     }
     #options-container { height: auto; }
-    .option-row { height: auto; min-height: 3; width: 100%; margin-bottom: 1; background: $panel; }
-    .opt-btn { width: 6; min-width: 6; margin-right: 1; }
+    .option-row { height: auto; min-height: 1; width: 100%; margin-bottom: 1; background: $panel; }
+    .opt-btn { width: 5; min-width: 5; margin-right: 1; }
     .option-text { width: 1fr; min-width: 0; height: auto; padding: 0 1; color: $text; }
     .option-text:hover { background: $primary 20%; }
-    .opt-btn:focus { border: heavy $accent; }
+    .opt-btn:focus { background: $primary; text-style: bold; }
     #write-in-input {
         width: 100%;
         height: 3;
@@ -866,7 +866,7 @@ class ClarificationModal(ModalScreen[str]):
         color: $text;
     }
     #modal-help { height: 1; color: $accent; }
-    #modal-buttons { height: 3; }
+    #modal-buttons { height: 1; }
     #modal-buttons Button { width: 1fr; }
     """
     BINDINGS = [("escape", "cancel", "Cancel"), ("up", "previous_option", "Previous"),
@@ -893,15 +893,27 @@ class ClarificationModal(ModalScreen[str]):
                 with Vertical(id="options-container"):
                     for i, opt in enumerate(self.options):
                         with Horizontal(classes="option-row"):
-                            yield Button(f"{i+1}.", id=f"opt-{i}", classes="opt-btn", variant="primary" if i == 0 else "default")
+                            option_button = Button(f"{i+1}.", id=f"opt-{i}", classes="opt-btn",
+                                                  variant="primary" if i == 0 else "default")
+                            # A three-row Button with `border: tall` has no room
+                            # for its own label: the border paints, the text never
+                            # does. This is the one screen the agent blocks on, so
+                            # it has to actually show its controls.
+                            _make_row_readable(option_button)
+                            yield option_button
                             yield OptionDescription(opt, i)
 
             yield Static("Scroll question/reason · 1-9 choose · ↑↓ options · Tab type · Esc cancel", id="modal-help")
             yield Input(placeholder="Type custom answer and press Enter...", id="write-in-input")
 
             with Horizontal(id="modal-buttons"):
-                yield Button("Submit", id="submit-btn", variant="success")
-                yield Button("Cancel", id="cancel-btn", variant="error")
+                for label, button_id, variant in (("Submit", "submit-btn", "success"),
+                                                  ("Cancel", "cancel-btn", "error")):
+                    button = Button(label, id=button_id, variant=variant)
+                    _make_row_readable(button)
+                    button.styles.text_align = "center"
+                    button.styles.content_align_horizontal = "center"
+                    yield button
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id

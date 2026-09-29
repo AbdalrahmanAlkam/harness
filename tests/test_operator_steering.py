@@ -319,7 +319,10 @@ def test_a_concurrent_run_and_steer_keeps_the_transcript_valid(tmp_path: Path):
             assert following and following[0].get("tool_call_id") == call["id"], (
                 "a tool call was orphaned by steering")
 
-    # Each note appears at most once, and none was lost mid-batch.
+    # Each note appears at most once. The separator matters: "note-1" is a
+    # substring of "note-10" through "note-19", and counting on the bare
+    # number would blame the code for the test's own substring collision.
     for i in range(20):
-        count = sum(1 for m in agent.messages if f"note-{i}" in str(m.get("content", "")))
+        needle = f"note-{i}\n"
+        count = sum(1 for m in agent.messages if needle in str(m.get("content", "")))
         assert count <= 1, f"note-{i} was injected {count} times"
