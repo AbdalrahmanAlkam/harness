@@ -28,8 +28,13 @@ from adaptive_harness.classifiers.thinking_classifier import (ThinkingClassifier
     ThinkingLevel, BUDGET_TOKENS, parse_thinking_level, effort_for_level)
 from adaptive_harness.classifiers.skill_classifier import SKILL_CLASSES
 from adaptive_harness.data.storage import ExperienceRepository
+from adaptive_harness.agent.context_plane import (
+    ContextPlane,
+    project_instruction_files,
+)
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
 from adaptive_harness.llm.mock_client import ToolCall, LLMResponse
+from adaptive_harness.llm.providers import context_window
 from adaptive_harness.models.domain import ExecutionAttempt, ExecutionTrace, VerificationResult
 from adaptive_harness.tools.base import Tool, ToolResult
 from adaptive_harness.tools.bash import RunBashTool
@@ -51,7 +56,7 @@ from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.skills.router import SkillRouter
 from adaptive_harness.skills.verifier import SkillVerifier
 from adaptive_harness.classifiers.runtime_overseer import RuntimeOverseer, OverseerState
-from adaptive_harness.agent.context_window import prepare_context
+from adaptive_harness.agent.context_window import estimate_tokens, prepare_context
 from adaptive_harness.agent.tool_filter import ToolOutputArchive, ToolOutputFilter
 from adaptive_harness.agent.code_fallback import extract_file_calls, requests_file_changes
 from adaptive_harness.prompts import PromptRegistry, DEFAULT_PROMPTS
@@ -389,6 +394,13 @@ class DeveloperAgent:
         # existing embedder, test and swarm worker does exactly that.
         self.plugins = PluginHost(project_root=workspace_root,
                                   allow_project_plugins=allow_project_plugins)
+        # The context plane. Built on first use because the model's window is
+        # only known once a model is selected, and embedders set
+        # `context_window_override` after construction. Seeded with the
+        # project's own instructions and whatever plugins proposed; a fragment
+        # reaches the model only after a local trigger match and a relevance
+        # score admit it.
+        self._context_plane: ContextPlane | None = None
         if tools is None and self.plugins_enabled:
             self.plugins.discover()
             for plugin_tool in self.plugins.build_tools(workspace_root):
@@ -412,6 +424,33 @@ class DeveloperAgent:
         # which cannot be reported through run_stream because the generator is
         # mid-yield when it happens. Mirrors subagent_event_callback.
         self.operator_notify: Optional[Callable[[AgentEvent], None]] = None
+
+    @property
+    def context_plane(self) -> ContextPlane:
+        """The turn's context plane, built on first use.
+
+        Built lazily because the window is only known once a model has been
+        selected, and embedders set ``context_window_override`` after
+        construction. Every context-bearing thing -- project instructions, plugin
+        fragments, and the system prompt's own guidance -- is seeded here and
+        reaches the model only through the plane's admission.
+        """
+        if self._context_plane is None:
+            self._context_plane = ContextPlane(
+                context_window(getattr(self.llm_client, "default_model", "") or "",
+                               getattr(self.llm_client, "provider", "openrouter"),
+                               getattr(self, "context_window_override", None)),
+                estimator=estimate_tokens)
+            self._context_plane.contribute_many(
+                project_instruction_files(self.workspace_root))
+            self._context_plane.contribute_many(self.plugins.context_fragments())
+        return self._context_plane
+
+    def _turn_fixed_tokens(self) -> int:
+        """What the conversation already costs, which the plane must respect."""
+        from adaptive_harness.agent.context_window import estimate_tokens
+
+        return estimate_tokens(self.messages)
 
     def _configure_output_filter(self, secondary_model: str | None, enabled: bool) -> None:
         """Install the tool-output filter and the tool that recovers filtered text.
@@ -922,6 +961,19 @@ class DeveloperAgent:
         security_skill_active = any(skill.name == "security_audit_scanner"
                                     for skill in selected_skills)
 
+        # Context admission, before the task lands. A fragment reaches the
+        # model only after a local trigger match and a relevance score admit it
+        # into the budget; the report says what was admitted and what was not.
+        plane = self.context_plane
+        report = plane.allocate(text=original_input,
+                                fixed_tokens=self._turn_fixed_tokens())
+        admitted_fragments = [plane.fragments[source] for source in report.admitted
+                              if source in plane.fragments]
+        if report.admitted or report.rejected:
+            yield AgentEvent("context_budget", report.to_dict())
+        for message in plane.as_messages(admitted_fragments):
+            self.messages.append(message)
+
         # Add user message to history
         self.messages.append({"role": "user", "content": user_input})
         successful_mutations = 0
@@ -1045,6 +1097,10 @@ class DeveloperAgent:
         overseer = RuntimeOverseer(original_input, overseer_backend)
         context_limit = getattr(self, "context_window_override", None)
 
+        # Context admission happens once per turn, before the first request.
+        # Fragments are matched locally, scored locally, and budgeted; the
+        # admitted ones are prepended to this turn's request so the model reads
+        # the task-relevant context first.
         while step < max_steps:
             if self._cancel_reason is not None:
                 # Stop before spending another request. A tool call already in

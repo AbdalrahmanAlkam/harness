@@ -63,6 +63,14 @@ assert something that had not happened. Those are the substantive changes:
   now counts CJK at roughly a token per character instead of four characters per
   token — the old estimate was low by about 3x on Chinese, which let a request
   run well past the window before anything compacted.
+- **A context plane.** Everything context-bearing reaches the model through
+  one module. A fragment is matched by a cheap local trigger, scored by a local
+  relevance classifier, and admitted only if it fits the budget — so a plugin
+  never gets its text into context by asserting it might be useful. Pinned
+  fragments (project instructions) survive a full window; everything else is
+  admitted by priority or by score, and every rejection carries a reason. A
+  plugin that understates its own size is measured rather than believed.
+  Project instructions load from `AGENTS.md` and `.harness/instructions/*.md`.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.

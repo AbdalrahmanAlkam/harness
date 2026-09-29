@@ -127,8 +127,6 @@ class ContextFragment:
             raise ValueError("A context fragment needs a source.")
         if not isinstance(self.content, str) or not self.content.strip():
             raise ValueError(f"Context fragment {self.source!r} has no content.")
-        if not isinstance(self.trigger, Trigger):
-            raise ValueError("A context fragment's trigger must be a Trigger.")
         if self.priority not in VALID_PRIORITIES:
             raise ValueError(
                 f"Unknown priority {self.priority}. Valid values: "
@@ -137,6 +135,10 @@ class ContextFragment:
             raise ValueError(
                 "A pinned fragment must use PRIORITY_PINNED, so 'pinned' cannot "
                 "disagree with the eviction order.")
+        # A trigger may be written the way a manifest writes it, as a string.
+        # Frozen, so normalise through object.__setattr__.
+        if not isinstance(self.trigger, Trigger):
+            object.__setattr__(self, "trigger", Trigger.parse(self.trigger))
 
     @property
     def effective_priority(self) -> int:
