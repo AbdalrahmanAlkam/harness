@@ -88,6 +88,17 @@ assert something that had not happened. Those are the substantive changes:
   arguments are whitespace-normalized so a rule cannot be defeated by an extra
   space. Rules are re-read per call, so tightening a policy takes effect on the
   next tool call rather than the next run.
+- **Durable memory in three tiers.** Project instructions load from `AGENTS.md`
+  and `.harness/instructions/*.md`. A memory the *model* proposes never takes
+  effect on its own: it is scored for whether it is a durable project fact or a
+  one-off observation, shown as a one-line diff, and applies only when you
+  accept it. Memories that name a credential are refused before anything is
+  written, and accepted memories are private, revocable, and listed by
+  `/memory` or `adaptive-harness memory`.
+- **New commands.** `/context` shows the context budget waterfall — what is held,
+  what was admitted, what was deferred and why. `/doctor` checks that this
+  installation can do what it claims, reporting an absent optional tool as absent
+  rather than as fine. `/memory` manages durable memory.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.

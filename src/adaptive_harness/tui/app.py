@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import sys
 import threading
 from typing import Optional
 from rich.syntax import Syntax
@@ -31,6 +32,7 @@ from adaptive_harness.classifiers.domain_classifier import DomainMode, parse_dom
 from adaptive_harness.classifiers.thinking_classifier import parse_thinking_level, BUDGET_TOKENS, effort_for_level
 from adaptive_harness.llm.effort import supported_efforts
 from adaptive_harness.data.storage import ExperienceRepository
+from adaptive_harness import __version__
 from adaptive_harness.data.config import (ConfigManager, PromptHistoryStore,
                                           DEFAULT_DOMAIN_MODE, DEFAULT_MODEL, DEFAULT_MODEL_SELECTION,
                                           DEFAULT_SWARM_MODE)
@@ -71,6 +73,57 @@ def _human_duration(milliseconds: float) -> str:
     return f"{minutes}m {remainder}s"
 
 
+def _doctor_checks(app) -> list[tuple[str, bool, str]]:
+    """What this installation can actually do, reported honestly.
+
+    A green light for something that will fail later is worse than a yellow one,
+    so an absent optional tool is reported as absent rather than as fine.
+    """
+    import shutil
+
+    checks: list[tuple[str, bool, str]] = []
+    for binary, label in (("lean", "Lean 4 (formal proofs)"),
+                          ("typst", "Typst (papers)"),
+                          ("bwrap", "Bubblewrap (science sandbox)"),
+                          ("git", "git (worktrees)")):
+        found = shutil.which(binary)
+        checks.append((label, bool(found), found or "not installed"))
+    try:
+        from adaptive_harness.agent.tokenizer import available_backends
+        backends = available_backends()
+        checks.append(("token estimator", "tiktoken" in backends,
+                       ", ".join(backends) + " (chars4 is the default)"))
+    except Exception as exc:  # noqa: BLE001 - a probe must not crash the command
+        checks.append(("token estimator", False, f"unavailable: {exc}"))
+    try:
+        found = app.plugins.discover()
+        broken = [plugin.name for plugin in found if not plugin.ok]
+        checks.append(("plugins", not broken,
+                       f"{len(found)} loaded" + (f", {len(broken)} broken" if broken else "")))
+        if broken:
+            checks.append(("broken plugins", False, ", ".join(broken)))
+    except Exception as exc:  # noqa: BLE001
+        checks.append(("plugins", False, f"discovery failed: {exc}"))
+    try:
+        from adaptive_harness.plugins.mcp import McpHost
+        checks.append(("MCP", True, "host available; no servers declared"))
+    except Exception:  # noqa: BLE001
+        checks.append(("MCP", False, "host unavailable"))
+    key_env = [name for name in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
+                                  "OPENAI_API_KEY", "GEMINI_API_KEY")
+               if os.environ.get(name)]
+    try:
+        from adaptive_harness.data.credentials import CredentialsManager
+        saved = CredentialsManager().load()
+        has_key = bool(saved)
+    except Exception:  # noqa: BLE001
+        has_key = False
+    checks.append(("provider key", bool(key_env or has_key),
+                   f"{len(key_env)} in the environment" if key_env
+                   else ("saved credentials" if has_key else "none configured")))
+    return checks
+
+
 _SETTING_COMMANDS = {
     "max_steps": "/steps",
     "provider": "/provider",
@@ -84,6 +137,7 @@ SESSION_SETTING_KEYS = (
 )
 
 COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/steps", "/prompts", "/safety", "/classifier", "/new",
+            "/context", "/memory", "/doctor",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
             "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export",
             "/diff", "/isolation", "/swarm", "/settings")
@@ -112,6 +166,9 @@ COMMAND_DESCRIPTIONS = {
     "/sessions": "Browse saved sessions",
     "/session": "Load or save a session",
     "/usage": "Show token usage and cost",
+    "/context": "Show the context budget: what is held, what was admitted, what was not",
+    "/memory": "Durable memory: list, accept <id>, forget <id>, clear",
+    "/doctor": "Check that this installation can do what it claims",
     "/skills": "Browse installed skills",
     "/skill": "Force or disable a skill",
     "/output": "Select or copy the latest agent response",
@@ -1916,6 +1973,12 @@ class AdaptiveHarnessApp(App):
                 log.write(Text("No tool result yet.", style="yellow"))
         elif cmd == "/usage":
             self._show_usage()
+        elif cmd == "/context":
+            self._show_context()
+        elif cmd == "/memory":
+            self._show_memory(arg)
+        elif cmd == "/doctor":
+            self._show_doctor()
         elif cmd == "/copy":
             self.action_copy_output()
         else:
@@ -1978,6 +2041,69 @@ class AdaptiveHarnessApp(App):
 
     def _show_usage(self) -> None:
         self.query_one("#chat-log", RichLog).write(Text("Session usage · " + self._usage_summary(), style="bold cyan"))
+
+    def _show_context(self) -> None:
+        """The context budget waterfall.
+
+        This is the view that answers "where did my context go", which is the
+        only question an operator has about context and the one the plane
+        exists to make answerable.
+        """
+        log = self.query_one("#chat-log", RichLog)
+        described = self.agent.context_plane.describe()
+        log.write(Text("Context plane", style="bold cyan"))
+        log.write(Text(f"  window {described['capacity']:,} · "
+                       f"reserved {described['reserved']:,} for the final answer · "
+                       f"{described['available']:,} to fill", style="dim"))
+        held = described.get("held") or {}
+        if not held:
+            log.write(Text("  nothing held: only the conversation so far", style="dim"))
+        for source, info in held.items():
+            log.write(Text(f"  {source} · ~{info['tokens']:,} tokens · priority "
+                           f"{info['priority']} · trigger {info['trigger']}"
+                           + (" · pinned" if info["pinned"] else ""), style="dim"))
+        last = described.get("last")
+        if last:
+            log.write(Text(f"  last turn: {last['used']:,}/{last['available']:,} used · "
+                           f"{len(last['admitted'])} admitted · "
+                           f"{len(last['rejected'])} deferred", style="dim"))
+            for item in last.get("rejected", []):
+                log.write(Text(f"    not admitted · {item['source']}: {item['reason']}",
+                               style="dim yellow"))
+
+    def _show_memory(self, argument: str) -> None:
+        """Durable memory: what the harness remembers, and what it is asking about."""
+        from adaptive_harness.agent.memory import MemoryStore
+
+        log = self.query_one("#chat-log", RichLog)
+        store = MemoryStore(Path(self.config_dir) if getattr(self, "config_dir", None) else None)
+        action, _, value = (argument or "").partition(" ")
+        value = value.strip()
+        try:
+            if action == "accept" and value:
+                memory = store.accept(value)
+                log.write(Text(f"Remembered: {memory.text}" if memory
+                               else f"No pending memory with id {value!r}.", style="green"))
+            elif action == "forget" and value:
+                log.write(Text("Forgotten." if store.forget(value)
+                               else f"No memory with id {value!r}.",
+                               style="green" if store.proposals or store.memories else "yellow"))
+            elif action == "clear":
+                log.write(Text(f"Cleared {store.clear()} memory(ies).", style="green"))
+            else:
+                log.write(Text(store.describe(), style="dim"))
+        except ValueError as exc:
+            log.write(Text(str(exc), style="yellow"))
+        log.write(Text("/memory accept <id> · /memory forget <id> · /memory clear", style="dim"))
+
+    def _show_doctor(self) -> None:
+        """Is this installation actually able to do what it claims?"""
+        log = self.query_one("#chat-log", RichLog)
+        log.write(Text("Environment", style="bold cyan"))
+        log.write(Text(f"  harness {__version__} · python {sys.version.split()[0]}", style="dim"))
+        for label, ok, detail in _doctor_checks(self):
+            mark = "[green]ok[/green]" if ok else "[yellow]--[/yellow]"
+            log.write(Text(f"  {mark} {label}: {detail}", style="dim"))
 
     def _should_isolate(self, task: str) -> bool:
         if self.isolation_mode == "off":

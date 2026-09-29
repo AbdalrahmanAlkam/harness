@@ -668,6 +668,51 @@ def plugin_info(name: str = typer.Argument(..., help="Plugin name")):
         console.print("  [bold]hooks:[/bold] " + ", ".join(sorted(active)))
 
 
+@app.command("memory")
+def memory_cmd(
+    action: str = typer.Argument("list", help="list, accept ID, forget ID, or clear"),
+    memory_id: str = typer.Argument("", help="Memory id, for accept or forget"),
+    add: str = typer.Option("", "--add", help="Propose a memory and show what would be stored"),
+):
+    """Inspect and manage what the harness remembers about this project.
+
+    A memory the model proposed never takes effect on its own. It is shown as a
+    one-line diff and applies only when you accept it, which is the only way a
+    model can end up changing what it is told in a later session.
+    """
+    from adaptive_harness.agent.memory import MemoryStore
+
+    store = MemoryStore()
+    try:
+        if add:
+            proposal = store.propose(add)
+            console.print(f"[bold]Proposed[/bold] {proposal.preview}")
+            console.print(f"[dim]id: {proposal.memory.id} · {proposal.reason}[/dim]")
+            console.print("[dim]It is not in effect. "
+                          "Accept it with: adaptive-harness memory accept <id>[/dim]")
+            return
+        if action == "accept":
+            memory = store.accept(memory_id)
+            if memory is None:
+                console.print(f"[yellow]No pending memory with id {memory_id!r}.[/yellow]")
+                raise typer.Exit(1)
+            console.print(f"[green]Remembered:[/green] {memory.text}")
+            return
+        if action == "forget":
+            if not store.forget(memory_id):
+                console.print(f"[yellow]No memory with id {memory_id!r}.[/yellow]")
+                raise typer.Exit(1)
+            console.print("[green]Forgotten.[/green]")
+            return
+        if action == "clear":
+            console.print(f"[green]Cleared {store.clear()} memory(ies).[/green]")
+            return
+        console.print(store.describe())
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(2) from exc
+
+
 @app.command("plugins")
 def plugins_cmd(
     workspace: Optional[Path] = typer.Option(None, "--workspace", help="Project root to discover plugins in"),
