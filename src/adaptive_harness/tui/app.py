@@ -816,6 +816,12 @@ class AdaptiveHarnessApp(App):
         log = self.query_one("#chat-log", PinnedRichLog)
         log.clear()
         log._set_pinned(False)
+        # An empty bordered box reads as a broken app. Say what happened and
+        # what to do next, in the space that was just freed.
+        log.write(Text(""))
+        log.write(Text("Chat cleared. The session and its settings are untouched.", style="dim"))
+        log.write(Text("Ask for anything, or type /help to see what this can do.",
+                       style="dim cyan"))
 
     def deliver_to_clipboard(self, text: str) -> clipboard.ClipboardDelivery:
         """Copy ``text`` to the best available clipboard and remember the result.
@@ -1438,42 +1444,49 @@ class AdaptiveHarnessApp(App):
         self._has_focus = True
 
     def action_show_help(self) -> None:
+        """Print the command list, generated so it cannot drift from the code.
+
+        This used to be a hand-maintained block of plain strings written into a
+        ``markup=True`` log, so every literal ``[...]`` -- the argument
+        placeholders, which are the most useful part of each line -- was eaten as
+        markup and silently deleted from the help.
+        """
         log = self.query_one("#chat-log", RichLog)
-        log.write("[bold yellow]Available Commands:[/bold yellow]")
-        log.write("  /provider <name>       - Switch OpenRouter, Anthropic, OpenAI, DeepSeek, Google, Groq, or local")
-        log.write("  /key <provider> <key>   - Save a private provider key; /key status or /key clear <provider>")
-        log.write("  /model [MODEL_ID]      - Browse models (F4) or set one directly")
-        log.write("  /models                - Search live OpenRouter catalog")
-        log.write("  /tier <fast|standard|reasoning> - Force model tier")
-        log.write("  /copy                   - Copy selected chat text or latest agent reply")
-        log.write("  Ctrl+Shift+C, Ctrl+Y    - Copy selected chat text or latest agent reply")
-        log.write("  Ctrl+C                  - Copy the selection, or quit when nothing is selected")
-        log.write("  [dim]Mouse drag over the chat log selects text; every copy is also saved to output/clipboard/ "
-                 "so it can be recovered even if the terminal drops OSC 52.[/dim]")
-        log.write("  /safety <turbo|balanced|cautious|strict> - Set tool confirmation level")
-        log.write("  /mode <coding|research|science|security|auto> - Set operational mode")
-        log.write("  /thinking <auto|low|medium|high|xhigh|max> - Set model reasoning effort (deep = high)")
-        log.write("  /steps <classifier|fixed|unbounded|N> - Set tool-step limit policy")
-        log.write("  /prompts [show NAME]   - List model prompts or print one; edit via prompts.json overrides")
-        log.write("  /classifier <semif|sklearn|backend> [model/path] - Switch decision engine")
-        log.write("  /workspace [path]      - Show or change working directory")
-        log.write("  /sessions              - Browse saved sessions (F5); /sessions list prints IDs")
-        log.write("  /session new [title] | load <id> | save")
-        log.write("  /skills                - List installed skills")
-        log.write("  /skill list            - Browse 22 built-in and custom skills")
-        log.write("  /skill <name|off>      - Force a skill or restore automatic routing")
-        log.write("  /output                - Open a selectable full-text view of the latest agent response")
-        log.write("  /tool-output           - Open a selectable view of the latest tool result")
-        log.write("  /usage                 - Show all session token types and reported cost")
-        log.write("  /new | /reset          - Start a new session or reset current one (settings carry over)")
-        log.write("  /reset defaults        - Also restore mode/thinking/safety/swarm to launch defaults")
-        log.write("  /theme [name]          - Preview and save terminal theme (F2)")
-        log.write("  /history               - Show recent prompts; Up/Down recalls prompts")
-        log.write("  /export [markdown|json] - Save the session to output/sessions/")
-        log.write("  F3                    - Review isolated changes")
-        log.write("  F6                    - Show or hide telemetry")
-        log.write("  /clear                 - Clear chat history")
-        log.write("  /exit                  - Exit application")
+        log.write(Text("Available Commands", style="bold yellow"))
+        width = max((len(command) for command in COMMANDS), default=10)
+        for command in COMMANDS:
+            description = COMMAND_DESCRIPTIONS.get(command, "")
+            log.write(Text(f"  {command.ljust(width)}  {description}"))
+        log.write(Text(""))
+        log.write(Text("Key bindings", style="bold yellow"))
+        for binding in self._key_binding_help():
+            log.write(Text(f"  {binding}"))
+        log.write(Text(""))
+        log.write(Text(
+            "Drag across the chat log to select text. Every copy is also saved to "
+            "output/clipboard/ so it survives a terminal that drops OSC 52.",
+            style="dim"))
+        log.write(Text(
+            "While the agent is working, Enter queues your note for the start of the "
+            "next step; prefix it with ! to stop the run after the current step.",
+            style="dim"))
+
+    @staticmethod
+    def _key_binding_help() -> list[str]:
+        """The keys the footer advertises, described in words rather than glyphs."""
+        return [
+            "Ctrl+C        copy the selection, or quit when nothing is selected",
+            "Ctrl+Y        copy the selection or the latest agent reply",
+            "Ctrl+N        new session",
+            "Ctrl+L        clear the chat history",
+            "F2            preview and save the terminal theme",
+            "F3            review isolated changes",
+            "F4            choose a model",
+            "F5            browse saved sessions",
+            "F6            show or hide telemetry",
+            "F7            open the settings screen",
+            "Esc           close a dialog, or cancel a question",
+        ]
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "prompt-input":
