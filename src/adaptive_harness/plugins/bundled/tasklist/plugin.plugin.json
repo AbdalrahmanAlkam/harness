@@ -1,0 +1,51 @@
+{
+  "name": "tasklist",
+  "version": "1.0.0",
+  "description": "Live task state for a run, in which a task cannot be marked done without an observed successful tool call.",
+  "author": "Adaptive Agent Harness",
+  "permissions": ["tools", "hooks", "env"],
+  "tools": [
+    {
+      "name": "task_update",
+      "description": "Create or update a task. Status is one of pending, in_progress, done, blocked. A task cannot be marked done unless a successful call to a real tool has been observed since it entered in_progress: an unevidenced done is refused and says what is missing. A task that is done or blocked does not silently go back to pending. Use this to hold a plan the run is actually keeping.",
+      "handler": "task_update",
+      "risk": "write",
+      "domains": ["coding", "planning"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "description": "Stable identifier for the task, e.g. 'fix-null-deref'."},
+          "status": {"type": "string", "enum": ["pending", "in_progress", "done", "blocked"],
+                     "description": "Where the task is now."},
+          "note": {"type": "string", "description": "What happened, or why a blocked task is being re-opened."}
+        },
+        "required": ["id", "status"]
+      }
+    },
+    {
+      "name": "task_list",
+      "description": "List the tasks being tracked, optionally filtered to one status. Shows how many observed tool calls each in_progress or done task has.",
+      "handler": "task_list",
+      "risk": "read",
+      "domains": ["coding", "planning"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {"type": "string",
+                     "description": "pending, in_progress, done or blocked. Empty for all."}
+        }
+      }
+    },
+    {
+      "name": "task_clear",
+      "description": "Reset the task list and all recorded evidence. Use at the start of a new run.",
+      "handler": "task_clear",
+      "risk": "write",
+      "domains": ["coding", "planning"],
+      "parameters": {"type": "object", "properties": {}}
+    }
+  ],
+  "hooks": [
+    {"when": "pre_tool", "handler": "guard_pre_tool"}
+  ]
+}

@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from adaptive_harness.agent.compaction import OPERATOR_PREFIX, compact_tool_output
+from adaptive_harness.agent.hierarchical import compact_hierarchically
 from adaptive_harness.llm.providers import context_window
 
 
@@ -60,20 +61,21 @@ def prepare_context(messages: list[dict[str, Any]], model: str,
 
     used = estimate_tokens(copied, tools)
     if used / capacity > threshold:
-        # Summarize only complete old turns, avoiding dangling tool-call pairs.
-        cutoff = max(1, len(copied) - 8)
-        first_old_user = next((i for i in range(1, cutoff) if copied[i].get("role") == "user"), None)
-        if first_old_user is not None:
-            end = max((i for i in range(first_old_user + 1, cutoff)
-                       if copied[i].get("role") == "user"), default=cutoff)
-            old = copied[first_old_user:end]
-            if old and not any(i in protected for i in range(first_old_user, end)):
-                requests = [str(item.get("content") or "")[:180] for item in old if item.get("role") == "user"]
-                outcomes = [str(item.get("content") or "")[:220] for item in old
-                            if item.get("role") == "assistant" and not item.get("tool_calls")]
-                note = "Earlier conversation summary (original turns retained in session storage):\n"
-                note += "Requests: " + " | ".join(requests[-6:]) + "\nOutcomes: " + " | ".join(outcomes[-6:])
-                copied[first_old_user:end] = [{"role": "user", "content": note[:2400]}]
+        # Map->reduce over the old cohort, replacing a single lossy pass. A
+        # second attempt is made if one fold was not enough.
+        # The foldable region starts after the protected head, which is the
+        # system message and anything pinned before it.
+        head = (max(protected) + 1) if protected else 0
+        tail = 8
+        for _ in range(2):
+            folded, report = compact_hierarchically(
+                copied, protected=protected, head=head, tail=tail,
+                estimate=lambda items: estimate_tokens(items, tools))
+            if not report.generations and report.messages_after == report.messages_before:
+                break
+            copied = folded
+            if estimate_tokens(copied, tools) / capacity <= threshold:
+                break
 
     compacted = estimate_tokens(copied, tools)
     info["compacted_tokens"] = max(0, original - compacted)
