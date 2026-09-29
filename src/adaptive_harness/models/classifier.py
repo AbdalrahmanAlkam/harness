@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Dict, List, Optional, Union
 
 import joblib
@@ -16,6 +18,9 @@ from adaptive_harness.models.features import build_text_feature_union
 
 
 DEFAULT_MODEL_PATH = Path("output/models/routing_classifier.joblib")
+
+#: Recorded in a saved artifact so a future payload change is detectable.
+MODEL_SCHEMA_VERSION = 2
 
 
 class TaskClassifier:
@@ -122,8 +127,21 @@ class TaskClassifier:
             "c_param": self.c_param,
             "max_iter": self.max_iter,
             "is_trained": self._is_trained,
+            "schema_version": MODEL_SCHEMA_VERSION,
         }
-        joblib.dump(payload, target_path)
+        # Write to a sibling temp file and rename. Dumping in place means a
+        # crash, a Ctrl-C, or a full disk mid-write leaves a truncated artifact,
+        # and the next retrain then dies loading it -- so the retrain that was
+        # meant to repair the model can never run again.
+        handle, temp_name = tempfile.mkstemp(dir=str(target_path.parent), suffix=".joblib.tmp")
+        os.close(handle)
+        temp_path = Path(temp_name)
+        try:
+            joblib.dump(payload, temp_path)
+            os.replace(temp_path, target_path)
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise
         return target_path
 
     @classmethod
@@ -134,6 +152,15 @@ class TaskClassifier:
             raise FileNotFoundError(f"Model file not found at {target_path}")
 
         payload = joblib.load(target_path)
+        # A missing key used to raise KeyError out of the caller, which surfaced
+        # as an unhandled crash. Report which artifact is unusable instead, so a
+        # user can delete or retrain it rather than guess.
+        missing = [key for key in ("pipeline", "classes", "is_trained") if key not in payload]
+        if missing:
+            raise ValueError(
+                f"The saved model at {target_path} is missing {', '.join(missing)}. "
+                f"It was written by an incompatible version. Delete it and run "
+                f"`adaptive-harness train` to rebuild.")
         instance = cls(
             c_param=payload.get("c_param", 2.0),
             max_iter=payload.get("max_iter", 1000),

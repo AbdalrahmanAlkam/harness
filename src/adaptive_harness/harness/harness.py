@@ -27,6 +27,9 @@ class Harness:
         router: Optional[Router] = None,
     ):
         self.classifier = classifier
+        #: Set when a trace could not be persisted, so the condition is
+        #: inspectable instead of vanishing.
+        self.last_storage_error: str | None = None
         self.policy = policy or ThresholdPolicy()
         self.strategies = strategies or get_default_strategies()
         self.repository = repository
@@ -141,7 +144,12 @@ class Harness:
         if self.repository is not None:
             try:
                 self.repository.record_trace(trace)
-            except Exception:
-                pass  # Do not allow database logging failure to crash harness execution
+            except Exception as exc:  # noqa: BLE001 - persistence must not fail the run
+                # A persistence failure must not fail the task, but swallowing it
+                # silently made a wedged repository (locked file, full disk,
+                # schema drift) look like "no experience recorded" forever with
+                # no diagnostic at all. The agent loop reports the same condition
+                # as a storage_error event.
+                self.last_storage_error = f"{type(exc).__name__}: {exc}"
 
         return trace

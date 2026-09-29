@@ -15,6 +15,9 @@ class ClarificationMemory:
 
     def __init__(self, directory: Path | str | None = None):
         self.path = Path(directory or DEFAULT_CONFIG_DIR).expanduser() / "preferences.json"
+        #: Set when a read failed, so the caller can tell the user their
+        #: remembered decisions were dropped rather than silently losing them.
+        self.last_error: str | None = None
 
     @staticmethod
     def _key(question: str) -> str:
@@ -45,10 +48,14 @@ class ClarificationMemory:
             os.chmod(self.path, 0o600)
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
+                self.last_error = f"{self.path} does not contain a JSON object; ignoring it."
                 return {}
             return {str(key): str(value) for key, value in data.items()
                     if isinstance(key, str) and isinstance(value, str)}
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            # Silently returning {} here wiped every remembered decision the user
+            # had made, with no symptom at all. The caller can surface this.
+            self.last_error = f"Could not read {self.path}: {exc}"
             return {}
 
     def lookup(self, question: str, context: str | None = None) -> str | None:
