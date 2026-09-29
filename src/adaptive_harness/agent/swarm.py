@@ -280,7 +280,8 @@ class DeveloperAgentWorker:
                  enable_skill_routing: bool = False,
                  write_target: Path | Sequence[Path] | None = None,
                  system_prompt: str | None = None,
-                 on_event: Callable[[Any], None] | None = None) -> None:
+                 on_event: Callable[[Any], None] | None = None,
+                 budget_tokens: int | None = None) -> None:
         if max_steps is not None and max_steps < 1:
             raise ValueError("max_steps must be positive")
         self.llm_client_factory = llm_client_factory
@@ -299,6 +300,11 @@ class DeveloperAgentWorker:
         self.write_target = write_target
         self.system_prompt = system_prompt
         self.on_event = on_event
+        # Per-assignment token ceiling. The research swarm passes one so a run
+        # has a bound on what it can spend; None means unbounded, which is only
+        # appropriate for a single interactive task.
+        self.budget_tokens = budget_tokens
+        self.total_tokens_spent = 0
 
     def _authorized_writes(self) -> tuple[Path, ...] | None:
         """The write allow-list for this assignment, or None when unrestricted."""
@@ -381,6 +387,7 @@ class DeveloperAgentWorker:
             prompt += prompts.get("swarm.context_header") + json.dumps(assignment.context, ensure_ascii=False)
         response: dict[str, Any] = {}
         evidence: list[dict[str, Any]] = []
+        spent_tokens = 0
         for event in agent.run_stream(prompt, max_steps=self.max_steps):
             if self.on_event is not None:
                 self.on_event(event)
@@ -390,6 +397,19 @@ class DeveloperAgentWorker:
                 evidence.append({"tool": event.payload.get("name"),
                                  "success": bool(event.payload.get("success")),
                                  "error": event.payload.get("error")})
+            usage = event.payload.get("usage") if event.event_type == "response" else None
+            if isinstance(usage, dict):
+                spent_tokens += int(usage.get("total_tokens")
+                                    or (usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)))
+            if self.budget_tokens and spent_tokens >= self.budget_tokens:
+                # The budget used to be recorded in the spawn ledger entry and
+                # never compared to anything, so the audit trail attested to a
+                # limit that did not exist. Stop here, and say so.
+                response.setdefault("content", "")
+                response["stop_reason"] = "token_budget_exhausted"
+                self.total_tokens_spent += spent_tokens
+                break
+        self.total_tokens_spent += spent_tokens
         stop_reason = response.get("stop_reason")
         test_results = [item for item in evidence if item["tool"] == "run_pytest"]
         successful_tests = bool(test_results and test_results[-1]["success"])

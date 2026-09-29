@@ -703,6 +703,11 @@ def research(
                               help="A checkable claim as 'lhs == rhs' in SymPy syntax, decided directly"),
     symbols: str = typer.Option("", "--symbols", help="Comma-separated free symbols for --claim"),
     seed: int = typer.Option(20260926, "--seed", help="Pinned seed for every experiment"),
+    worker_budget: int = typer.Option(
+        16000, "--worker-budget-tokens", min=0,
+        help="Token ceiling per worker attempt. 0 removes the ceiling. A research "
+             "run fans out to many workers, so this is what bounds what one "
+             "invocation can cost."),
     install_typst: bool = typer.Option(
         False, "--install-typst",
         help="Allow the harness to pip install the pinned Typst binding if no "
@@ -731,6 +736,10 @@ def research(
                                 help="Recover the persisted task board and ledger from an interrupted run"),
     provider: str = typer.Option("openrouter", "--provider",
                                  help="Configured API provider for independent research agents"),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m",
+        help="Model the research agents use. Defaults to the provider's own "
+             "default, which any account with that provider can call."),
     author: bool = typer.Option(True, "--author/--offline-legacy",
                                help="Run the live LLM research swarm (default); "
                                     "offline legacy mode is for reproducibility only"),
@@ -750,15 +759,13 @@ def research(
     reports EXTERNAL_STOP with the operator named, rather than leaving orphaned
     child processes and a ledger that claims the loop converged.
     """
+    from adaptive_harness.research.claim import Verdict
     from adaptive_harness.research.swarm import ResearchSwarm, SwarmConfig
 
     client_factory = None
     if author:
-        if provider.lower() != "openrouter":
-            raise typer.BadParameter("live research uses OpenRouter with stealth/space-bunny-alpha",
-                                     param_hint="--provider")
         try:
-            client_factory = _llm_client_factory(provider=provider)
+            client_factory = _llm_client_factory(provider=provider, model=model)
         except Exception as exc:  # noqa: BLE001 - surfaced to the operator
             raise typer.BadParameter(str(exc), param_hint="--author") from exc
 
@@ -774,6 +781,7 @@ def research(
                          seed=seed,
                          llm_client_factory=client_factory,
                          claim=claim,
+                         worker_budget_tokens=worker_budget,
                          auto_install_typst=install_typst,
                          claim_symbols=tuple(name.strip() for name in symbols.split(",") if name.strip()))
     swarm = ResearchSwarm(topic, root=root, config=config)
@@ -835,7 +843,18 @@ def research(
 
     verdict = swarm.claims.headline
     color = {"PROVEN": "green", "DISPROVEN": "red"}.get(verdict.value, "yellow")
-    console.print(f"\n[bold {color}]VERDICT: {verdict.value}[/bold {color}]")
+    # Two different verdicts are reported: the mathematical one (what the
+    # derivations decided) and the process one (whether the run met every
+    # invariant). Printing a green PROVEN next to UNSOLVED and exiting 2 was
+    # the single most misleading thing this command could do, so the process
+    # verdict is stated first and the relationship is spelled out.
+    process = "COMPLETE" if outcome.solved else "INCOMPLETE"
+    process_color = "green" if outcome.solved else "red"
+    console.print(f"\n[bold {process_color}]RUN: {process} — {outcome.stop_reason.value}[/bold {process_color}]")
+    if not outcome.solved and verdict is Verdict.PROVEN:
+        console.print("[yellow]The mathematics was decided, but the run did not satisfy every "
+                      "invariant, so nothing is published as settled.[/yellow]")
+    console.print(f"[bold {color}]MATHEMATICAL VERDICT: {verdict.value}[/bold {color}]")
     console.print(swarm.claims.summary())
     for item in swarm.claims.adjudications:
         console.print(f"  [dim]{item.prop_id}[/dim] {item.verdict.value:<13} {item.statement[:66]}")
@@ -855,12 +874,17 @@ def research(
         raise typer.Exit(code=2)
 
 
-def _llm_client_factory(provider: str = "openrouter"):
+def _llm_client_factory(provider: str = "openrouter", model: Optional[str] = None):
     """Build a factory that mints a fresh LLM client per research worker.
 
     A new client per worker is deliberate: each subagent needs its own
     conversation, tool set, and system prompt, and sharing one would interleave
     their histories.
+
+    ``model`` lets an operator choose the research model. The default comes from
+    the provider's entry, which is a model any account with that provider can
+    actually call -- research previously pinned one private slug, so a customer
+    without access to it could not run the product's headline feature at all.
     """
     from adaptive_harness.llm.client import LLMClient
     from adaptive_harness.data.credentials import CredentialsManager
@@ -868,12 +892,15 @@ def _llm_client_factory(provider: str = "openrouter"):
     saved_keys = CredentialsManager().load()
     probe = LLMClient(provider=provider, provider_keys=saved_keys)
     if probe.is_mock:
-        raise RuntimeError(f"no live {provider} model is configured; use the harness credentials "
-                           "command or provider environment variable before research")
+        raise RuntimeError(
+            f"no live {provider} model is configured. Set the provider's environment "
+            f"variable (for example OPENROUTER_API_KEY), or save a key in the TUI with "
+            f"/key {provider} <key>, then run research again.")
+    chosen = model or probe.default_model
 
     def factory():
         return LLMClient(api_key=probe.api_key, base_url=probe.base_url,
-                         default_model=probe.default_model, force_mock=False,
+                         default_model=chosen, force_mock=False,
                          provider=probe.provider, provider_keys=probe.provider_keys,
                          backup_providers=probe.backup_providers)
 

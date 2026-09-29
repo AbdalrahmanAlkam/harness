@@ -1584,9 +1584,10 @@ class ResearchSwarm:
             return {"ran": False, "reason": "no live model configured"}
 
         def role_client_factory() -> Any:
-            client = self.config.llm_client_factory()
-            client.default_model = "stealth/space-bunny-alpha"
-            return client
+            # The factory already carries the operator's chosen research model.
+            # Overriding it here pinned the swarm to one private slug, so a
+            # customer without access to that model could not run research at all.
+            return self.config.llm_client_factory()
 
         if tool_names_override is not None:
             tool_names = tool_names_override
@@ -1677,6 +1678,7 @@ class ResearchSwarm:
             # which is exactly the duplicate work the board exists to prevent.
             write_target=authorized,
             system_prompt=self._worker_prompt(agent, division, success_criterion, target),
+            budget_tokens=self.config.worker_budget_tokens or None,
             on_event=on_event)
         assignment = SwarmAssignment(SwarmRole.CODER, SwarmPhase.IMPLEMENT, directive,
                                      self.workspace.root)

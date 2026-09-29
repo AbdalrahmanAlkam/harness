@@ -121,7 +121,12 @@ def test_worker_iterates_in_a_tool_loop_and_logs_its_trajectory(tmp_path: Path):
     assert entries[0].recipient["role"] == "Theoretical Lead"
 
 
-def test_research_roles_use_space_bunny_alpha_only(tmp_path: Path):
+def test_research_workers_use_the_operator_chosen_model(tmp_path: Path):
+    """The swarm must not override the model the operator selected.
+
+    It used to pin every research worker to one private slug, so a customer
+    without access to that model could not run research at all.
+    """
     swarm = _swarm(tmp_path, [])
     agent_id = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "write a proof",
                                     ["write_file"])
@@ -131,6 +136,7 @@ def test_research_roles_use_space_bunny_alpha_only(tmp_path: Path):
     def factory():
         client = ScriptedClient([("write_file", {
             "path": str(target.relative_to(swarm.workspace.root)), "content": PROOF_BODY})])
+        client.default_model = "some/other-model"
         clients.append(client)
         return client
 
@@ -138,7 +144,7 @@ def test_research_roles_use_space_bunny_alpha_only(tmp_path: Path):
     swarm._run_worker(swarm.agents[agent_id], Division.THEORY, "Write a proof.",
                       success_criterion="File exists.", target=target)
     assert clients
-    assert all(client.default_model == "stealth/space-bunny-alpha" for client in clients)
+    assert all(client.default_model == "some/other-model" for client in clients)
 
 
 def test_division_leads_only_author_assignments(tmp_path: Path):
