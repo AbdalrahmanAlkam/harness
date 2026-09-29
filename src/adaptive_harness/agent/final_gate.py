@@ -66,9 +66,14 @@ class Requirement:
     #: obligation itself rather than invented, so a requirement always has some
     #: way of being evidenced.
     keywords: tuple[str, ...] = ()
+    #: Tools that can *do* this obligation, as opposed to looking at it.
+    #: Listing a tests directory is not running the test suite, and a gate that
+    #: cannot tell those apart will pass a run where nothing was executed.
+    acting_tools: tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"id": self.id, "text": self.text, "keywords": list(self.keywords)}
+        return {"id": self.id, "text": self.text, "keywords": list(self.keywords),
+                "acting_tools": list(self.acting_tools)}
 
 
 @dataclass
@@ -90,7 +95,8 @@ class RequirementSet:
         return cls(
             requirements=[Requirement(id=str(item.get("id", "")),
                                        text=str(item.get("text", "")),
-                                       keywords=tuple(item.get("keywords", ())))
+                                       keywords=tuple(item.get("keywords", ())),
+                                       acting_tools=tuple(item.get("acting_tools", ())))
                           for item in payload.get("requirements", [])],
             source=str(payload.get("source", "")))
 
@@ -130,8 +136,54 @@ def extract_requirements(request: str) -> RequirementSet:
             id=f"R{len(requirements) + 1}",
             text=fragment,
             keywords=_keywords(fragment),
+            acting_tools=_acting_tools(fragment),
         ))
     return RequirementSet(requirements=requirements, source=text)
+
+
+#: Obligation verb -> the tools that can actually perform it. A requirement
+#: naming one of these is satisfied only by one of them: listing a tests
+#: directory is not running the suite, and reading a file is not editing it.
+#: Empty means any successful matching tool will do, which is the right default
+#: for an obligation whose verb is not in this table.
+_ACTING_TOOLS = {
+    "run": ("run_bash", "run_pytest", "run_python_repl", "run_lean_proof"),
+    "test": ("run_pytest", "run_bash", "run_python_repl"),
+    "execute": ("run_bash", "run_python_repl", "run_lean_proof"),
+    "build": ("run_bash", "run_python_repl"),
+    "deploy": ("run_bash",),
+    "add": ("write_file", "edit_file", "run_bash"),
+    "create": ("write_file", "edit_file", "run_bash"),
+    "write": ("write_file", "edit_file", "run_bash"),
+    "implement": ("write_file", "edit_file", "run_bash"),
+    "fix": ("write_file", "edit_file", "run_bash"),
+    "refactor": ("write_file", "edit_file", "run_bash"),
+    "update": ("write_file", "edit_file", "run_bash"),
+    "remove": ("write_file", "edit_file", "run_bash"),
+    "delete": ("write_file", "edit_file", "run_bash"),
+    "rename": ("write_file", "edit_file", "run_bash"),
+    "move": ("write_file", "edit_file", "run_bash"),
+    "document": ("write_file", "edit_file", "run_bash"),
+    "migrate": ("write_file", "edit_file", "run_bash"),
+    "configure": ("write_file", "edit_file", "run_bash"),
+    "publish": ("run_bash",),
+    "push": ("run_bash",),
+}
+
+#: Tools that observe without acting, whatever else the evidence says.
+_NEVER_ACTING = frozenset({
+    "list_directory", "search_files", "read_file", "read_full_output",
+    "calculate", "verify_equation", "check_convergence", "task_list",
+})
+
+
+def _acting_tools(fragment: str) -> tuple[str, ...]:
+    """The tools that could satisfy this obligation, inferred from its verb."""
+    lowered = fragment.lower()
+    for verb, tools in _ACTING_TOOLS.items():
+        if re.search(rf"\b{verb}\w*\b", lowered):
+            return tools
+    return ()
 
 
 def _keywords(fragment: str) -> tuple[str, ...]:
@@ -314,12 +366,26 @@ def adjudicate(requirement: Requirement, ledger: EvidenceLedger,
     evidence_ids: List[str] = []
     matched_any = False
     for record in ledger.records:
-        haystack_words = set(re.findall(r"[a-z0-9_.]+", f"{record.target} {record.digest}".lower()))
-        if any(any(_same_word(keyword, word) for word in haystack_words)
+        # A path is split into its stem and its extension, so "fix the parser"
+        # matches evidence on src/parse.py. Treating "parse.py" as one token
+        # meant the single most common evidence form never matched anything.
+        tokens: set[str] = set()
+        for token in re.findall(r"[a-z0-9_]+", f"{record.target} {record.digest}".lower()):
+            tokens.add(token)
+            if "." in token:
+                tokens.add(token.rsplit(".", 1)[0])
+        if any(any(_same_word(keyword, word) for word in tokens)
                for keyword in requirement.keywords):
             evidence_ids.append(f"{record.tool}:{record.target[:60]}")
-            if record.success:
-                matched_any = True
+            if not record.success:
+                continue
+            # A tool that only observes cannot have performed the obligation,
+            # however much its output happens to mention the subject.
+            if record.tool in _NEVER_ACTING:
+                continue
+            if requirement.acting_tools and record.tool not in requirement.acting_tools:
+                continue
+            matched_any = True
 
     if matched_any:
         return Adjudication(requirement.id, requirement.text, SATISFIED,
@@ -372,14 +438,23 @@ def _stem(word: str) -> str:
 
 
 def _same_word(left: str, right: str) -> bool:
-    """Whether two words are the same word in different inflections."""
+    """Whether two words are the same word in different inflections.
+
+    Suffix stripping plus a shared prefix covers the pairs that actually show
+    up between a request and the evidence for it: cach/cache, run/runs,
+    parse/parser, migrat/migration. The prefix is compared on a length floor so
+    two unrelated short words do not collide.
+    """
     a, b = _stem(left), _stem(right)
     if a == b:
         return True
-    # A shared prefix covers derivational pairs the suffix rules miss
-    # (cach/cache, doc/document, migrat/migration).
     shorter = min(len(a), len(b))
     return shorter >= 4 and a[:shorter] == b[:shorter]
+
+
+def _mentions(needle: str, haystack_words) -> bool:
+    """Whether any word in the evidence is the same word as ``needle``."""
+    return any(_same_word(needle, word) for word in haystack_words)
 
 
 def evaluate(requirements: RequirementSet, ledger: EvidenceLedger, summary: str,

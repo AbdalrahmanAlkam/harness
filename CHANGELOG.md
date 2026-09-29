@@ -112,6 +112,17 @@ assert something that had not happened. Those are the substantive changes:
   than logged, because a log line nobody reads is not a signal. A classifier
   that degrades silently makes every run quietly worse, and the cost of being
   worse is invisible until someone notices the bill.
+- **Measured calibration for the quality gate.** A gate that cries wolf gets
+  switched off, which is worse than having none, so the claim gate is now scored
+  against a labelled set of honest and hallucinated reports. Doing so found
+  three real defects: a path like `src/parse.py` never matched the word
+  "parser", so a genuine edit was read as a fabrication; merely *listing* a
+  tests directory satisfied "run the test suite"; and the agent recorded no
+  evidence at all, so the gate had nothing to judge against.
+- **Language-server and project-memory plugins.** `lsp` gives definitions,
+  references, hover and diagnostics with no language server installed, and says
+  so rather than pretending. `agents-md` loads `AGENTS.md` and
+  `.harness/instructions/*.md` as a pure reader — it never writes to them.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.
