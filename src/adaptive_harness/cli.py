@@ -18,6 +18,11 @@ from rich.text import Text
 
 from adaptive_harness.tui.formatting import format_model_markdown
 
+from adaptive_harness.cli_contract import (
+    Ceilings,
+    JsonStream,
+    exit_code_for,
+)
 from adaptive_harness.dashboard.report import (
     print_ablation_table,
     print_execution_trace,
@@ -294,6 +299,17 @@ def dev(
     mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, plan, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Model effort: auto, low, medium, high, xhigh, max (deep = high)"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
+    json_output: bool = typer.Option(
+        False, "--json",
+        help="Emit one JSON object per event, and a summary object at the end. "
+             "For scripting; the human-readable output is suppressed."),
+    max_cost: Optional[float] = typer.Option(
+        None, "--max-cost", min=0.0,
+        help="Stop the run once this much has been spent, in US dollars. The stop "
+             "is attributed: the exit code is 3, not 1."),
+    max_turns: Optional[int] = typer.Option(
+        None, "--max-turns", min=1,
+        help="Stop the run after this many model turns. Exit code 3 when reached."),
     quality_gate: bool = typer.Option(
         False, "--quality-gate",
         help="Check the final answer against the tool calls that were actually "
@@ -410,8 +426,22 @@ def dev(
 
     last_agent_content = ""
     task_succeeded = False
+    task_stop_reason = ""
+    json_stream = None
+    if json_output:
+        # Straight to stdout, never through Rich: Rich wraps at the terminal
+        # width, which turns one JSON object per line into something a parser
+        # cannot read. `--json` is a machine contract.
+        json_stream = JsonStream(lambda line: (sys.stdout.write(line + "\n"),
+                                               sys.stdout.flush()))
+    if max_cost is not None or max_turns is not None:
+        # Independent of --json: a ceiling is a ceiling whether or not anyone is
+        # parsing the output.
+        agent.ceilings = Ceilings(max_cost_usd=max_cost, max_turns=max_turns)
     _start_operator_reader(agent)
     for event in agent.run_stream_with_followup(task):
+        if json_stream is not None:
+            json_stream.emit(event)
         et = event.event_type
         p = event.payload
         if et == "skill_classification":
@@ -518,6 +548,7 @@ def dev(
             console.print(f"  [dim]Verification Classifier: [{badge_col}]{p['status']}[/{badge_col}] -> Action: {p['action']}[/dim]")
         elif et == "response":
             task_succeeded = bool(p.get("success"))
+            task_stop_reason = str(p.get("stop_reason") or "")
             if p.get("content") and p["content"] != last_agent_content:
                 console.print("\n[bold magenta]Agent:[/bold magenta]")
                 console.print(Markdown(format_model_markdown(p["content"])))
@@ -533,8 +564,28 @@ def dev(
             color = "green" if p.get("success", True) else "yellow"
             console.print(f"\n[bold {color}]{status} in {p['total_time_ms']} ms ({p['steps']} steps)[/bold {color}]\n")
 
-    if not task_succeeded:
-        raise typer.Exit(code=1)
+    # A script's only signal is the exit status, so it has to carry a meaning.
+    # See cli_contract for the vocabulary.
+    if json_stream is not None:
+        # The summary is part of the machine contract, so it goes out the same
+        # unwrapped way the events did.
+        sys.stdout.write(json.dumps(json_stream.summary(), ensure_ascii=False,
+                                   default=str) + "\n")
+        sys.stdout.flush()
+    # Exit 4 means "something the run needed was not available", which is
+    # usually fixable by configuration. Detect it from the stop reason rather
+    # Exit 4 means "something the run needed was not available", which is
+    # usually fixable by configuration rather than by changing the task. That is
+    # specifically *a missing credential for a live provider* -- not a model that
+    # ran and declined the work, which is the agent failing (exit 1), and not an
+    # explicitly offline run, which asked for the mock and got it.
+    unavailable = bool(
+        not offline
+        and getattr(agent.llm_client, "is_mock", False)
+        and task_stop_reason in {"provider_error", "no_credential", ""}
+    )
+    raise typer.Exit(code=exit_code_for(task_stop_reason, success=task_succeeded,
+                                        unavailable=unavailable))
 
 
 #: Plugin lifecycle. A plugin is a directory under one of the discovery roots,

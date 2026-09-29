@@ -99,6 +99,13 @@ assert something that had not happened. Those are the substantive changes:
   what was admitted, what was deferred and why. `/doctor` checks that this
   installation can do what it claims, reporting an absent optional tool as absent
   rather than as fine. `/memory` manages durable memory.
+- **A non-interactive contract.** Exit codes now mean something a script can
+  branch on: `0` completed, `1` the agent did not finish, `2` a gate refused,
+  `3` a budget ceiling was reached, `4` something the run needed was missing.
+  `dev --json` emits one JSON object per event plus a summary, written straight
+  to stdout so Rich cannot wrap it into something unparsable. `--max-cost` and
+  `--max-turns` halt a run deterministically with an attributed stop reason
+  instead of an unexplained truncation.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.

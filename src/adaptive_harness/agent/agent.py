@@ -418,6 +418,14 @@ class DeveloperAgent:
         # reaches the model only after a local trigger match and a relevance
         # score admit it.
         self._context_plane: ContextPlane | None = None
+        #: Spend ceilings, set by the non-interactive contract. Absent means the
+        #: run is bounded only by its step policy, which is right for an
+        #: interactive session and wrong for a CI one.
+        self.ceilings: Optional[Any] = None
+        #: Set when a spend ceiling was hit mid-run, so the completion
+        #: path can stop rather than reporting a run that was cut short
+        #: as though it had simply finished.
+        self._ceiling_breach: Optional[str] = None
         # The Quality Controller's per-turn state. The requirement set is the
         # ground truth for the turn; the ledger is what was actually observed
         # while answering it. Both are replaced at the start of each turn.
@@ -1181,6 +1189,16 @@ class DeveloperAgent:
                 final_answer = (f"Run cancelled: {self._cancel_reason}. "
                                 f"Work already done is above.")
                 break
+            if self.ceilings is not None:
+                # A ceiling that only reports after the fact is a report, not a
+                # ceiling. Checked before the request that would breach it.
+                breach = self.ceilings.observe_turn()
+                if breach:
+                    stop_reason = "max_turns"
+                    final_answer = (f"Stopped: {breach}. The work done so far is "
+                                    f"above and is not lost.")
+                    yield AgentEvent("budget_exhausted", self.ceilings.to_dict())
+                    break
             # A message typed mid-run lands here. The previous step's tool batch
             # is fully recorded (including the synthesised CANCELLED results), so
             # inserting a user message here cannot orphan a tool_call, and the
@@ -1231,6 +1249,22 @@ class DeveloperAgent:
                 reported_cost_usd += float(response_usage["cost_usd"])
                 cost_reported = True
             cached_tokens += int((llm_resp.usage or {}).get("cached_tokens", 0) or 0)
+            if self.ceilings is not None:
+                # Feed the ceiling what the provider actually reported, and
+                # act on a breach immediately rather than at the next step
+                # boundary. A one-turn run never reaches a boundary, so a
+                # cost ceiling checked only there would never fire.
+                # Pass only a price the provider actually reported. Passing a
+                # running total that happens to be 0.0 would be read as "the
+                # provider priced this at zero", which skips the token-based
+                # estimate and makes a cost ceiling silently never fire.
+                priced = {key: value for key, value in response_usage.items()
+                          if key != "cost_usd"}
+                if cost_reported:
+                    priced["cost_usd"] = reported_cost_usd
+                breach = self.ceilings.observe_usage(priced)
+                if breach:
+                    self._ceiling_breach = breach
             if (llm_resp.metadata or {}).get("thinking_fallback"):
                 reason = (llm_resp.metadata or {}).get("thinking_fallback_reason")
                 notice = ("Older assistant tool history has no replayable thinking blocks; using provider default reasoning for this session. Start a new session to re-enable the selected thinking budget."
@@ -1240,7 +1274,16 @@ class DeveloperAgent:
             if llm_resp.finish_reason == "error":
                 yield AgentEvent("llm_error", {"message": llm_resp.content or "Unknown model error", "model": selected_model})
                 final_answer = llm_resp.content or "Model request failed"
-                stop_reason = "provider_error"
+                # A model that ran and declined the work, or a mock that said it
+                # cannot, is the agent failing. Only a credential or transport
+                # failure means something the run needed was unavailable --
+                # conflating them tells a CI job to retry a task that will never
+                # succeed.
+                message = str(llm_resp.content or "").lower()
+                unavailable = any(token in message for token in (
+                    "api call failed", "unauthorized", "authentication", "invalid api key",
+                    "no api key", "connection error", "forbidden"))
+                stop_reason = "provider_unavailable" if unavailable else "provider_error"
                 break
 
             if (not llm_resp.tool_calls and llm_resp.content and
@@ -1325,7 +1368,13 @@ class DeveloperAgent:
                     final_answer = ""
                     continue
                 completed = bool(final_answer.strip()) and not unresolved_failures and not missing_checks
-                if domain_res.mode is DomainMode.PLAN:
+                if self._ceiling_breach:
+                    completed = False
+                    stop_reason = "max_cost"
+                    final_answer = (f"Stopped: {self._ceiling_breach}. The work done "
+                                    f"so far is above and is not lost.")
+                    yield AgentEvent("budget_exhausted", self.ceilings.to_dict())
+                elif domain_res.mode is DomainMode.PLAN:
                     # A plan is the deliverable. "Completed" would claim the work
                     # was done, which is precisely what plan mode refused to do.
                     completed = False
