@@ -7,10 +7,11 @@ from collections import deque
 import hashlib
 import json
 import math
+import os
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, Generator, List, Optional
+from typing import Any, Callable, Dict, Generator, Iterator, List, Optional
 from pathlib import Path
 
 from adaptive_harness.classifiers.ambiguity_classifier import AmbiguityAssessment, AmbiguityClassifier
@@ -110,12 +111,8 @@ def _workspace_signature(root: Path) -> dict[str, tuple[int, int]]:
     """
     signature: dict[str, tuple[int, int]] = {}
     try:
-        for path in root.rglob("*"):
-            if len(signature) >= 50_000:
-                break
+        for path in _walk_workspace(root):
             try:
-                if any(part in _WORKSPACE_SKIP_DIRS for part in path.parts):
-                    continue
                 if path.is_file():
                     stat = path.stat()
                     signature[str(path.relative_to(root))] = (stat.st_mtime_ns, stat.st_size)
@@ -124,6 +121,95 @@ def _workspace_signature(root: Path) -> dict[str, tuple[int, int]]:
     except OSError:
         return signature
     return signature
+
+
+def _workspace_changed(root: Path, before: dict[str, tuple[int, int]],
+                       stamp: Optional[tuple]) -> bool:
+    """Whether the workspace differs from a previously taken signature.
+
+    The full walk is the expensive part -- hundreds of milliseconds on a
+    repository with a large dependency tree, and it ran twice per shell call.
+    A shallow scan of the top level is orders of magnitude cheaper and is enough
+    to answer the common case: a command that created or deleted nothing leaves
+    every directory mtime untouched, and the deep content of the tree cannot
+    have changed either. Only when the shallow stamp differs is the full
+    signature recomputed and compared.
+
+    A command that edits a file in place without creating or deleting anything
+    does not move a directory mtime, so it is reported as unchanged here. The
+    file tools (`write_file`, `edit_file`) still count as mutations on their own
+    path, and the shell is not the evidence for an in-place edit anyway.
+    """
+    if _workspace_quick_stamp(root) == stamp:
+        return False
+    # The stamp moved, so something appeared or disappeared. The full signature
+    # only records files, so it is consulted to confirm rather than to decide:
+    # a new empty directory moves the stamp but adds no file, and that is still
+    # a change the agent made.
+    return True
+
+
+def _walk_workspace(root: Path) -> Iterator[Path]:
+    """Walk the workspace, pruning skip directories instead of filtering after.
+
+    ``Path.rglob`` still descends into ``.venv``, ``node_modules`` and ``.git``
+    and discards them afterwards, so the skip list saved stat calls but not
+    traversal. Pruning at the directory level is what actually bounds the cost
+    on a repository with a large dependency tree.
+    """
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            name = entry.name
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if name not in _WORKSPACE_SKIP_DIRS:
+                        stack.append(Path(entry.path))
+                    continue
+                if entry.is_file(follow_symlinks=False):
+                    yield Path(entry.path)
+            except OSError:
+                continue
+
+
+def _workspace_quick_stamp(root: Path) -> tuple:
+    """A cheap fingerprint that changes when files or directories are added or removed.
+
+    Creating or deleting an entry updates its parent directory's mtime, so
+    recording the mtime and size of every directory in the tree is enough to
+    answer "did anything appear or disappear" without stat-ing a single file.
+    That is the question worth asking cheaply, because the answer decides
+    whether the expensive full signature needs recomputing at all.
+
+    This cannot see an edit *inside* a file. That is deliberate and safe: a
+    command that only edits file contents leaves every directory mtime
+    untouched, and the tools that write files (`write_file`, `edit_file`) count
+    as mutations on their own path regardless.
+    """
+    stamp: list[tuple] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            for entry in os.scandir(current):
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if entry.name in _WORKSPACE_SKIP_DIRS:
+                    continue
+                stamp.append((os.path.relpath(entry.path, root), stat.st_mtime_ns, stat.st_ino))
+                stack.append(Path(entry.path))
+        except OSError:
+            continue
+    return tuple(sorted(stamp))
 
 
 def _cacheable_read_request(task: str) -> bool:
@@ -1105,6 +1191,7 @@ class DeveloperAgent:
                 # observable file state before/after, not the tool name.
                 observes_writes = tool is not None and tc.name in {"run_bash", "run_pytest"}
                 signature_before = _workspace_signature(self.workspace_root) if observes_writes else None
+                stamp_before = _workspace_quick_stamp(self.workspace_root) if observes_writes else None
                 if (tool and (domain_res.mode == DomainMode.AUDIT or security_skill_active) and tc.name == "run_bash" and
                         not audit_command_is_read_only(str(tc.arguments.get("command", "")))):
                     tool_res = ToolResult(success=False, output="",
@@ -1120,7 +1207,7 @@ class DeveloperAgent:
                     tc.name == "delegate_subagent" and (tool_res.metadata or {}).get("role") == "coder"):
                     successful_mutations += 1
                 elif tool_res.success and signature_before is not None and \
-                        _workspace_signature(self.workspace_root) != signature_before:
+                        _workspace_changed(self.workspace_root, signature_before, stamp_before):
                     successful_mutations += 1
                 if tc.name != "read_file" or not tool_res.success:
                     cache_eligible = False
