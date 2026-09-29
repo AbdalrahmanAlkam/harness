@@ -10,9 +10,15 @@ from adaptive_harness.llm.providers import context_window
 
 
 def estimate_tokens(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> int:
-    # A conservative character estimate until the provider reports usage.
-    serialized = json.dumps({"messages": messages, "tools": tools or []}, ensure_ascii=False, default=str)
-    return max(1, (len(serialized) + 3) // 4)
+    """Estimate the tokens a request would use.
+
+    Delegates to the active backend in `tokenizer`, which is a pluggable
+    estimator rather than a fixed `len//4`. The signature is unchanged, so
+    nothing that calls this had to move when the backends arrived.
+    """
+    from adaptive_harness.agent.tokenizer import count
+
+    return count(messages, tools)
 
 
 def prepare_context(messages: list[dict[str, Any]], model: str,

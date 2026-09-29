@@ -505,6 +505,137 @@ def dev(
         raise typer.Exit(code=1)
 
 
+#: Plugin lifecycle. A plugin is a directory under one of the discovery roots,
+#: so these commands take a path and operate on it directly.
+plugin_app = typer.Typer(
+    help="Create, validate, and package plugins.",
+)
+app.add_typer(plugin_app, name="plugin")
+
+
+@plugin_app.command("init")
+def plugin_init(
+    name: str = typer.Argument(..., help="Plugin name, e.g. csv-inspector"),
+    description: str = typer.Option("", "--description", help="One line about what it does"),
+    destination: Path = typer.Option(Path("."), "--dest", help="Where to create it (a plugin root)"),
+):
+    """Scaffold a plugin that passes `validate` with no edits.
+
+    Creates a manifest, a module, a README, and a test, in a directory you can
+    copy into your plugins folder.
+    """
+    from adaptive_harness.plugins.lifecycle import scaffold, validate
+
+    if not name.replace("-", "_").isidentifier():
+        console.print(f"[red]{name!r} is not a usable plugin name "
+                      f"(letters, digits, - and _ only).[/red]")
+        raise typer.Exit(2)
+    path = scaffold(destination, name=name, description=description)
+    report = validate(path)
+    console.print(f"[green]Created[/green] {path}")
+    console.print(report.render())
+    if not report.ok:
+        raise typer.Exit(1)
+
+
+@plugin_app.command("validate")
+def plugin_validate(
+    path: Path = typer.Argument(..., help="A plugin directory, or its manifest"),
+):
+    """Check a plugin's manifest, permissions, and handlers — without running it.
+
+    The module is parsed, not imported, so validating something you have not
+    decided to trust does not execute it.
+    """
+    from adaptive_harness.plugins.lifecycle import validate
+
+    report = validate(path)
+    console.print(report.render())
+    raise typer.Exit(0 if report.ok else 1)
+
+
+@plugin_app.command("pack")
+def plugin_pack(
+    path: Path = typer.Argument(..., help="A plugin directory"),
+    destination: Path = typer.Option(Path("dist"), "--out", help="Where to write the tarball"),
+):
+    """Bundle a validated plugin into a distributable tarball."""
+    from adaptive_harness.plugins.lifecycle import pack, validate
+
+    try:
+        archive = pack(path, destination)
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]Packed[/green] {archive}")
+
+
+@plugin_app.command("list")
+def plugin_list(
+    with_project_plugins: bool = typer.Option(False, "--with-project-plugins",
+                                              help="Also load project-supplied plugins"),
+):
+    """List every discovered plugin and what it contributes."""
+    from adaptive_harness.plugins.host import PluginHost
+
+    host = PluginHost(project_root=Path.cwd(),
+                      allow_project_plugins=with_project_plugins)
+    found = host.discover()
+    if not found:
+        console.print("[dim]No plugins found.[/dim]")
+        return
+    for plugin in sorted(found, key=lambda item: item.name):
+        mark = "[green]●[/green]" if plugin.ok else "[red]✗[/red]"
+        console.print(f"{mark} [bold]{plugin.name}[/bold] {plugin.version} "
+                      f"— {plugin.description or 'no description'}")
+        if plugin.ok:
+            console.print(f"  [dim]permissions:[/dim] "
+                          f"{', '.join(sorted(plugin.permissions)) or 'none'}")
+        else:
+            console.print(f"  [red]{escape(plugin.error)}[/red]")
+
+
+@plugin_app.command("info")
+def plugin_info(name: str = typer.Argument(..., help="Plugin name")):
+    """Show one plugin in detail: what it provides and what it can do."""
+    from adaptive_harness.plugins.host import PluginHost
+
+    host = PluginHost(project_root=Path.cwd(), allow_project_plugins=True)
+    found = [p for p in host.discover() if p.name == name]
+    if not found:
+        console.print(f"[red]No plugin named {name!r}.[/red]")
+        raise typer.Exit(1)
+    plugin = found[0]
+    if not plugin.ok:
+        console.print(f"[red]{plugin.name} failed to load:[/red] {escape(plugin.error)}")
+        raise typer.Exit(1)
+    console.print(f"[bold]{plugin.name}[/bold] {plugin.version}")
+    console.print(f"  {plugin.description or 'no description'}")
+    if plugin.author:
+        console.print(f"  [dim]author:[/dim] {plugin.author}")
+    console.print(f"  [dim]permissions:[/dim] "
+                  f"{', '.join(sorted(plugin.permissions)) or 'none'}")
+    if plugin.tools:
+        console.print("  [bold]tools:[/bold]")
+        for tool in plugin.tools:
+            console.print(f"    {tool.name} [{tool.risk}] — {tool.description}")
+    if plugin.skills:
+        console.print("  [bold]skills:[/bold] " + ", ".join(s.name for s in plugin.skills))
+    if plugin.settings:
+        console.print("  [bold]settings:[/bold] " + ", ".join(s.key for s in plugin.settings))
+    if plugin.commands:
+        console.print("  [bold]commands:[/bold] " + ", ".join(sorted(plugin.commands)))
+    if plugin.subagents:
+        console.print("  [bold]subagents:[/bold] " + ", ".join(s.name for s in plugin.subagents))
+    if plugin.mcp_servers:
+        console.print("  [bold]mcp servers:[/bold] " + ", ".join(s.name for s in plugin.mcp_servers))
+    if plugin.context:
+        console.print("  [bold]context:[/bold] " + ", ".join(f.source for f in plugin.context))
+    active = [name for name, hook in plugin.hooks.__dict__.items() if hook]
+    if active:
+        console.print("  [bold]hooks:[/bold] " + ", ".join(sorted(active)))
+
+
 @app.command("plugins")
 def plugins_cmd(
     workspace: Optional[Path] = typer.Option(None, "--workspace", help="Project root to discover plugins in"),

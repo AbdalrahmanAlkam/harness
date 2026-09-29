@@ -39,6 +39,30 @@ assert something that had not happened. Those are the substantive changes:
   without access to it could not run research at all.
 
 ### Added in this release
+- **A plugin system.** Anything most users will not use ships as a plugin
+  rather than in the core. A plugin can contribute a tool the model may call, a
+  skill, a persistent setting, a prompt override, a slash command with a model
+  or tier override, an MCP server, a specialist subagent, a context fragment,
+  and a hook. Adding one requires no change to a file in `src/adaptive_harness`.
+  Project-supplied plugins are off by default, so cloning a repository cannot
+  make it execute anything.
+- **`harness plugin init|validate|pack|list|info`.** `validate` checks a
+  manifest, its permissions, and its handlers by *parsing* the module rather
+  than importing it, so validating something you have not decided to trust does
+  not run it. A scaffolded plugin passes validation with zero edits.
+- **Hooks that can deny.** A `PRE_TOOL` hook runs before the risk classifier,
+  before the safety profile, and before dispatch, and may allow, deny with a
+  reason, or rewrite arguments. A hook that raises blocks the call rather than
+  failing open. A `POST_TOOL` hook may redact a successful result and
+  structurally cannot touch a failure.
+- **MCP support.** The host supervises the server subprocess, does the JSON-RPC
+  handshake, and exposes each remote tool through the existing tool adapter, so
+  the agent loop needs no MCP branch. Remote tools are pinned to network risk
+  and the manifest cannot downgrade them. No third-party dependency.
+- **Pluggable token estimation.** The default is still zero-dependency, but it
+  now counts CJK at roughly a token per character instead of four characters per
+  token — the old estimate was low by about 3x on Chinese, which let a request
+  run well past the window before anything compacted.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.
