@@ -71,6 +71,15 @@ assert something that had not happened. Those are the substantive changes:
   admitted by priority or by score, and every rejection carries a reason. A
   plugin that understates its own size is measured rather than believed.
   Project instructions load from `AGENTS.md` and `.harness/instructions/*.md`.
+- **A Quality Controller.** The requirements are extracted from your request
+  before the model acts, every tool result is recorded as evidence while it
+  runs, and the final answer is checked against that evidence. A summary that
+  claims work no tool call supports is reported, itemised, and — with
+  `--quality-gate` — sent back for repair rather than restarted. The gate never
+  rewrites your model's text; it reports, and the model authors. It reports by
+  default and only blocks when you ask it to, because a lexical evidence match
+  is a real signal but not a proof, and a gate that cries wolf gets switched
+  off.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.

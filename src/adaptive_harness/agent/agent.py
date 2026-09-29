@@ -57,6 +57,16 @@ from adaptive_harness.skills.router import SkillRouter
 from adaptive_harness.skills.verifier import SkillVerifier
 from adaptive_harness.classifiers.runtime_overseer import RuntimeOverseer, OverseerState
 from adaptive_harness.agent.context_window import estimate_tokens, prepare_context
+from adaptive_harness.agent.final_gate import (
+    ACCEPT,
+    REVISE,
+    Evidence,
+    EvidenceLedger,
+    RequirementSet,
+    evaluate,
+    extract_requirements,
+    revision_instruction,
+)
 from adaptive_harness.agent.tool_filter import ToolOutputArchive, ToolOutputFilter
 from adaptive_harness.agent.code_fallback import extract_file_calls, requests_file_changes
 from adaptive_harness.prompts import PromptRegistry, DEFAULT_PROMPTS
@@ -68,6 +78,10 @@ DEFAULT_SYSTEM_PROMPT = DEFAULT_PROMPTS["system.default"]
 STEP_POLICIES = ("classifier", "fixed", "unbounded")
 
 # Previous hardcoded tool-step budgets, selectable via step_policy="fixed".
+#: How many times the Quality Controller may send the model back to
+#: repair an unsubstantiated summary before the run is marked as such.
+FINAL_GATE_RETRIES = 1
+
 FIXED_STEP_BUDGETS = {ThinkingLevel.NONE: 4, ThinkingLevel.LOW: 8, ThinkingLevel.MEDIUM: 12,
                       ThinkingLevel.DEEP: 16, ThinkingLevel.EXTREME: 20,
                       ThinkingLevel.HIGH: 16, ThinkingLevel.XHIGH: 20, ThinkingLevel.MAX: 24}
@@ -319,6 +333,7 @@ class DeveloperAgent:
         filter_tool_output: bool = True,
         plugins_enabled: bool = True,
         allow_project_plugins: bool = False,
+        quality_gate: bool = False,
     ):
         if safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
             raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
@@ -401,6 +416,17 @@ class DeveloperAgent:
         # reaches the model only after a local trigger match and a relevance
         # score admit it.
         self._context_plane: ContextPlane | None = None
+        # The Quality Controller's per-turn state. The requirement set is the
+        # ground truth for the turn; the ledger is what was actually observed
+        # while answering it. Both are replaced at the start of each turn.
+        self.requirement_set = RequirementSet()
+        self.evidence_ledger = EvidenceLedger()
+        # Off by default. A lexical evidence match is a good signal, not a proof:
+        # a run can do real work whose evidence does not share words with the
+        # request. Firing the gate on that basis would fail honest runs, and a
+        # gate that cries wolf gets switched off -- which is worse than having
+        # none. It reports whenever on, and blocks only when asked to.
+        self.quality_gate_enabled = quality_gate
         if tools is None and self.plugins_enabled:
             self.plugins.discover()
             for plugin_tool in self.plugins.build_tools(workspace_root):
@@ -964,6 +990,13 @@ class DeveloperAgent:
         # Context admission, before the task lands. A fragment reaches the
         # model only after a local trigger match and a relevance score admit it
         # into the budget; the report says what was admitted and what was not.
+        # What was asked, extracted before the model acts. This is the ground
+        # truth the Quality Controller judges the run against at the end.
+        self.requirement_set = extract_requirements(original_input)
+        self.evidence_ledger = EvidenceLedger()
+        if len(self.requirement_set):
+            yield AgentEvent("requirements", self.requirement_set.to_dict())
+
         plane = self.context_plane
         report = plane.allocate(text=original_input,
                                 fixed_tokens=self._turn_fixed_tokens())
@@ -1092,6 +1125,9 @@ class DeveloperAgent:
         answer_parts: list[str] = []
         stop_reason = ""
         verification_followups = 0
+        # Bounded, like every other retry loop here: a gate that could ask
+        # forever would be a gate that gets switched off.
+        final_gate_retries = 0
         overseer_backend = self.overseer_backend or (self.classifier_backend
             if self.classifier_backend.name in {"onnx", "ollama", "local-slm"} else None)
         overseer = RuntimeOverseer(original_input, overseer_backend)
@@ -1255,6 +1291,36 @@ class DeveloperAgent:
                 completed = bool(final_answer.strip()) and not unresolved_failures and not missing_checks
                 stop_reason = ("verification_failed" if unresolved_failures or missing_checks else
                                "no_answer" if not final_answer.strip() else "completed")
+                if completed and final_answer.strip() and (
+                        self.quality_gate_enabled or len(self.requirement_set)):
+                    # The Quality Controller: does what the model did fulfil
+                    # what the user asked for? Judged against observed tool
+                    # results, not against the model's own account of them.
+                    # A `revise` verdict returns the specific deficiencies as a
+                    # targeted instruction so the model repairs rather than
+                    # restarts; it is bounded so it cannot loop.
+                    quality = evaluate(self.requirement_set, self.evidence_ledger,
+                                       final_answer)
+                    yield AgentEvent("quality_gate", quality.to_dict())
+                    # Report always; block only when the operator asked for the
+                    # gate to be load-bearing. The signal is real but lexical,
+                    # and an honest run whose evidence happens not to share words
+                    # with the request must not be failed for that.
+                    if self.quality_gate_enabled:
+                        if quality.verdict == REVISE and final_gate_retries < FINAL_GATE_RETRIES:
+                            final_gate_retries += 1
+                            nudge = revision_instruction(quality)
+                            self.messages.append({"role": "user", "content": nudge})
+                            yield _injection_event("harness", nudge, step,
+                                                   kind="quality_gate")
+                            answer_parts.clear()
+                            final_answer = ""
+                            completed = False
+                            stop_reason = ""
+                            continue
+                        if quality.verdict != ACCEPT:
+                            completed = False
+                            stop_reason = "quality_gate_unsubstantiated"
                 break
 
             # Obtain authorization before adding tool calls to conversation history.

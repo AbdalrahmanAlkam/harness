@@ -2301,6 +2301,37 @@ class AdaptiveHarnessApp(App):
                     log.write(Text(f"injected as the first instruction of step {p.get('step')} "
                                    f"· waited {p.get('wait_ms', 0)} ms", style="dim cyan"))
                 self._refresh_status()
+        elif et == "requirements":
+                items = p.get("requirements", [])
+                if items:
+                    log.write(Text(f"\n◈ {len(items)} obligation(s) extracted from your request:",
+                                   style="dim"))
+                    for item in items:
+                        log.write(Text(f"  {item.get('id')} {item.get('text')}", style="dim"))
+        elif et == "context_budget":
+                admitted, rejected = p.get("admitted", []), p.get("rejected", [])
+                bits = [f"{p.get('used', 0):,}/{p.get('available', 0):,} tokens used"]
+                if admitted:
+                    bits.append(f"{len(admitted)} fragment(s) admitted")
+                if rejected:
+                    bits.append(f"{len(rejected)} deferred")
+                log.write(Text("◈ Context budget · " + " · ".join(bits), style="dim"))
+                for item in rejected:
+                    log.write(Text(f"  not admitted · {item.get('source')}: "
+                                   f"{item.get('reason')}", style="dim yellow"))
+        elif et == "quality_gate":
+                # The finding is shown whether or not the gate is load-bearing,
+                # because a user who cannot see it cannot act on it.
+                verdict = p.get("verdict", "?")
+                colour = {"accept": "green", "revise": "yellow", "reject": "red"}.get(verdict, "yellow")
+                log.write(Text(f"\n◈ Quality gate: {verdict.upper()} — {p.get('reason', '')}",
+                               style=f"bold {colour}"))
+                for item in p.get("adjudications", []):
+                    if item.get("status") != "satisfied":
+                        log.write(Text(f"  {item.get('id')} {item.get('status')}: "
+                                       f"{item.get('reason')}", style="dim yellow"))
+                for line in p.get("contradictions", []):
+                    log.write(Text(f"  contradiction: {line}", style="red"))
         elif et == "provider_failover":
                 log.write(Text(f"Provider failover: {p['from']} → {p['to']} ({p['model']})", style="bold yellow"))
                 telemetry.update_telemetry(model=p["model"], selection="failover")

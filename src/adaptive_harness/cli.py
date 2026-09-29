@@ -195,6 +195,11 @@ def tui(
         None, "--secondary-model",
         help="Cheap model that compresses low-value tool output (default: the primary model)"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
+    quality_gate: bool = typer.Option(
+        False, "--quality-gate",
+        help="Check the final answer against the tool calls that were actually "
+             "made, and send it back if it claims work nothing evidences. Reports "
+             "either way; this makes it load-bearing."),
     step_policy: str = typer.Option("classifier", "--step-policy", help="Tool-step limits: classifier (default; stops circling loops), fixed (hardcoded per-thinking budgets), unbounded"),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", min=1, help="Explicit tool-step cap overriding the step policy"),
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
@@ -289,6 +294,11 @@ def dev(
     mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Model effort: auto, low, medium, high, xhigh, max (deep = high)"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
+    quality_gate: bool = typer.Option(
+        False, "--quality-gate",
+        help="Check the final answer against the tool calls that were actually "
+             "made, and send it back if it claims work nothing evidences. Reports "
+             "either way; this makes it load-bearing."),
     step_policy: str = typer.Option("classifier", "--step-policy", help="Tool-step limits: classifier (default; stops circling loops), fixed (hardcoded per-thinking budgets), unbounded"),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", min=1, help="Explicit tool-step cap overriding the step policy"),
     swarm: bool = typer.Option(False, "--swarm", help="Expose delegate_subagent to the coordinator agent"),
@@ -382,7 +392,8 @@ def dev(
                            classifier_backend=backend, overseer_backend=overseer_backend,
                            forced_mode=selected_mode, forced_thinking=selected_thinking,
                            safety_profile=safety or "turbo", swarm_enabled=swarm,
-                           step_policy=step_policy, max_steps=max_steps)
+                           step_policy=step_policy, max_steps=max_steps,
+                           quality_gate=quality_gate)
     if research_topic:
         research_swarm = agent.enable_research(research_topic, root=research_root)
         console.print(f"[dim]Research swarm attached: {research_swarm.workspace.root} "
@@ -458,6 +469,27 @@ def dev(
                     else "the run had already finished; kept as context" if p.get("late")
                     else f"delivered at the start of step {p.get('step')}")
             console.print(f"  [dim]{escape(note)} · waited {p.get('wait_ms', 0)} ms[/dim]")
+        elif et == "requirements":
+            items = p.get("requirements", [])
+            if items:
+                console.print(f"  [dim]{len(items)} obligation(s): "
+                              f"{escape(', '.join(i.get('text', '') for i in items))}[/dim]")
+        elif et == "context_budget":
+            admitted, rejected = p.get("admitted", []), p.get("rejected", [])
+            console.print(f"  [dim]context: {p.get('used', 0):,}/{p.get('available', 0):,} "
+                          f"tokens · {len(admitted)} admitted, {len(rejected)} deferred[/dim]")
+        elif et == "quality_gate":
+            colour = {"accept": "green", "revise": "yellow", "reject": "red"}.get(
+                p.get("verdict", ""), "yellow")
+            console.print(f"  [bold {colour}]quality gate: {escape(str(p.get('verdict', '')).upper())}"
+                          f"[/bold {colour}] — {escape(p.get('reason', ''))}")
+            for item in p.get("adjudications", []):
+                if item.get("status") != "satisfied":
+                    console.print(f"    [yellow]{escape(item.get('id', ''))} "
+                                  f"{escape(item.get('status', ''))}: "
+                                  f"{escape(item.get('reason', ''))}[/yellow]")
+            for line in p.get("contradictions", []):
+                console.print(f"    [red]contradiction: {escape(line)}[/red]")
         elif et == "provider_failover":
             console.print(f"  [yellow]Provider failover: {escape(p['from'])} → {escape(p['to'])} "
                           f"({escape(p['model'])})[/yellow]")
