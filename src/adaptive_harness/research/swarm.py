@@ -1016,8 +1016,9 @@ class ResearchSwarm:
             return (f"No derivation strategy matched the topic '{self.topic}', so no proposition was "
                     f"constructed and the claim was not tested. This paper reports that outcome "
                     f"explicitly rather than presenting an unverified result.")
-        proved = [prop for prop in props if prop.verdict is Verdict.PROVEN.value]
-        refuted = [prop for prop in props if prop.verdict is Verdict.DISPROVEN.value]
+        adjudications = list(self.claims.adjudications)
+        proved = [item for item in adjudications if item.verdict is Verdict.PROVEN]
+        refuted = [item for item in adjudications if item.verdict is Verdict.DISPROVEN]
         if not proved and not refuted:
             return (f"We investigate {self.topic}. The {len(props)} proposition(s) below are "
                     f"constructed from their definitions and adjudicated by executing "

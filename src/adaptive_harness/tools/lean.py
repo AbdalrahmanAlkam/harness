@@ -42,7 +42,7 @@ import shutil
 import subprocess
 from typing import Any, Iterable, Sequence
 
-from adaptive_harness.tools.base import Tool, ToolResult
+from adaptive_harness.tools.base import Tool, ToolResult, workspace_path
 
 # Placeholders and escape hatches that let Lean accept an unproved claim.
 # `sorry` is the canonical one and `admit` is its alias. A bare `axiom`
@@ -368,27 +368,43 @@ class LeanVerifier:
         self.audit_axioms = audit_axioms
 
     def verify_source(self, source: str, *, name: str = "Proof.lean",
-                      directory: str | Path | None = None) -> LeanVerification:
+                      directory: str | Path | None = None,
+                      timeout_s: float | None = None) -> LeanVerification:
         """Write ``source`` to disk, compile it, and adjudicate the result."""
         import time
 
         started = time.perf_counter()
         target_dir = Path(directory) if directory else Path.cwd()
         target_dir.mkdir(parents=True, exist_ok=True)
-        path = target_dir / name
+        # `name` is model-supplied, so it must not be able to name a file
+        # outside the directory it is supposed to land in.
+        path = (target_dir / name).resolve()
+        if not path.is_relative_to(target_dir.resolve()):
+            raise LeanError(f"Refusing to write a Lean source outside {target_dir}: {name}")
         path.write_text(source, encoding="utf-8")
-        return self.verify(path, started=started)
+        return self.verify(path, started=started, timeout_s=timeout_s)
 
-    def verify(self, path: str | Path, *, started: float | None = None) -> LeanVerification:
+    def verify(self, path: str | Path, *, started: float | None = None,
+               timeout_s: float | None = None) -> LeanVerification:
         """Compile a ``.lean`` file and decide whether the proof is certified."""
         import time
 
         target = Path(path).resolve()
+        budget = self.timeout_s if timeout_s is None else timeout_s
         begin = started if started is not None else time.perf_counter()
         if not target.is_file():
             return LeanVerification(False, None, str(target), "", error="Lean source does not exist")
         text = target.read_text(encoding="utf-8", errors="replace")
         digest = f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
+
+        # Lean exits 0 on a file that declares no theorem, so an empty or
+        # comment-only file would otherwise be certified. A receipt asserting
+        # Lean checked something it never checked is the failure this whole
+        # module exists to prevent.
+        if not declared_names(text):
+            return LeanVerification(
+                False, None, str(target), digest, duration_ms=(time.perf_counter() - begin) * 1000.0,
+                error="Lean source declares no theorem, lemma, or definition to verify")
 
         # Check 1: no placeholder token in the source itself.
         placeholders = find_placeholders(text)
@@ -415,7 +431,7 @@ class LeanVerifier:
         exit_code: int | None
         try:
             completed = subprocess.run(command, capture_output=True, text=True,
-                                       timeout=self.timeout_s, check=False,
+                                       timeout=budget, check=False,
                                        cwd=str(self.toolchain._lake_root(compile_target)
                                                or compile_target.parent))
             exit_code, stdout, stderr = completed.returncode, completed.stdout, completed.stderr
@@ -423,7 +439,7 @@ class LeanVerifier:
             return LeanVerification(False, None, str(target), digest,
                                     launcher=" ".join(command[:2]),
                                     duration_ms=(time.perf_counter() - begin) * 1000.0,
-                                    error=f"Lean timed out after {self.timeout_s:g}s")
+                                    error=f"Lean timed out after {budget:g}s")
         except OSError as exc:
             raise LeanError(f"Could not execute Lean: {exc}") from exc
         finally:
@@ -508,8 +524,10 @@ class RunLeanProofTool(Tool):
         code = lean_code if lean_code is not None else source
         target_path = file_path if file_path is not None else path
         stem = name or theorem_name or "Proof"
-        if timeout_s is not None:
-            self.verifier.timeout_s = float(timeout_s)
+        # Bound this call, not the shared verifier: a model-supplied
+        # timeout_s=1 would otherwise permanently degrade every later proof in
+        # the process to a one-second budget.
+        budget = self.verifier.timeout_s if timeout_s is None else float(timeout_s)
         if not self.verifier.toolchain.available:
             message = ("Lean 4 was not found on PATH, in ~/.elan/bin, or in ~/.local/bin. "
                        "Install it with `curl https://elan.lean-lang.org/elan-init.sh -sSf | sh`.")
@@ -518,13 +536,16 @@ class RunLeanProofTool(Tool):
         directory = self.workspace_root / self.lean_dir if self.lean_dir else self.workspace_root
         try:
             if target_path:
-                target = Path(target_path)
-                if not target.is_absolute():
-                    target = self.workspace_root / target
-                result = self.verifier.verify(target)
+                # Containment, as every other file-touching tool enforces. An
+                # absolute path or a `../` here would otherwise let a prompt
+                # injection read any file the user can read and leave a
+                # `.receipt.json` beside it.
+                target = workspace_path(self.workspace_root, target_path)
+                result = self.verifier.verify(target, timeout_s=budget)
             elif code:
                 filename = stem if stem.endswith(".lean") else f"{stem}.lean"
-                result = self.verifier.verify_source(code, name=filename, directory=directory)
+                result = self.verifier.verify_source(code, name=filename, directory=directory,
+                                                     timeout_s=budget)
             else:
                 return ToolResult(success=False, output="",
                                   error="Provide either 'lean_code' (Lean 4 text) or 'file_path' "

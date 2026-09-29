@@ -529,7 +529,8 @@ class PaperBuilder:
             # stay tied to the results above: a hardcoded sentence here would
             # assert a finding about a topic this run never investigated.
             props = list(inputs.propositions or [])
-            proved = [prop for prop in props if prop.verdict is Verdict.PROVEN.value]
+            verdicts = {item.prop_id: item.verdict for item in (inputs.adjudications or [])}
+            proved = [prop for prop in props if verdicts.get(prop.prop_id) is Verdict.PROVEN]
             titles = "; ".join(typst_escape(prop.name) for prop in proved[:5]) or "the results above"
             body = (f"The results above settle the question posed. {len(proved)} proposition(s) "
                     f"were decided by an executed exact derivation: {titles}. Each is stated with "
