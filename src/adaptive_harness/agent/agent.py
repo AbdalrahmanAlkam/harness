@@ -384,6 +384,11 @@ class DeveloperAgent:
         # Mid-turn steering. The inbox is the only thing a foreign thread may
         # write; the transcript stays the exclusive property of the run.
         self.operator_inbox = OperatorInbox()
+        # Cooperative cancellation. A tool call already in flight is allowed to
+        # finish -- pre-empting arbitrary synchronous code is not something this
+        # loop can promise -- but the run stops at the next step boundary rather
+        # than continuing to spend tokens the user asked it not to spend.
+        self._cancel_reason: Optional[str] = None
         # Set by an interactive surface to observe the enqueue side of a steer,
         # which cannot be reported through run_stream because the generator is
         # mid-yield when it happens. Mirrors subagent_event_callback.
@@ -571,6 +576,14 @@ class DeveloperAgent:
     def _request_messages(self) -> List[Dict[str, Any]]:
         """The saved conversation is verbatim; request compaction is conditional."""
         return self.messages
+
+    def request_cancel(self, reason: str = "cancelled by the operator") -> None:
+        """Ask the run to stop at the next step boundary. Safe from any thread."""
+        self._cancel_reason = reason
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_reason is not None
 
     def queue_operator_message(self, text: str, *, kind: str = "steer") -> int:
         """Accept one mid-turn instruction from any thread. Returns queue depth.
@@ -990,6 +1003,13 @@ class DeveloperAgent:
         context_limit = getattr(self, "context_window_override", None)
 
         while step < max_steps:
+            if self._cancel_reason is not None:
+                # Stop before spending another request. A tool call already in
+                # flight was allowed to finish; everything after it is skipped.
+                stop_reason = "cancelled"
+                final_answer = (f"Run cancelled: {self._cancel_reason}. "
+                                f"Work already done is above.")
+                break
             # A message typed mid-run lands here. The previous step's tool batch
             # is fully recorded (including the synthesised CANCELLED results), so
             # inserting a user message here cannot orphan a tool_call, and the

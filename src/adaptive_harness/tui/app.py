@@ -223,6 +223,11 @@ class AdaptiveHarnessApp(App):
         ("ctrl+shift+c", "copy_output", "Copy Output"),
         ("ctrl+y", "copy_output", "Copy Output"),
         ("ctrl+n", "new_session", "New Session"),
+        # Textual's stock palette offers Maximize, Screenshot and Theme -- none of
+        # the 32 commands this app has -- and it traps focus, so Tab lands in its
+        # input with no way out but Escape. Ctrl+P opens the harness's own.
+        ("ctrl+p", "open_command_palette", "Commands"),
+        ("escape", "cancel_task", "Cancel"),
         ("f1", "show_help", "Help"),
         ("f2", "choose_theme", "Theme"),
         ("f3", "review_diff", "Diff Review"),
@@ -231,6 +236,28 @@ class AdaptiveHarnessApp(App):
         ("f6", "toggle_telemetry", "Telemetry"),
         ("f7", "settings", "Settings"),
     ]
+
+    #: The stock Textual command palette is replaced by the harness's own.
+    ENABLE_COMMAND_PALETTE = False
+
+    def action_open_command_palette(self) -> None:
+        """Open the harness command palette, pre-seeded with the `/` prefix."""
+        self.query_one("#prompt-input", HistoryInput).value = "/"
+        self.action_palette()
+
+    def action_cancel_task(self) -> None:
+        """Escape cancels a run in flight; otherwise it is left to the dialogs.
+
+        A long task used to be uninterruptible: Ctrl+C only offers to quit, and
+        Esc only dismissed a question. On a paid tool that is not shippable.
+        """
+        if self._busy:
+            self.agent.request_cancel("operator pressed Esc")
+            self.query_one("#chat-log", RichLog).write(
+                Text("Cancelling after the current step…", style="yellow"))
+            return
+        # Not busy: let a modal or the settings screen handle Escape itself.
+
 
     def __init__(
         self,
@@ -2405,6 +2432,7 @@ class AdaptiveHarnessApp(App):
                     "skill_verification_failed": "Task did not meet skill verification checks",
                     "provider_error": "Provider request failed",
                     "operator_interrupt": "Stopped at your instruction",
+                    "cancelled": "Cancelled — a tool call already in flight finished first",
                 }.get(p.get("stop_reason"), "Task stopped before completion")
                 cost_display = f"${self._reported_cost_usd:.6f}" if self._cost_reported else "not reported by provider"
                 log.write(Text(f"Session tokens: {self.prompt_tokens + self.completion_tokens:,} total · "
