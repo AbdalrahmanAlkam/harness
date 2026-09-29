@@ -139,6 +139,18 @@ DEFAULT_PROMPTS: dict[str, str] = {
         "Failed tools: {failures}. Missing checks: {checks}. "
         "If a check cannot be completed, state the concrete blocker instead of claiming success."
     ),
+    # Live operator steering: the human speaking into a run already in flight.
+    # Framed rather than raw so the model reads it as a course correction from
+    # its principal, not as a new task and not as harness policy. It is a user
+    # message, never a system one: system messages in this transcript mean the
+    # harness is speaking, and that distinction is what the TUI renders.
+    "operator.steer": (
+        "[Operator · sent at step {step}, while you were still working on the original task]\n"
+        "{text}\n"
+        "Treat this as a course correction from the person you are working for. Apply it from your "
+        "next action onward. Do not restart work you have already verified, and do not report it as "
+        "a separate task."
+    ),
 
     # Swarm subagent prompts.
     "swarm.role.read_only": (

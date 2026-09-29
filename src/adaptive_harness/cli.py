@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import typer
 from rich.console import Console
 from rich.markup import escape
@@ -150,6 +151,34 @@ def run(
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Terminating session.[/dim]")
             break
+
+
+def _start_operator_reader(agent) -> Optional[threading.Thread]:
+    """Let an operator steer a headless run by typing, in the same terminal.
+
+    Reads stdin on a daemon thread that only ever calls
+    ``queue_operator_message``; the run itself stays single-threaded on the main
+    thread. Nothing is read when stdin is not a TTY, so piped invocations and CI
+    are unaffected.
+    """
+    if not sys.stdin.isatty():
+        return None
+    console.print("[dim]type a note + Enter to steer the start of the next step · "
+                  "prefix it with ! to stop after the current step instead[/dim]")
+
+    def pump() -> None:
+        for line in sys.stdin:
+            text = line.strip()
+            if not text:
+                continue
+            interrupt = text.startswith("!")
+            body = text[1:].strip() if interrupt else text
+            depth = agent.queue_operator_message(body, kind="interrupt" if interrupt else "steer")
+            console.print(f"[cyan]⏳ queued ({depth} pending): {body}[/cyan]")
+
+    thread = threading.Thread(target=pump, daemon=True, name="operator-reader")
+    thread.start()
+    return thread
 
 
 @app.command()
@@ -370,7 +399,8 @@ def dev(
 
     last_agent_content = ""
     task_succeeded = False
-    for event in agent.run_stream(task):
+    _start_operator_reader(agent)
+    for event in agent.run_stream_with_followup(task):
         et = event.event_type
         p = event.payload
         if et == "skill_classification":
@@ -419,6 +449,15 @@ def dev(
             console.print(f"  [bold yellow]Prompt injected · {escape(label)}"
                           f"{(' · ' + escape(p['state'])) if p.get('state') else ''}:[/bold yellow]")
             console.print(Text(p["content"], style="yellow"))
+        elif et == "operator_queued":
+            console.print(f"  [cyan]⏳ operator queued ({p.get('pending', 1)} pending):[/cyan] "
+                          f"{escape(p.get('content', ''))}")
+        elif et == "operator_message":
+            console.print(f"  [bold cyan]⚡ operator:[/bold cyan] {escape(p.get('raw') or '')}")
+            note = ("run stops after this step" if p.get("kind") == "interrupt"
+                    else "the run had already finished; kept as context" if p.get("late")
+                    else f"delivered at the start of step {p.get('step')}")
+            console.print(f"  [dim]{escape(note)} · waited {p.get('wait_ms', 0)} ms[/dim]")
         elif et == "provider_failover":
             console.print(f"  [yellow]Provider failover: {escape(p['from'])} → {escape(p['to'])} "
                           f"({escape(p['model'])})[/yellow]")

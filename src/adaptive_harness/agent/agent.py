@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import deque
 import hashlib
 import json
 import math
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, Generator, List, Optional
 from pathlib import Path
@@ -140,6 +142,63 @@ class AgentEvent:
     timestamp: float = field(default_factory=time.time)
 
 
+@dataclass
+class OperatorMessage:
+    """One instruction typed by the user while the agent was mid-turn."""
+
+    #: 'steer' adds information to the running turn; 'interrupt' asks the run to
+    #: stop and be replaced by this text. Pausing is the research swarm's own
+    #: control plane and is deliberately not re-invented here.
+    text: str
+    kind: str = "steer"
+    at: float = field(default_factory=time.time)
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"steer", "interrupt"}:
+            raise ValueError("Operator message kind must be 'steer' or 'interrupt'")
+
+
+class OperatorInbox:
+    """Thread-safe hand-off for messages typed into a run already in flight.
+
+    The inbox exists so a producer never has to touch ``self.messages``. The
+    thread driving ``run_stream`` is the only writer of the transcript; a UI
+    thread may put text here at any moment and the note reaches the model at
+    the point the injection is due, in transcript order, with no locking on the
+    message list itself. That is what makes steering race-free: a generator is
+    not reentrant, so there is only ever one writer to reason about.
+    """
+
+    def __init__(self) -> None:
+        self._pending: "deque[OperatorMessage]" = deque()
+        self._lock = threading.Lock()
+
+    def queue(self, message: OperatorMessage) -> int:
+        """Enqueue one message. Returns the new depth so the caller can echo it."""
+        with self._lock:
+            self._pending.append(message)
+            return len(self._pending)
+
+    def drain(self) -> List[OperatorMessage]:
+        """Take everything queued, in arrival order, leaving the inbox empty.
+
+        Called only from the generator thread, at a point where the transcript
+        is mid-batch and therefore not safe for anyone else to be appending to.
+        """
+        with self._lock:
+            items = list(self._pending)
+            self._pending.clear()
+            return items
+
+    @property
+    def depth(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def __len__(self) -> int:
+        return self.depth
+
+
 class DeveloperAgent:
     """Full-featured AI Coding Agent powered by OpenRouter LLMs and multi-tier ML classifiers."""
 
@@ -236,6 +295,13 @@ class DeveloperAgent:
         if swarm_enabled:
             self.enable_swarm(True)
         self.messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        # Mid-turn steering. The inbox is the only thing a foreign thread may
+        # write; the transcript stays the exclusive property of the run.
+        self.operator_inbox = OperatorInbox()
+        # Set by an interactive surface to observe the enqueue side of a steer,
+        # which cannot be reported through run_stream because the generator is
+        # mid-yield when it happens. Mirrors subagent_event_callback.
+        self.operator_notify: Optional[Callable[[AgentEvent], None]] = None
 
     def _configure_output_filter(self, secondary_model: str | None, enabled: bool) -> None:
         """Install the tool-output filter and the tool that recovers filtered text.
@@ -419,6 +485,55 @@ class DeveloperAgent:
     def _request_messages(self) -> List[Dict[str, Any]]:
         """The saved conversation is verbatim; request compaction is conditional."""
         return self.messages
+
+    def queue_operator_message(self, text: str, *, kind: str = "steer") -> int:
+        """Accept one mid-turn instruction from any thread. Returns queue depth.
+
+        Safe to call from a UI thread while ``run_stream`` is suspended in the
+        middle of a tool batch: the text lands in the inbox and nowhere else, so
+        it cannot interleave into the middle of an assistant ``tool_calls``
+        message and strand a ``tool`` result without its call.
+        """
+        message = OperatorMessage(text.strip(), kind)
+        depth = self.operator_inbox.queue(message)
+        if self.operator_notify is not None:
+            # Outside the lock: a slow renderer must not block the agent thread.
+            self.operator_notify(AgentEvent("operator_queued", {
+                "content": message.text, "kind": kind, "position": "next_step",
+                "pending": depth, "at": message.at}))
+        return depth
+
+    def _inject_operator_messages(self, step: int, state: str,
+                                  ) -> Generator[AgentEvent, None, List[OperatorMessage]]:
+        """Consume the inbox at a step boundary. Yields; returns the interrupts.
+
+        Steers are appended to the transcript here, on the agent's own thread,
+        so the ordering invariant holds: assistant tool calls, then their tool
+        results, then the operator's note, then the next model request.
+
+        Interrupts are deliberately *not* appended. A redirect is not a note to
+        the current turn, it is the next turn's task; appending it here and then
+        re-entering with it as the task would put the same text in the
+        transcript twice.
+        """
+        pending = self.operator_inbox.drain()
+        interrupts: List[OperatorMessage] = []
+        for message in pending:
+            waited_ms = int((time.time() - message.at) * 1000)
+            if message.kind == "interrupt":
+                interrupts.append(message)
+                yield AgentEvent("operator_message", {
+                    "raw": message.text, "content": message.text, "role": "user",
+                    "kind": "interrupt", "state": "interrupting", "step": step,
+                    "wait_ms": waited_ms, "late": state == "late"})
+                continue
+            framed = self.prompts.get("operator.steer", step=step, text=message.text)
+            self.messages.append({"role": "user", "content": framed})
+            yield AgentEvent("operator_message", {
+                "raw": message.text, "content": framed, "role": "user",
+                "kind": "steer", "state": state, "step": step,
+                "wait_ms": waited_ms, "late": state == "late"})
+        return interrupts
 
     def run_stream(self, user_input: str, max_steps: Optional[int] = None) -> Generator[AgentEvent, None, None]:
         """Executes a task through the agentic lifecycle, yielding real-time events for the TUI."""
@@ -789,6 +904,17 @@ class DeveloperAgent:
         context_limit = getattr(self, "context_window_override", None)
 
         while step < max_steps:
+            # A message typed mid-run lands here. The previous step's tool batch
+            # is fully recorded (including the synthesised CANCELLED results), so
+            # inserting a user message here cannot orphan a tool_call, and the
+            # note precedes the request that acts on it. This single site also
+            # covers the `continue` paths -- the missing-file-changes nudge, the
+            # continuation nudge, the verification-repair nudge and the
+            # claim-check intervention -- all of which re-enter at the top.
+            interrupts = yield from self._inject_operator_messages(step, "delivered")
+            if interrupts:
+                stop_reason = "operator_interrupt"
+                break
             step += 1
             request_messages, context_info = prepare_context(self._request_messages(), selected_model,
                 tool_schemas, provider=getattr(self.llm_client, "provider", "openrouter"), limit=context_limit)
@@ -1183,6 +1309,14 @@ class DeveloperAgent:
             if stop_reason in {"overseer_impasse", "classifier_stop"}:
                 break
 
+        # The user may have typed during the final step, or while the model was
+        # writing its answer. The run is over, but the note is not discarded: it
+        # is appended so it is in context and in the saved session, and reported
+        # as late so the UI cannot claim it steered anything it did not.
+        late_interrupts = yield from self._inject_operator_messages(step, "late")
+        if late_interrupts and not stop_reason:
+            stop_reason = "operator_interrupt"
+
         skill_checks = self.skill_verifier.verify(selected_skills, skill_observations)
         for skill_check in skill_checks:
             yield AgentEvent("skill_verification", {"skill": skill_check.skill,
@@ -1252,3 +1386,41 @@ class DeveloperAgent:
                 self.repository.record_trace(trace)
             except Exception as exc:
                 yield AgentEvent("storage_error", {"error": f"Could not save execution trace: {exc}"})
+
+    def run_stream_with_followup(self, user_input: str, max_steps: Optional[int] = None,
+                                 *, followup_limit: int = 8) -> Generator[AgentEvent, None, None]:
+        """``run_stream``, plus honouring interrupts and late messages.
+
+        An interrupt means "stop and do this instead": the run ends at the next
+        step boundary and the text is re-entered as the next turn's task, which
+        is the only honest way to express a redirect without putting the same
+        text in the transcript twice. Anything still queued when the generator
+        ends for any other reason -- an early return on a memory hit, or a
+        cancelled destructive action -- is carried forward the same way rather
+        than silently dropped between turns.
+
+        Both the TUI and the headless CLI consume this instead of ``run_stream``,
+        so neither can end up with a different steering policy.
+        """
+        task = user_input
+        for _ in range(max(1, followup_limit)):
+            redirect: Optional[str] = None
+            for event in self.run_stream(task, max_steps):
+                yield event
+                if (event.event_type == "operator_message"
+                        and event.payload.get("kind") == "interrupt"
+                        and event.payload.get("state") == "interrupting"):
+                    redirect = str(event.payload.get("raw") or "")
+            if redirect is None:
+                leftover = self.operator_inbox.drain()
+                if not leftover:
+                    return
+                redirect = "\n".join(message.text for message in leftover)
+                yield AgentEvent("operator_message", {
+                    "raw": redirect, "content": redirect, "role": "user",
+                    "kind": "interrupt", "state": "carried_over", "step": 0,
+                    "wait_ms": 0, "late": True})
+            task = redirect
+        yield AgentEvent("llm_notice", {
+            "message": (f"Stopped after {followup_limit} consecutive operator redirects; "
+                        "the newest instruction is queued for your next prompt.")})

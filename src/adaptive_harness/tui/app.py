@@ -15,7 +15,6 @@ from typing import Optional
 from rich.syntax import Syntax
 from rich.text import Text
 from rich.markdown import Markdown
-from rich.prompt import Prompt
 from textual import work
 from textual.app import App, ComposeResult
 from textual import events
@@ -57,6 +56,21 @@ SWITCH_MODES = ("auto", "on", "off")
 #: Which slash command owns each setting the screen cannot cycle in place.
 #: The names differ from the setting keys, so this is explicit rather than
 #: derived: `max_steps` is set through `/steps`, not `/max_steps`.
+def _human_duration(milliseconds: float) -> str:
+    """Render a duration the way a person would say it.
+
+    "86.37 ms" is instrumentation. Sub-second work is reported in whole
+    milliseconds, anything longer in seconds or minutes.
+    """
+    if milliseconds < 1000:
+        return f"{round(milliseconds)} ms"
+    seconds = milliseconds / 1000
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    minutes, remainder = divmod(int(seconds), 60)
+    return f"{minutes}m {remainder}s"
+
+
 _SETTING_COMMANDS = {
     "max_steps": "/steps",
     "provider": "/provider",
@@ -840,12 +854,27 @@ class AdaptiveHarnessApp(App):
             log.write(Text("Nothing to copy yet. Drag across the chat log to select text, "
                            "or run a task first.", style="yellow"))
             return
-        delivery = self.deliver_to_clipboard(selected)
+        # The clipboard helper is an external process that can take seconds to
+        # fail. Running it inline froze the whole app for the duration -- no
+        # repaint, no keystroke, no Ctrl+C -- on two of the most-used shortcuts.
+        # Acknowledge immediately and deliver on a worker thread.
+        self._activity = "Copying"
+        self._refresh_status()
+        self._copy_in_background(selected)
+
+    @work(thread=True)
+    def _copy_in_background(self, text: str) -> None:
+        """Deliver to the clipboard off the event loop, then report the outcome."""
+        delivery = self.deliver_to_clipboard(text)
+        log = self.query_one("#chat-log", RichLog)
         style = "green" if delivery.delivered else "yellow"
         message = delivery.summary()
         if not delivery.delivered:
-            message += " Install wl-clipboard/xclip, or run: xclip -selection clipboard"
+            # Only suggest a helper when none was found. The old text advised
+            # installing the very tool that had just been found and failed.
+            message += " No clipboard helper answered; the text was still written to output/clipboard/."
         log.write(Text(message, style=style))
+        self.call_from_thread(self._refresh_status)
 
     def action_copy_or_quit(self) -> None:
         """``ctrl+c``: copy the selection when there is one, otherwise quit."""
@@ -1235,14 +1264,42 @@ class AdaptiveHarnessApp(App):
             return
         # `/provider` and `/classifier` print their current value and exit when
         # given no argument, which reads as a dead end from a settings screen.
-        # Ask for the value so the row actually changes something.
+        # They open the app's own picker: a blocking Prompt.ask here would read
+        # stdin on Textual's event loop, freeze the app, and leave the screen
+        # stack half-popped when it hit EOF.
         if command in {"/provider", "/classifier"}:
-            value = Prompt.ask(f"{command.lstrip('/')}", default="")
-            if not value.strip():
-                return
-            self._handle_slash_command(f"{command} {value.strip()}")
+            self._show_value_picker(command.lstrip("/"))
             return
         self._handle_slash_command(command)
+
+    def _show_value_picker(self, what: str) -> None:
+        """Open a searchable picker for a setting that owns a slash command.
+
+        Reuses the same modal the model picker uses, so a value chosen here
+        arrives through the command that already owns the behaviour rather than
+        through a second implementation of it.
+        """
+        if what == "provider":
+            choices = [(name, f"Use {name} for this session") for name in PROVIDERS]
+            current = self.provider_name
+        else:
+            backends = ["sklearn", "semif", "onnx"]
+            choices = [(name, f"Use the {name} classifier backend") for name in backends]
+            current = self._classifier_summary_name()
+
+        def chosen(selection: str | None) -> None:
+            if not selection:
+                return
+            self._handle_slash_command(f"/{what} {selection}")
+
+        self.push_screen(QuickSelectModal(what.title(), choices, current=current),
+                          callback=chosen)
+
+    def _classifier_summary_name(self) -> str:
+        try:
+            return self.agent.classifier_backend.name
+        except AttributeError:
+            return "sklearn"
 
     def _refresh_settings_screen(self) -> None:
         """Update the open screen's rows in place after a change."""
@@ -1435,7 +1492,10 @@ class AdaptiveHarnessApp(App):
 
         input_widget = self.query_one("#prompt-input", HistoryInput)
         if self._busy and not text.startswith("/"):
-            self.query_one("#chat-log", RichLog).write(Text("Agent is still working. Wait for this task to finish.", style="yellow"))
+            # Steering a run already in flight, rather than making the user wait
+            # for a long task to end before they can correct it. A leading "!"
+            # asks to stop after this step and start from the note instead.
+            self._queue_operator_message(text, input_widget)
             return
         input_widget.value = ""
         input_widget.reset_navigation()
@@ -1464,6 +1524,37 @@ class AdaptiveHarnessApp(App):
         self._refresh_status()
         self._bell_rung = False
         self.execute_agent_task(text)
+
+    def _queue_operator_message(self, text: str, input_widget: HistoryInput) -> None:
+        """Accept a message typed into a run already in flight.
+
+        Plain text is added to the next step's context; a leading ``!`` asks to
+        stop after the current step and be replaced by this text. Either way the
+        run keeps going and the log says which, because an instruction typed by
+        a human is never silently swallowed.
+        """
+        log = self.query_one("#chat-log", RichLog)
+        kind = "steer"
+        if text.startswith("!"):
+            kind = "interrupt"
+            text = text[1:].strip()
+            if not text:
+                text = "Stop here and report exactly what you have verified so far."
+        depth = self.agent.queue_operator_message(text, kind=kind)
+        log.write(Text(f"\nDeveloper (operator) > {text}", style="bold cyan"))
+        log.write(Text(("⏳ queued, delivered at the start of the next step" if kind == "steer"
+                        else "⏳ queued, the run stops after this step and this becomes the next task")
+                       + (f" · {depth} pending" if depth > 1 else ""), style="dim cyan"))
+        input_widget.value = ""
+        input_widget.reset_navigation()
+        try:
+            if self.history_store.record(text):
+                input_widget.history = list(self.history_store.entries)
+        except OSError as exc:
+            log.write(Text(f"Prompt history could not be saved: {exc}", style="yellow"))
+        # Deliberately no _save_session() here: it reads self.agent.messages from
+        # this thread while the worker thread is appending to it.
+        self._refresh_status()
 
     def _handle_slash_command(self, cmd_text: str) -> None:
         log = self.query_one("#chat-log", RichLog)
@@ -2029,7 +2120,7 @@ class AdaptiveHarnessApp(App):
                 success = report.success
             else:
                 success = False
-                for event in self.agent.run_stream(task_text):
+                for event in self.agent.run_stream_with_followup(task_text):
                     if event.event_type == "response":
                         success = bool(event.payload.get("success"))
                     self.call_from_thread(self._render_event, event)
@@ -2143,6 +2234,33 @@ class AdaptiveHarnessApp(App):
                 suffix = f" · {p['state'].replace('_', ' ').title()}" if p.get("state") else ""
                 log.write(Text(f"⚠ Prompt injected ({label}{suffix}):", style="bold yellow"))
                 log.write(Text(p["content"], style="yellow"))
+        elif et == "operator_queued":
+                depth = p.get("pending", 1)
+                when = ("stop after this step" if p.get("kind") == "interrupt"
+                        else "lands at the start of the next step")
+                log.write(Text(f"⏳ operator ({when}" + (f" · {depth} queued" if depth > 1 else "")
+                               + ")", style="dim cyan"))
+        elif et == "operator_message":
+                # Cyan means the model actually received it and it changed the
+                # run. Yellow means it was recorded but steered nothing -- a late
+                # note must never be rendered as though it was obeyed.
+                raw = p.get("raw") or ""
+                if p.get("kind") == "interrupt":
+                    log.write(Text(f"⚡ operator: {raw}", style="bold cyan"))
+                    log.write(Text("run stops after this step · this becomes the next task", style="dim cyan"))
+                    self._activity = "Handing over to the operator"
+                elif p.get("state") == "carried_over":
+                    log.write(Text(f"⚡ operator: {raw}", style="bold yellow"))
+                    log.write(Text("the previous run was already over · running this as the next task", style="dim yellow"))
+                elif p.get("late"):
+                    log.write(Text(f"⚡ operator: {raw}", style="bold yellow"))
+                    log.write(Text("the run had already finished · kept as context, it did not steer anything",
+                                   style="dim yellow"))
+                else:
+                    log.write(Text(f"⚡ operator: {raw}", style="bold cyan"))
+                    log.write(Text(f"injected as the first instruction of step {p.get('step')} "
+                                   f"· waited {p.get('wait_ms', 0)} ms", style="dim cyan"))
+                self._refresh_status()
         elif et == "provider_failover":
                 log.write(Text(f"Provider failover: {p['from']} → {p['to']} ({p['model']})", style="bold yellow"))
                 telemetry.update_telemetry(model=p["model"], selection="failover")
@@ -2273,14 +2391,22 @@ class AdaptiveHarnessApp(App):
                     "verification_failed": "Task needs another verification pass",
                     "skill_verification_failed": "Task did not meet skill verification checks",
                     "provider_error": "Provider request failed",
+                    "operator_interrupt": "Stopped at your instruction",
                 }.get(p.get("stop_reason"), "Task stopped before completion")
                 cost_display = f"${self._reported_cost_usd:.6f}" if self._cost_reported else "not reported by provider"
                 log.write(Text(f"Session tokens: {self.prompt_tokens + self.completion_tokens:,} total · "
                     f"input {self.prompt_tokens:,} · output {self.completion_tokens:,} · reasoning {self._reasoning_tokens:,} · "
                     f"cache read {self._cached_tokens:,} · cache write {self._cache_write_tokens:,} · cost {cost_display}",
                     style="dim cyan"))
-                log.write(Text(f"\n{status} in {p['total_time_ms']} ms ({p['steps']} steps)\n",
-                               style="bold green" if p["success"] else "bold yellow"))
+                # "86.37 ms" and "1 steps" are developer instrumentation. Round to
+                # a number a person would say, and fix the plural.
+                elapsed = _human_duration(p['total_time_ms'])
+                steps = p['steps']
+                step_word = "step" if steps == 1 else "steps"
+                handover = p.get("stop_reason") == "operator_interrupt"
+                log.write(Text(f"\n{status} in {elapsed} ({steps} {step_word})\n",
+                               style="dim cyan" if handover else
+                               "bold green" if p["success"] else "bold yellow"))
                 if p.get("total_time_ms", 0) >= 5000 and not self._has_focus and not self._bell_rung:
                     self.bell()
                     self._bell_rung = True

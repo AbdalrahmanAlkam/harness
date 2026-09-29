@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from adaptive_harness.agent.compaction import compact_tool_output
+from adaptive_harness.agent.compaction import OPERATOR_PREFIX, compact_tool_output
 from adaptive_harness.llm.providers import context_window
 
 
@@ -37,7 +37,12 @@ def prepare_context(messages: list[dict[str, Any]], model: str,
     protected.update(range(max(0, len(copied) - 8), len(copied)))
     for index, message in enumerate(copied):
         content = str(message.get("content") or "")
-        if "Diff:\n" in content or ("--- a/" in content and "+++ b/" in content):
+        # An operator steer is a user message sitting between two assistant
+        # tool-calling turns, so it lands squarely inside the old-turn window
+        # that the second pass replaces with a summary. Without this it would be
+        # reduced to nothing a few steps after the user typed it.
+        if (content.startswith(OPERATOR_PREFIX) or "Diff:\n" in content
+                or ("--- a/" in content and "+++ b/" in content)):
             protected.add(index)
     for index, message in enumerate(copied):
         if index in protected or message.get("role") != "tool":

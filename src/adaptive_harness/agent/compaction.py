@@ -15,6 +15,14 @@ def clean_output(value: str) -> str:
                    if character in "\n\t" or unicodedata.category(character) != "Cc")
 
 
+#: Prefix carried by every live operator injection. `prepare_context` protects
+#: any message bearing it from old-turn summarisation, so a correction typed
+#: mid-run cannot be summarised away before the model has acted on it.
+#: It lives here because both `agent.py` and `context_window.py` import from
+#: this module; putting it in `agent.py` would create an import cycle.
+OPERATOR_PREFIX = "[Operator"
+
+
 def _collapse_repeated_lines(value: str) -> str:
     lines = value.splitlines()
     result: list[str] = []
