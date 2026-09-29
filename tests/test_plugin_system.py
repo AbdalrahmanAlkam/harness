@@ -390,7 +390,10 @@ def test_the_bundled_example_plugin_loads_and_is_contained(tmp_path: Path):
     (tmp_path / "node_modules").mkdir()
     (tmp_path / "node_modules" / "b.js").write_text("// TODO: ignored\n", encoding="utf-8")
 
-    tool = host.build_tools(tmp_path)[0]
+    # More than one plugin ships with the package, so select by name rather
+    # than by position.
+    tool = next(tool for tool in host.build_tools(tmp_path)
+                if tool.name == "scan_markers")
     result = tool.execute(path=".")
     assert result.success
     assert "a.py:1" in result.output

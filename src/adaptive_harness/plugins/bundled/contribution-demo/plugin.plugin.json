@@ -1,0 +1,77 @@
+{
+  "name": "contribution-demo",
+  "version": "1.0.0",
+  "description": "Exercises every plugin contribution type. Not for production use.",
+  "author": "Adaptive Agent Harness",
+  "permissions": ["tools", "skills", "settings", "prompts", "commands", "context", "subagents", "hooks", "subprocess", "net"],
+  "tools": [
+    {
+      "name": "note_size",
+      "description": "Report the size of a file. Proves a plain plugin tool works.",
+      "handler": "note_size",
+      "risk": "read",
+      "parameters": {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"]
+      }
+    }
+  ],
+  "skills": [
+    {"name": "demo_auditor", "factory": "build_skill"}
+  ],
+  "settings": [
+    {
+      "key": "demo_depth", "label": "Demo depth", "kind": "cycle",
+      "choices": ["fast", "thorough"], "default": "fast",
+      "description": "How deep the demo plugin looks."
+    }
+  ],
+  "prompts": {
+    "demo.greeting": "The demo plugin is active."
+  },
+  "commands": {
+    "/demo": {
+      "description": "Run the demo plugin's example tool.",
+      "model": "anthropic/claude-sonnet-4",
+      "tier": "reasoning",
+      "argument_schema": {
+        "type": "object",
+        "properties": {"path": {"type": "string"}}
+      }
+    }
+  },
+  "mcp": [
+    {
+      "name": "demo-mcp",
+      "command": ["python3", "-c", "pass"],
+      "startup_timeout_s": 5.0
+    }
+  ],
+  "subagents": [
+    {
+      "name": "demo_specialist",
+      "system_prompt": "You are a demo specialist. Say only: demo.",
+      "tools": ["note_size"],
+      "budget_tokens": 2000,
+      "description": "A minimal subagent, to prove the mode exists."
+    }
+  ],
+  "context": [
+    {
+      "source": "demo:inline",
+      "content": "Inline declarative context fragment.",
+      "priority": 50,
+      "trigger": "keyword:inline"
+    },
+    {
+      "source": "demo:conventions",
+      "factory": "project_conventions"
+    }
+  ],
+  "hooks": [
+    {"when": "pre_tool", "handler": "guard_pre_tool"},
+    {"when": "post_tool", "handler": "redact_post_tool"},
+    {"when": "on_final", "handler": "observe_final"}
+  ]
+}

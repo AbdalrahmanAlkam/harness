@@ -1248,6 +1248,30 @@ class DeveloperAgent:
                     payload={"name": tc.name, "arguments": tc.arguments, "call_id": tc.id},
                 )
 
+                # A PRE_TOOL hook may deny or rewrite the call before anything
+                # else looks at it -- before the risk classifier, before the
+                # safety profile, before dispatch. That ordering is the point: a
+                # policy a privileged profile could route around is not a
+                # policy. A denial becomes a tool error the model can see and
+                # act on, never a silent skip.
+                if self.plugins.pre_tool_hooks():
+                    hooked_args, denial, denier = self.plugins.consult_pre_tool(
+                        tc.name, tc.arguments)
+                    if denial:
+                        yield AgentEvent("hook_blocked", {"name": tc.name,
+                                                           "plugin": denier, "reason": denial})
+                        tool_res = ToolResult(success=False, output="",
+                            error=f"Blocked by the {denier} safety hook: {denial}")
+                        self.messages.append({"role": "tool", "tool_call_id": tc.id,
+                            "name": tc.name,
+                            "content": f"ERROR: {tool_res.error}"})
+                        answered_tool_calls.add(tc.id)
+                        continue
+                    if hooked_args != tc.arguments:
+                        yield AgentEvent("hook_rewrote", {"name": tc.name,
+                                                          "arguments": hooked_args})
+                        tc.arguments = hooked_args
+
                 tool = self.tools.get(tc.name) if tc.name in domain_tool_names else None
                 t_start = time.perf_counter()
                 # Shell and test tools may write files; mutation evidence is the
@@ -1318,6 +1342,24 @@ class DeveloperAgent:
                 # threshold; prepare_context compacts only the request copy.
                 model_error = (tool_res.error or "")[:600]
                 estimated_saved = max(0, (len(tool_res.output) - len(model_output)) // 4)
+
+                # A POST_TOOL hook may redact a successful tool's output before it
+                # reaches the model's context, or attach metadata. It can never
+                # touch a failure: losing an error's detail is the one thing this
+                # system must never do, so the run_post_tool path ignores a
+                # redaction of a failed call.
+                if self.plugins.post_tool_hooks():
+                    hooked_output, hook_meta = self.plugins.run_post_tool(
+                        tc.name, tc.arguments, model_output, tool_res.success)
+                    if hook_meta:
+                        tool_res = tool_res.model_copy(update={"metadata": {
+                            **(tool_res.metadata or {}), **hook_meta}})
+                    if hooked_output != model_output:
+                        estimated_saved += max(0, (len(model_output) - len(hooked_output)) // 4)
+                        model_output = hooked_output
+                        shown_output = hooked_output
+                        yield AgentEvent("tool_redacted", {"name": tc.name,
+                                                           "chars": len(hooked_output)})
 
                 yield AgentEvent(
                     event_type="tool_result",
