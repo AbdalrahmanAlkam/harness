@@ -324,10 +324,13 @@ class DeveloperAgentWorker:
             available = {
                 "read_file": lambda: ReadFileTool(workspace_root=root),
                 "write_file": lambda: WriteFileTool(workspace_root=root, allowed_paths=authorized),
-                "edit_file": lambda: EditFileTool(workspace_root=root),
+                "edit_file": lambda: EditFileTool(workspace_root=root, allowed_paths=authorized),
                 "list_directory": lambda: ListDirectoryTool(workspace_root=root),
                 "search_files": lambda: SearchFilesTool(workspace_root=root),
-                "run_bash": lambda: RunBashTool(workspace_root=root),
+                # A worker must be able to execute its own decider, so the shell
+                # stays unrestricted; the allow-list is enforced separately on
+                # any path the command tries to *write*.
+                "run_bash": lambda: RunBashTool(workspace_root=root, allowed_write_paths=authorized),
                 "run_pytest": lambda: RunPytestTool(workspace_root=root),
                 "run_python_repl": lambda: RunPythonReplTool(),
                 "run_lean_proof": lambda: RunLeanProofTool(workspace_root=root,

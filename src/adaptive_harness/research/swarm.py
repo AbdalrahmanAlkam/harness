@@ -897,8 +897,18 @@ class ResearchSwarm:
         except OSError as exc:
             return False, f"paper.typ could not be authored: {exc}", ()
         digest = sha256_file(target)
+        # The cache key is the *source* digest, so a PDF that is deleted, truncated
+        # or clobbered after a good build would otherwise be reported as a clean
+        # build for a file that no longer exists. Re-stat the artifact before
+        # trusting a cached verdict.
         if digest == self._paper_digest and self._compile_result is not None:
-            return self._document_verdict(self._compile_result)
+            published = self.workspace.root / "paper.pdf"
+            try:
+                intact = published.is_file() and published.stat().st_size > 0
+            except OSError:
+                intact = False
+            if intact:
+                return self._document_verdict(self._compile_result)
         result = self._compile()
         self._paper_digest = digest
         return self._document_verdict(result)
@@ -993,30 +1003,35 @@ class ResearchSwarm:
         return self.topic
 
     def _paper_abstract(self, certified: int = 0) -> str:
-        """A real abstract: what was asked, what was shown, and what it means."""
-        strategy = self.plan.strategy
-        if "power-law-moments" in strategy and "balanced-allocation" in strategy:
-            return ("Routing policies for delay-sensitive services are routinely justified by "
-                    "minimising the variance of the observed delay. We show that this objective "
-                    "is not merely inconvenient but undefined on part of the empirically observed "
-                    "range: for a delay with a Pareto tail of index at most two the second moment "
-                    "diverges, so the variance is infinite under every allocation of work and no "
-                    "variance-minimising policy exists. Above the critical index we identify the "
-                    "variance-minimising allocation, showing that the balanced split is optimal "
-                    "and that its exact excess over the Cauchy-Schwarz bound is determined by the "
-                    "remainder of the batch size upon division by the number of servers. Every "
-                    "statement is a proposition whose symbolic form is constructed from a "
-                    "definition and decided by an executed derivation script."
-                    + (f" {certified} of these results additionally carry a Lean 4 proof that the "
-                       f"Lean kernel machine-checks, so the argument rests on a verified "
-                       f"deduction and not only on symbolic computation." if certified else ""))
-        if self.plan.propositions:
-            return (f"We investigate {self.topic}. The propositions below are constructed from "
-                    f"their definitions and decided by executing self-adjudicating derivation "
-                    f"scripts; a result is reported only where its script reached a verdict.")
-        return (f"No derivation strategy matched the topic '{self.topic}', so no proposition was "
-                f"constructed and the claim was not tested. This paper reports that outcome "
-                f"explicitly rather than presenting an unverified result.")
+        """A real abstract: what was asked, what was shown, and what it means.
+
+        The abstract is built from this run's own results. It must never assert a
+        mathematical finding that the run did not decide: a run that proved
+        nothing has to say so, whatever strategy the topic matched. Every clause
+        below is therefore qualified by a count that came from an executed
+        derivation.
+        """
+        props = self.plan.propositions
+        if not props:
+            return (f"No derivation strategy matched the topic '{self.topic}', so no proposition was "
+                    f"constructed and the claim was not tested. This paper reports that outcome "
+                    f"explicitly rather than presenting an unverified result.")
+        proved = [prop for prop in props if prop.verdict is Verdict.PROVEN.value]
+        refuted = [prop for prop in props if prop.verdict is Verdict.DISPROVEN.value]
+        if not proved and not refuted:
+            return (f"We investigate {self.topic}. The {len(props)} proposition(s) below are "
+                    f"constructed from their definitions and adjudicated by executing "
+                    f"self-adjudicating derivation scripts, but none reached a verdict in this "
+                    f"run, so the claim is reported as untested. No finding is asserted.")
+        lead = (f"We investigate {self.topic}. Of the {len(props)} proposition(s) constructed, "
+                f"{len(proved)} were proved and {len(refuted)} refuted by executing a "
+                f"self-adjudicating derivation script over an exact symbolic expression; "
+                f"each is reported below together with the verdict its script actually reached.")
+        if certified:
+            lead += (f" {certified} of the formal results additionally carry a Lean 4 proof that "
+                     f"the Lean kernel machine-checks, so that part of the argument rests on a "
+                     f"verified deduction and not only on symbolic computation.")
+        return lead
 
     def _compile(self) -> Any:
         if not self.workspace.paper_typ.is_file():

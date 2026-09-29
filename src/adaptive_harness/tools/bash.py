@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import subprocess
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 import re
 import shlex
 
@@ -20,6 +20,10 @@ FORBIDDEN_PATTERNS: List[str] = [
     "> /dev/sda",
     "mkfs",
 ]
+
+# Commands that write a file named on the command line. Used by the worker's
+# write allow-list so a shell redirect is not a way around it.
+_WRITE_COMMANDS = ("tee", "cp", "mv", "install", "dd", "truncate", "patch")
 
 
 class RunBashTool(Tool):
@@ -43,9 +47,51 @@ class RunBashTool(Tool):
         "required": ["command"],
     }
 
-    def __init__(self, workspace_root: Optional[Path | str] = None, *, read_only: bool = False):
+    def __init__(self, workspace_root: Optional[Path | str] = None, *, read_only: bool = False,
+                 allowed_write_paths: Optional[Sequence[Path | str]] = None):
         self.workspace_root = Path(workspace_root or os.getcwd()).resolve()
         self.read_only = read_only
+        # When a worker is leased a specific artifact, its shell must not be a
+        # second write channel past the file tools' allow-list: `cat > sibling`
+        # would otherwise defeat the coordination board's exclusivity. Execution
+        # stays unrestricted so a worker can still run its own decider.
+        self.allowed_write_paths = ({workspace_path(self.workspace_root, str(path))
+                                     for path in allowed_write_paths}
+                                    if allowed_write_paths is not None else None)
+
+    def _refused_write_target(self, command: str) -> str | None:
+        """Return the offending path if the command writes outside the lease.
+
+        Covers shell redirection (``>``, ``>>``) and the common write commands.
+        This is a guard, not a sandbox: it exists so a worker's shell cannot
+        reach a sibling's leased artifact, and it fails closed on anything it
+        cannot parse as an authorized path.
+        """
+        if self.allowed_write_paths is None:
+            return None
+        candidates: list[str] = []
+        for match in re.finditer(r">>?\s*([^\s;|&]+)", command):
+            candidates.append(match.group(1))
+        for name in _WRITE_COMMANDS:
+            for match in re.finditer(rf"\b{re.escape(name)}\b\s+(?:-\S+\s+)*([^\s;|&]+)", command):
+                candidates.append(match.group(1))
+            # `cp`/`mv`/`install` name the *destination* last, so the final
+            # operand is the file actually written.
+            operands = re.findall(rf"\b{re.escape(name)}\b((?:\s+-\S+|\s+[^\s;|&]+)+)", command)
+            for group in operands:
+                words = group.split()
+                if name in {"cp", "mv", "install"} and len(words) > 1:
+                    candidates.append(words[-1])
+        for raw in candidates:
+            if raw.startswith("&") or raw in {"/dev/null", "/dev/stdout", "/dev/stderr"}:
+                continue
+            try:
+                resolved = workspace_path(self.workspace_root, raw)
+            except ValueError:
+                return raw
+            if resolved not in self.allowed_write_paths:
+                return raw
+        return None
 
     def execute(self, command: str, timeout_seconds: int = 30, **kwargs: Any) -> ToolResult:
         cmd_strip = command.strip()
@@ -55,6 +101,14 @@ class RunBashTool(Tool):
             words = shlex.split(cmd_strip)
         except ValueError as exc:
             return ToolResult(success=False, output="", error=f"Invalid shell quoting: {exc}")
+        refused = self._refused_write_target(cmd_strip)
+        if refused is not None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(f"Write refused: this worker is not authorized to write {refused}. "
+                       f"Write to your own leased artifact instead."),
+            )
         if self.read_only:
             # Reviewers can check JavaScript syntax without executing project
             # scripts or giving a shell command permission to edit the workspace.

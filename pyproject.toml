@@ -4,10 +4,36 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adaptive-harness"
-version = "0.1.0"
+version = "2.0.0"
 description = "Adaptive Agent Harness: ML-routed agent execution with verification, uncertainty reasoning, and recovery"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "AbdalrahmanAlkam" }]
+keywords = [
+    "agent",
+    "llm",
+    "textual",
+    "tui",
+    "formal-verification",
+    "lean4",
+    "machine-learning",
+    "research",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = [
     "numpy>=1.26.0",
     "scipy>=1.12.0",
@@ -34,6 +60,12 @@ dev = [
 
 [project.scripts]
 adaptive-harness = "adaptive_harness.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/AbdalrahmanAlkam/harness"
+Repository = "https://github.com/AbdalrahmanAlkam/harness"
+Issues = "https://github.com/AbdalrahmanAlkam/harness/issues"
+Changelog = "https://github.com/AbdalrahmanAlkam/harness/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]

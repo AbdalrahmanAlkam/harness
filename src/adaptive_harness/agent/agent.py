@@ -77,6 +77,29 @@ _WORKSPACE_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", ".tox",
                         ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 
 
+def _synthesize_missing_tool_results(tool_calls: list, answered: set[str]) -> list[dict]:
+    """Back-fill ``tool`` messages for any declared call that never ran.
+
+    The assistant message declares every call in a batch up front, so breaking out
+    of the execution loop early (an overseer stop, a clarification abort) can
+    leave a declared ``tool_call`` with no matching result. An OpenAI-compatible
+    endpoint rejects the whole request in that state, which would silently break
+    every later turn of a session that reuses the same message list. Each
+    unanswered call therefore gets an explicit cancellation result.
+    """
+    synthesized: list[dict] = []
+    for call in tool_calls:
+        if call.id in answered:
+            continue
+        synthesized.append({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "name": call.name,
+            "content": "CANCELLED: not executed. The run stopped before this tool call ran.",
+        })
+    return synthesized
+
+
 def _workspace_signature(root: Path) -> dict[str, tuple[int, int]]:
     """Cheap observable file state (path -> mtime_ns, size) for mutation detection.
 
@@ -925,6 +948,7 @@ class DeveloperAgent:
                 assistant_tool_message["reasoning_details"] = llm_resp.metadata["reasoning_details"]
             self.messages.append(assistant_tool_message)
             pending_directives: list[tuple[str, str]] = []
+            answered_tool_calls: set[str] = set()
             for tc in llm_resp.tool_calls:
                 yield AgentEvent("agent_stage", {"stage": "tool_running", "step": step, "tool": tc.name})
                 yield AgentEvent(
@@ -1081,6 +1105,7 @@ class DeveloperAgent:
                                    f"ERROR: {model_error or 'Tool failed'}\n{model_output}",
                     }
                 )
+                answered_tool_calls.add(tc.id)
 
                 decision = overseer.observe(tc.name, tc.arguments, success=tool_res.success,
                     error=tool_res.error or "", output=tool_res.output, model_text=llm_resp.content or "")
@@ -1128,6 +1153,13 @@ class DeveloperAgent:
                             stop_reason = "overseer_impasse"
                             break
                         overseer.consecutive_interventions = 0
+            # Any call the loop did not reach (an overseer stop or a clarification
+            # abort breaks out early) still needs a result, or the next request
+            # carries a dangling tool_call and the endpoint rejects the history.
+            for cancelled in _synthesize_missing_tool_results(llm_resp.tool_calls, answered_tool_calls):
+                self.messages.append(cancelled)
+                yield AgentEvent("tool_cancelled", {"tool": cancelled["name"],
+                                                    "call_id": cancelled["tool_call_id"]})
             for state_name, text in pending_directives:
                 self.messages.append({"role": "system", "content": text})
                 yield _injection_event("runtime_overseer", text, step, state=state_name)
