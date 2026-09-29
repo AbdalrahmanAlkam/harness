@@ -852,7 +852,11 @@ def test_the_manifest_is_valid_json_and_declares_the_right_permissions():
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     assert manifest["name"] == "web"
     assert manifest["name"].isidentifier()
-    assert sorted(manifest["permissions"]) == ["net", "tools"]
+    # `env` is declared because web_query reads BRAVE_SEARCH_API_KEY from the
+    # environment. Declaring only what a tool is "for" while reading the
+    # environment anyway is exactly the ungranted-permission hole the manifest
+    # exists to close.
+    assert sorted(manifest["permissions"]) == ["env", "net", "tools"]
 
 
 def test_the_plugin_loads_through_the_host():
@@ -862,7 +866,7 @@ def test_the_plugin_loads_through_the_host():
     host.discover()
     plugin = next(p for p in host.plugins if p.name == "web")
     assert plugin.ok, plugin.error
-    assert plugin.permissions == frozenset({"tools", "net"})
+    assert plugin.permissions == frozenset({"tools", "net", "env"})
 
 
 def test_both_tools_are_registered_with_net_risk():
