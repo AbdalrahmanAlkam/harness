@@ -404,6 +404,18 @@ class DeveloperAgent:
             return "Action cancelled by user"
         return options[0]
 
+    #: Tools that only observe. Anything else can change the workspace, run
+    #: code, or reach the network, so the strict profile asks first. A tool that
+    #: is not in this set is treated as mutating: the safe default for a tool
+    #: this code has never heard of.
+    _READ_ONLY_TOOLS = frozenset({
+        "read_file", "list_directory", "search_files", "read_full_output",
+        "calculate", "verify_equation", "check_convergence",
+    })
+
+    def _is_read_only_tool(self, name: str) -> bool:
+        return name in self._READ_ONLY_TOOLS
+
     def _request_messages(self) -> List[Dict[str, Any]]:
         """The saved conversation is verbatim; request compaction is conditional."""
         return self.messages
@@ -918,8 +930,13 @@ class DeveloperAgent:
             for tc in llm_resp.tool_calls:
                 risky_command = self.tool_risk_classifier.evaluate(tc.name, tc.arguments,
                     catastrophic_only=self.safety_profile == "turbo")
-                if self.safety_profile == "strict" and tc.name in {
-                        "run_bash", "write_file", "edit_file", "run_pytest", "run_python_repl", "web_search"}:
+                # The strict profile asks before anything that changes state.
+                # This used to be a hardcoded list of six tool names, so any tool
+                # added later -- including one a user installed -- reached
+                # execution without ever passing this gate. Deriving it from
+                # whether the tool is read-only means the gate covers every
+                # tool by construction, not by enumeration.
+                if self.safety_profile == "strict" and not self._is_read_only_tool(tc.name):
                     risky_command = risky_command or f"strict profile approval for {tc.name}"
                 if risky_command and not authorized_destructive:
                     strict_gate = self.safety_profile == "strict"

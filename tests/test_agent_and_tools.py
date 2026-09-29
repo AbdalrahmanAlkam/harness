@@ -155,7 +155,7 @@ def test_openrouter_reasoning_request_uses_effort_without_temperature():
     assert response.content == "ok"
     assert captured["model"] == MODEL_TIERS["reasoning"]
     assert captured["extra_body"] == {"reasoning": {"effort": "high"},
-                                      "cache_control": {"type": "ephemeral"}, "usage": {"include": True}}
+                                      "usage": {"include": True}}
     assert "temperature" not in captured
 
 
@@ -173,7 +173,7 @@ def test_reasoning_budget_uses_supported_openrouter_parameters():
     client.complete(messages, model="anthropic/claude-3.7-sonnet", reasoning_effort="high",
                     reasoning_budget_tokens=16000)
     assert requests[-1]["extra_body"] == {"reasoning": {"max_tokens": 16000},
-                                          "cache_control": {"type": "ephemeral"}, "usage": {"include": True}}
+                                          "usage": {"include": True}}
     assert requests[-1]["max_completion_tokens"] > 16000
     assert "temperature" not in requests[-1]
     client.complete(messages, model="deepseek/deepseek-r1", reasoning_effort="medium",
@@ -181,12 +181,39 @@ def test_reasoning_budget_uses_supported_openrouter_parameters():
     assert requests[-1]["extra_body"] == {"reasoning": {"effort": "medium"}, "usage": {"include": True}}
     client.complete(messages, model="anthropic/claude-3.7-sonnet", reasoning_budget_tokens=0)
     assert requests[-1]["extra_body"] == {"reasoning": {"enabled": False},
-                                          "cache_control": {"type": "ephemeral"}, "usage": {"include": True}}
+                                          "usage": {"include": True}}
     client.complete(messages, model=MODEL_TIERS["standard"], reasoning_effort="low",
                     reasoning_budget_tokens=1000)
     assert requests[-1]["extra_body"] == {"reasoning": {"effort": "low"}, "usage": {"include": True}}
     client.complete(messages, model=MODEL_TIERS["standard"], reasoning_budget_tokens=0)
     assert requests[-1]["extra_body"] == {"usage": {"include": True}}
+
+
+def test_claude_requests_carry_a_cache_breakpoint_on_the_system_message():
+    """Caching is requested per content block, not as a top-level field.
+
+    A top-level `cache_control` marks no prefix, so the system prompt and the
+    tool schemas were re-billed in full on every step of a tool loop.
+    """
+    captured: dict = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None),
+                                                      finish_reason="stop")], usage=None, model=kwargs["model"])
+
+    client = LLMClient(api_key="test-key")
+    client._openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    conversation = [{"role": "system", "content": "A stable system prompt."},
+                    {"role": "user", "content": "hello"}]
+    client.complete(conversation, model="anthropic/claude-3.7-sonnet", reasoning_effort="high")
+
+    # The marker is on the content block, not floating at the top level.
+    assert "cache_control" not in captured["extra_body"]
+    system = captured["messages"][0]
+    assert system["content"][0]["cache_control"] == {"type": "ephemeral"}
+    # And the caller's own list is untouched, since it is reused every step.
+    assert conversation[0]["content"] == "A stable system prompt."
 
 
 def test_run_bash_tool(tmp_path: Path):
