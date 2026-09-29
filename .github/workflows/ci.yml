@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # The fast gate on every push. It is the loop developers actually run.
+      - name: Fast test suite
+        run: pytest -m "not slow" -q
+
+      # The full gate compiles real Lean 4 proofs and drives full research
+      # swarms, so it runs on the default branch and on pull requests, but not
+      # on every unrelated push to a fork's branch.
+      - name: Full test suite
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+        run: pytest -q
+
+  package:
+    name: build and install the wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      # A wheel that installs but cannot start is not a release. Install it into
+      # a clean environment and run the commands a new user runs first.
+      - name: Install into a clean environment and smoke test
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/adaptive-harness --version
+          /tmp/smoke/bin/adaptive-harness --help
+          /tmp/smoke/bin/adaptive-harness run "2+2" --db /tmp/smoke.db
+          /tmp/smoke/bin/adaptive-harness report --db /tmp/smoke.db
+          /tmp/smoke/bin/adaptive-harness prompts list
+          # `tui` must refuse cleanly without a TTY rather than hanging forever.
+          ! /tmp/smoke/bin/adaptive-harness tui < /dev/null
