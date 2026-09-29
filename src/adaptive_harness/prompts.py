@@ -81,6 +81,20 @@ DEFAULT_PROMPTS: dict[str, str] = {
         "severity, evidence, and a concrete mitigation."
     ),
 
+    "domain.guidance.plan": (
+        "You are in PLAN MODE. Investigate thoroughly and produce a plan; do not modify "
+        "anything. You may read files, search, and list directories freely, and you may "
+        "delegate investigation to a subagent. Any attempt to write, edit, or run a "
+        "mutating command will be refused.\n\n"
+        "End your answer with a plan under the heading '## Plan', as an ordered list of "
+        "concrete steps. For each step, name the file(s) it touches and what it changes. "
+        "State anything you could not determine rather than guessing; the operator will "
+        "approve, edit, or reject this plan, so its accuracy matters more than its "
+        "confidence.\n\n"
+        "Also include a '## Risks' section naming what could go wrong, and a "
+        "'## Open questions' section for anything you need the operator to decide."
+    ),
+
     # Tool-output compression, asked of the *secondary* model only.
     "tool_filter.summarize": (
         "You are compressing the output of the `{tool}` tool so it fits in a small context window. "

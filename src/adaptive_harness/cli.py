@@ -189,7 +189,7 @@ def tui(
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID (e.g. anthropic/claude-sonnet-4)"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
-    mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
+    mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, plan, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Model effort: auto, low, medium, high, xhigh, max (deep = high)"),
     secondary_model: Optional[str] = typer.Option(
         None, "--secondary-model",
@@ -291,7 +291,7 @@ def dev(
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
-    mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
+    mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, plan, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Model effort: auto, low, medium, high, xhigh, max (deep = high)"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
     quality_gate: bool = typer.Option(

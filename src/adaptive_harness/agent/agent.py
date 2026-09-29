@@ -23,7 +23,8 @@ from adaptive_harness.plugins.host import PluginHost
 from adaptive_harness.classifiers.engine import (BaseClassifierBackend, SklearnBackend, DOMAIN_LABELS,
     THINKING_LABELS, TIER_LABELS, VERIFICATION_LABELS, Classification)
 from adaptive_harness.classifiers.domain_classifier import (DomainClassifier, DomainAssessment,
-    DomainMode, parse_domain_mode, audit_command_is_read_only)
+    DomainMode, parse_domain_mode, audit_command_is_read_only,
+    plan_command_is_read_only)
 from adaptive_harness.classifiers.thinking_classifier import (ThinkingClassifier, ThinkingAssessment,
     ThinkingLevel, BUDGET_TOKENS, parse_thinking_level, effort_for_level)
 from adaptive_harness.classifiers.skill_classifier import SKILL_CLASSES
@@ -1085,6 +1086,11 @@ class DeveloperAgent:
             DomainMode.RESEARCH: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "web_search", "run_bash", "run_pytest", "run_python_repl", "verify_equation", "calculate", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof", "read_full_output"},
             DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof", "read_full_output"},
             DomainMode.AUDIT: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user", "read_full_output"},
+            # Plan mode is read-and-investigate. The mutating tools stay in
+            # the set on purpose: a refused call with a reason is more useful
+            # to the model than a tool that silently does not exist, because
+            # it learns the boundary instead of guessing at it.
+            DomainMode.PLAN: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user", "read_full_output", "write_file", "edit_file", "delegate_subagent"},
         }[domain_res.mode]
         if self.safety_profile == "turbo":
             domain_tool_names.discard("ask_user")
@@ -1319,8 +1325,15 @@ class DeveloperAgent:
                     final_answer = ""
                     continue
                 completed = bool(final_answer.strip()) and not unresolved_failures and not missing_checks
-                stop_reason = ("verification_failed" if unresolved_failures or missing_checks else
-                               "no_answer" if not final_answer.strip() else "completed")
+                if domain_res.mode is DomainMode.PLAN:
+                    # A plan is the deliverable. "Completed" would claim the work
+                    # was done, which is precisely what plan mode refused to do.
+                    completed = False
+                    stop_reason = "plan_ready"
+                    yield AgentEvent("plan_ready", {"content": final_answer})
+                else:
+                    stop_reason = ("verification_failed" if unresolved_failures or missing_checks else
+                                   "no_answer" if not final_answer.strip() else "completed")
                 if completed and final_answer.strip() and (
                         self.quality_gate_enabled or len(self.requirement_set)):
                     # The Quality Controller: does what the model did fulfil
@@ -1359,6 +1372,24 @@ class DeveloperAgent:
             policy_denials: dict[str, str] = {}
             # Obtain authorization before adding tool calls to conversation history.
             for tc in llm_resp.tool_calls:
+                # Plan mode: investigating is allowed, changing is not. The
+                # refusal carries a reason and becomes a tool result, so the
+                # model learns the boundary rather than guessing at it, and the
+                # transcript stays well-formed.
+                if domain_res.mode is DomainMode.PLAN and not self._is_read_only_tool(tc.name):
+                    # run_bash is not a read-only *tool*, but a read-only
+                    # *command* is exactly what plan mode is for. Check the
+                    # command before refusing, or investigating the workspace
+                    # would be impossible in plan mode.
+                    if not (tc.name == "run_bash" and plan_command_is_read_only(
+                            str(tc.arguments.get("command", "")))):
+                        reason = ("plan mode is read-only: this call would change the "
+                                  "workspace. Investigate and return a plan instead.")
+                        yield AgentEvent("plan_mode_blocked", {"name": tc.name,
+                                                               "reason": reason})
+                        policy_denials[tc.id] = reason
+                        continue
+
                 # Rules are evaluated first, inside the gate, so a permissive
                 # profile cannot route around them. A rule that `--safety-profile
                 # turbo` can bypass is not a rule.
