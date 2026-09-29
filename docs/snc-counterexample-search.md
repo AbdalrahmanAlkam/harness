@@ -1,7 +1,7 @@
 # Running the Seymour counterexample search
 
 ```bash
-./research/snc.sh
+./scripts/run_snc_counterexample_search.sh
 ```
 
 The topic is in `scripts/snc_topic.txt`, not on the command line. That is not
@@ -34,7 +34,7 @@ report names which invariant blocked it and what remains open.
 
 ## Reading the output
 
-- `research/snc-counterexample-search-for-seymours-second-neighborhood-conjecture/`
+- `research/<topic-slug>/` -- the run writes into a directory named for the topic
 - `proof_receipts.json` — the exact bytes executed, with SHA-256
 - `task_board.json` — every task, its owner, and what became of it
 - `comm_ledger.jsonl` — hash-chained; verifies its own integrity

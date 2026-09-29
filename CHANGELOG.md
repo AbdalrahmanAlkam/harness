@@ -1,12 +1,52 @@
 # Changelog
 
-All notable changes to Adaptive Agent Harness. The entries under
-`[Unreleased]` cover the work in this push; earlier history is summarized in
-`git log`.
+All notable changes to Adaptive Agent Harness.
 
-## [Unreleased]
+`[2.0.0]` is the first public release. Anything earlier was development on an
+unpublished tree and is summarized in `git log` rather than here.
 
-### Added
+## [2.0.0] - 2026-09-29
+
+First public release. This is the version a customer installs; everything
+before it was development on an unpublished tree.
+
+### Fixed in this release
+The audit that produced this release found several ways the harness could
+assert something that had not happened. Those are the substantive changes:
+
+- The paper's Lean appendix listed every `.lean` file under a heading calling
+  them verified, including files the gate had rejected for a `sorry`. It now
+  lists only certified files, so a rejected proof can no longer appear in the
+  published PDF as a verified one.
+- The abstract and conclusion were hardcoded prose selected by a topic
+  substring. A run about the sum of the first n integers concluded that
+  balanced load allocation minimises delay variance. Both are now derived from
+  the verdicts the run actually reached.
+- `run_lean_proof` was the one file-touching tool that skipped workspace
+  containment: a model-supplied path could read any file the user can read and
+  overwrite any file it can write. It also certified a file declaring no
+  theorem, because Lean exits 0 on an empty file.
+- `5/0` evaluated to infinity and passed verification as a numeric answer. The
+  arithmetic verifier now re-evaluates the expression instead of checking only
+  that the value is a number, and roots are compared relatively so a true root
+  of 8.1e-9 is no longer reported as 0.0.
+- Prompt caching sent `cache_control` as a top-level field, which marks no
+  prefix. The system prompt and tool schemas were re-billed in full on every
+  step of every run. The breakpoint now lands on the system message.
+- A stop by the overseer left declared tool calls unanswered, which made every
+  later turn of a reused session fail the provider's validation.
+- The research swarm pinned every worker to one private model, so a customer
+  without access to it could not run research at all.
+
+### Added in this release
+- Mid-turn steering: type while the agent works and the note reaches the model
+  at the start of the next step, with `!` to stop and redirect instead.
+- Task cancellation on Escape, cooperative and attributed.
+- An enforced per-worker token budget on research runs.
+- A LICENSE, SECURITY.md, and CONTRIBUTING.md.
+
+### Changed
+- A fresh session now starts in coding mode with the swarm off.
 - **A settings screen.** F7 or `/settings` lists every persistent setting with
   its live value, instead of one command and one function key per knob. Short
   fixed sets cycle in place; the two model rows open the existing catalogue
@@ -290,7 +330,7 @@ document says so rather than claiming a completed paper.
   durable record rather than re-running the compiler.
 - **Lean 4 as the machine-checked epistemic proof engine.** `RunLeanProofTool`
   (`run_lean_proof`) compiles and adjudicates Lean sources, and a sixth
-  invariant, `formal_verification`, requires that any theorem the paper asserts
+  invariant, `lean_formal_soundness`, requires that any theorem the paper asserts
   is machine-checked. The paper gains a *Formal Foundations* section with a
   certification box per proof and an appendix listing the full sources.
 - **The zero-sorry invariant, enforced three independent ways.** Established
@@ -386,9 +426,12 @@ document says so rather than claiming a completed paper.
   `linarith`, or `ring_nf`, so polynomial identities are distributed by hand.
   The tool still prefers `lake env lean` when a `lakefile` is present, so a
   Mathlib environment is used automatically where one exists.
-- The research swarm defaults to **mechanical mode**: no language model is called
-  unless `--author` is passed, so a default run makes zero network requests and
-  costs nothing. All verification is local and deterministic.
+- The research swarm is **live by default**: it calls a real model and costs
+  real money, so a default run is not free. `--offline-legacy` runs the earlier
+  fixed-topic examples with no network requests and no cost, and exists for
+  reproducing those examples rather than for normal use. All verification —
+  exact derivation, SymPy, Lean, the ledger — is local and deterministic either
+  way, and a run reports a cost estimate so the spend is visible.
 
 ### Added (earlier)
 - **Classifier-driven tool-step policy** (`--step-policy classifier|fixed|unbounded`,
@@ -396,7 +439,7 @@ document says so rather than claiming a completed paper.
   fixed step cap: the runtime overseer injects a visible stop-circling system
   prompt when the agent repeats unnecessary tool calls and stops the run with a
   termination verdict when interventions fail. `fixed` restores the previous
-  hardcoded budgets (4–20 steps by thinking level, cap 32); `unbounded` removes
+  hardcoded budgets (4–24 steps by thinking level, cap 32); `unbounded` removes
   the cap and all interventions. Explicit `max_steps` always wins, and swarm
   subagents inherit the session policy.
 - **Prompt-injection and system-prompt visibility.** Every classifier or harness
