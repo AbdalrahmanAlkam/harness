@@ -26,7 +26,6 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3.12",
@@ -69,6 +68,10 @@ Changelog = "https://github.com/AbdalrahmanAlkam/harness/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# The bundled example plugin is data the package ships, not a subpackage.
+"adaptive_harness.plugins" = ["bundled/*/*.json", "bundled/*/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

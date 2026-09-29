@@ -1,3 +1,4 @@
+LICENSE
 README.md
 pyproject.toml
 src/adaptive_harness/__init__.py
@@ -62,6 +63,11 @@ src/adaptive_harness/models/classifier.py
 src/adaptive_harness/models/domain.py
 src/adaptive_harness/models/features.py
 src/adaptive_harness/models/training.py
+src/adaptive_harness/plugins/__init__.py
+src/adaptive_harness/plugins/host.py
+src/adaptive_harness/plugins/tool.py
+src/adaptive_harness/plugins/bundled/todo-scan/plugin.plugin.json
+src/adaptive_harness/plugins/bundled/todo-scan/plugin.py
 src/adaptive_harness/research/__init__.py
 src/adaptive_harness/research/claim.py
 src/adaptive_harness/research/coordination.py
@@ -124,11 +130,16 @@ tests/test_classifier_and_metrics.py
 tests/test_command_palette_and_math.py
 tests/test_equation_strategy.py
 tests/test_harness_and_policies.py
+tests/test_integrity_regressions.py
 tests/test_lean_prover.py
 tests/test_lean_verification.py
+tests/test_math_correctness_regressions.py
 tests/test_model_effort.py
+tests/test_operator_steering.py
 tests/test_phase3e_g.py
 tests/test_phase5_audit.py
+tests/test_plugin_system.py
+tests/test_prompt_caching_regressions.py
 tests/test_prompt_registry.py
 tests/test_research_audit_regressions.py
 tests/test_research_coordination.py
@@ -143,6 +154,7 @@ tests/test_step_policy.py
 tests/test_storage_and_retraining.py
 tests/test_swarm.py
 tests/test_system_prompt_hygiene.py
+tests/test_task_cancellation.py
 tests/test_terminal_plotting.py
 tests/test_text_stats_and_fallback.py
 tests/test_tool_output_filter.py
@@ -150,4 +162,5 @@ tests/test_tui_ergonomics.py
 tests/test_tui_row_visibility.py
 tests/test_tui_selection_and_persistence.py
 tests/test_typst_toolchain.py
+tests/test_workspace_signature_performance.py
 tests/test_worktree_review.py

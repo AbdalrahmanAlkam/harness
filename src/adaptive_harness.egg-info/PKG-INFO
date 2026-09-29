@@ -1,9 +1,27 @@
 Metadata-Version: 2.4
 Name: adaptive-harness
-Version: 0.1.0
+Version: 2.0.0
 Summary: Adaptive Agent Harness: ML-routed agent execution with verification, uncertainty reasoning, and recovery
+Author: AbdalrahmanAlkam
+License-Expression: MIT
+Project-URL: Homepage, https://github.com/AbdalrahmanAlkam/harness
+Project-URL: Repository, https://github.com/AbdalrahmanAlkam/harness
+Project-URL: Issues, https://github.com/AbdalrahmanAlkam/harness/issues
+Project-URL: Changelog, https://github.com/AbdalrahmanAlkam/harness/blob/main/CHANGELOG.md
+Keywords: agent,llm,textual,tui,formal-verification,lean4,machine-learning,research
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Environment :: Console
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Operating System :: MacOS :: MacOS X
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Software Development :: Quality Assurance
 Requires-Python: >=3.12
 Description-Content-Type: text/markdown
+License-File: LICENSE
 Requires-Dist: numpy>=1.26.0
 Requires-Dist: scipy>=1.12.0
 Requires-Dist: sympy>=1.12.0
@@ -32,6 +50,7 @@ Requires-Dist: bitsandbytes>=0.43; extra == "semif-4bit"
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0.0; extra == "dev"
 Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
+Dynamic: license-file
 
 # Adaptive Agent Harness 2.0
 
@@ -95,7 +114,7 @@ Swarm mode is off by default; in `auto` it pipelines only requests that explicit
 
 Verified developer trajectories are stored in `output/experience.db`. Similar verified tasks from the same workspace can provide a bounded example before a model request. Run `adaptive-harness distill --db output/experience.db --output output/distillation --model qwen2.5-0.5b` to export an instruction JSONL dataset, LoRA config, and optional local training script. Other model choices are `qwen2.5-1.5b` and `smollm2`. Only traces marked verified success are exported.
 
-Install `pip install 'adaptive-harness[plotting]'` to enable `plot_terminal` line, scatter, and bar charts in science and benchmark tasks. The tool validates bounded finite data and prints an inline terminal chart. The sandboxed `run_python_repl` also exposes optional `plotext` as `plt` for scripts that call `plt.show()`; the optional package must be installed before use.
+Install the optional plotting extra with `pip install -e ".[plotting]"` to enable `plot_terminal` line, scatter, and bar charts in science and benchmark tasks. The tool validates bounded finite data and prints an inline terminal chart. The sandboxed `run_python_repl` also exposes optional `plotext` as `plt` for scripts that call `plt.show()`; the optional package must be installed before use.
 
 ### Running the tests
 
@@ -232,7 +251,7 @@ The **Adaptive Agent Harness 2.0** solves this by embedding **pervasive machine 
 | :--- | :--- | :--- | :--- |
 | **`SkillClassifier`** | Developer prompt, code context | `code_edit`, `run_command`, `search_explore`, `testing`, `ask_clarification`, `general_reasoning` | Activates optimal tool subset and prompt framing |
 | **`AmbiguityClassifier`** | Intent distribution entropy $H(p)$, confidence margin $\Delta p$, destructive tokens (`rm`, `drop`, `reset --hard`) | Shannon entropy $H(p) = -\sum p \log_2 p$, Margin $p_1 - p_2$, Risk: `LOW`, `MEDIUM`, `HIGH` | Opens clarification for destructive actions or explicit decision ambiguity |
-| **`ComplexityRouter`** | Task scope, vocabulary depth, architectural cues | `FAST` (Gemini Flash Lite), `STANDARD` (GLM 5.3 Flash), `REASONING` (Claude Sonnet 4) | Dynamic model selection minimizing cost and maximizing reasoning depth |
+| **`ComplexityRouter`** | Task scope, vocabulary depth, architectural cues | `FAST` (Gemini Flash Lite), `STANDARD` (your provider's default), `REASONING` (Claude Sonnet 4) | Dynamic model selection minimizing cost and maximizing reasoning depth |
 | **`VerificationClassifier`** | Execution exit codes, Python AST tracebacks, pytest failures, regex patterns | `SUCCESS`, `SYNTAX_ERROR`, `TEST_FAILURE`, `FILE_ERROR`, `RUNTIME_ERROR` | Auto-recovery routing (`AUTO_RETRY_SYNTAX_FIX`, `AUTO_RETRY_TEST_FIX`, etc.) |
 
 ---
@@ -571,7 +590,7 @@ adaptive-harness retrain
 ### Setup
 ```bash
 # 1. Clone repository
-git clone https://github.com/adaptive-agent-harness/harness.git
+git clone https://github.com/AbdalrahmanAlkam/harness.git
 cd harness
 
 # 2. Create virtual environment and activate
@@ -599,18 +618,17 @@ pytest tests/ -v
 ```
 
 ```text
-============================= 257 passed in 36.37s =============================
-tests/test_agent_and_tools.py::test_llm_client_mock_mode PASSED          [  0%]
-tests/test_agent_and_tools.py::test_run_bash_tool PASSED                 [  0%]
-tests/test_agent_and_tools.py::test_file_ops_tools PASSED                [  1%]
-tests/test_research_swarm.py::test_proof_receipt_requires_exit_zero_and_exactness PASSED
-tests/test_research_swarm.py::test_experiment_requires_a_hashed_data_artifact PASSED
-tests/test_research_swarm.py::test_ledger_chain_verifies_and_detects_tampering PASSED
-tests/test_research_swarm.py::test_loop_aborts_on_a_flapping_invariant_instead_of_spinning PASSED
-tests/test_research_swarm.py::test_solved_run_produces_a_verified_ledger_and_a_pdf PASSED
-... [strategies, benchmarks, calibration, swarm, TUI, and skills tests]
-============================= 257 passed in 36.37s ==============================
+$ pytest -m "not slow" -q
+632 passed, 17 deselected in 91.44s
+
+$ pytest -q
+649 passed in 320.20s
 ```
+
+Those are real runs of this tree. `pytest --collect-only -q` prints the same
+counts if you want to check them without spending the time. The `slow` tests
+compile a real Lean 4 toolchain and drive full research swarms; they are part of
+the default gate and are not optional before a release.
 
 The research tests are deliberately adversarial about the research machinery
 itself: they assert that a flaky invariant cannot be mistaken for progress, that

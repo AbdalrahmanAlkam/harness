@@ -19,6 +19,7 @@ from adaptive_harness.classifiers.complexity_router import ComplexityRouter, Com
 from adaptive_harness.classifiers.skill_classifier import SkillClassificationResult, SkillClassifier
 from adaptive_harness.classifiers.verification_classifier import VerificationAssessment, VerificationClassifier
 from adaptive_harness.classifiers.risk_classifier import ToolRiskClassifier
+from adaptive_harness.plugins.host import PluginHost
 from adaptive_harness.classifiers.engine import (BaseClassifierBackend, SklearnBackend, DOMAIN_LABELS,
     THINKING_LABELS, TIER_LABELS, VERIFICATION_LABELS, Classification)
 from adaptive_harness.classifiers.domain_classifier import (DomainClassifier, DomainAssessment,
@@ -311,6 +312,8 @@ class DeveloperAgent:
         prompts: PromptRegistry | None = None,
         secondary_model: str | None = None,
         filter_tool_output: bool = True,
+        plugins_enabled: bool = True,
+        allow_project_plugins: bool = False,
     ):
         if safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
             raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
@@ -337,6 +340,12 @@ class DeveloperAgent:
         self.skill_verifier = SkillVerifier()
         self.explicit_model = (None if explicit_model == "auto" else
                                explicit_model or getattr(self.llm_client, "default_model", MODEL_TIERS["standard"]))
+        # Set before any use: plugin tools are registered below, and the TUI
+        # turns discovery off for a session that wants a fixed tool surface.
+        self.plugins_enabled = plugins_enabled
+        # Project-supplied plugins run code from the repository being worked on,
+        # so they are off unless the operator asked for them.
+        self.allow_project_plugins = allow_project_plugins
         self.forced_mode = parse_domain_mode(forced_mode)
         self.forced_thinking = parse_thinking_level(forced_thinking)
         self.classifier_backend = classifier_backend or SklearnBackend()
@@ -374,6 +383,16 @@ class DeveloperAgent:
             default_tools.append(WebSearchTool())
         tools_list = tools if tools is not None else default_tools
         self.tools: Dict[str, Tool] = {t.name: t for t in tools_list}
+        # Plugins extend the tool surface without a core change. They are added
+        # only when the caller did not pass an explicit tool list: passing
+        # `tools=` is the caller taking full control of the surface, and every
+        # existing embedder, test and swarm worker does exactly that.
+        self.plugins = PluginHost(project_root=workspace_root,
+                                  allow_project_plugins=allow_project_plugins)
+        if tools is None and self.plugins_enabled:
+            self.plugins.discover()
+            for plugin_tool in self.plugins.build_tools(workspace_root):
+                self.tools.setdefault(plugin_tool.name, plugin_tool)
         self._configure_output_filter(secondary_model, filter_tool_output)
         self.swarm_enabled = False
         self.research_enabled = False
@@ -571,7 +590,17 @@ class DeveloperAgent:
     })
 
     def _is_read_only_tool(self, name: str) -> bool:
-        return name in self._READ_ONLY_TOOLS
+        """Whether a tool only observes, for the strict-profile gate.
+
+        A plugin tool answers from the risk it declared rather than from its
+        name, and defaults to mutating. Without that, a plugin could reach
+        execution by calling itself anything other than `run_bash` -- which is
+        exactly the hole the risk classifier already had for every non-shell
+        tool.
+        """
+        if name in self._READ_ONLY_TOOLS:
+            return True
+        return self.plugins.is_read_only(name)
 
     def _request_messages(self) -> List[Dict[str, Any]]:
         """The saved conversation is verbatim; request compaction is conditional."""
@@ -635,6 +664,20 @@ class DeveloperAgent:
         return interrupts
 
     def run_stream(self, user_input: str, max_steps: Optional[int] = None) -> Generator[AgentEvent, None, None]:
+        """Executes a task, yielding real-time events.
+
+        Every event is published to the plugin bus before it is yielded, so a
+        plugin observes exactly the stream the interface does. The bus is a
+        tee, not a filter: a hook can never delay, reorder or swallow what the
+        caller receives, and a hook that raises is dropped rather than being
+        allowed to break the run.
+        """
+        for event in self._run_stream_inner(user_input, max_steps):
+            if self.plugins.hook_listeners:
+                self.plugins.emit(event)
+            yield event
+
+    def _run_stream_inner(self, user_input: str, max_steps: Optional[int] = None) -> Generator[AgentEvent, None, None]:
         """Executes a task through the agentic lifecycle, yielding real-time events for the TUI."""
         start_time = time.perf_counter()
         original_input = user_input

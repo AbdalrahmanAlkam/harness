@@ -505,6 +505,62 @@ def dev(
         raise typer.Exit(code=1)
 
 
+@app.command("plugins")
+def plugins_cmd(
+    workspace: Optional[Path] = typer.Option(None, "--workspace", help="Project root to discover plugins in"),
+    with_project_plugins: bool = typer.Option(
+        False, "--with-project-plugins",
+        help="Also load plugins from <project>/.harness/plugins. These run code from "
+             "the repository, so they are off unless you ask."),
+):
+    """List installed plugins, what each contributes, and the permissions it holds.
+
+    Plugins extend the harness without editing it: a tool the model can call, a
+    skill, a setting, a prompt override, a command. Each one declares what it
+    wants permission to do, and anything it did not declare is refused.
+
+    A plugin is third-party code that runs with your privileges. Read the
+    permission line before trusting one.
+    """
+    from adaptive_harness.plugins.host import PluginHost
+
+    host = PluginHost(project_root=workspace or Path.cwd(),
+                      allow_project_plugins=with_project_plugins)
+    found = host.discover()
+    console.print(f"[bold cyan]Plugins[/bold cyan] ({len(found)} found)")
+    if not found:
+        console.print("[dim]None installed.[/dim]")
+    else:
+        for plugin in sorted(found, key=lambda item: item.name):
+            if plugin.ok:
+                granted = ", ".join(sorted(plugin.permissions)) or "none"
+                console.print(f"  [green]●[/green] [bold]{plugin.name}[/bold] {plugin.version}"
+                              f" — {plugin.description or 'no description'}")
+                console.print(f"    [dim]permissions:[/dim] {granted}")
+                counts = []
+                if plugin.tools:
+                    counts.append(f"{len(plugin.tools)} tool(s)")
+                if plugin.skills:
+                    counts.append(f"{len(plugin.skills)} skill(s)")
+                if plugin.settings:
+                    counts.append(f"{len(plugin.settings)} setting(s)")
+                if plugin.commands:
+                    counts.append(f"{len(plugin.commands)} command(s)")
+                for spec in plugin.tools:
+                    counts.append(f"{spec.name} [{spec.risk}]")
+                if counts:
+                    console.print(f"    [dim]provides:[/dim] {', '.join(counts)}")
+            else:
+                console.print(f"  [red]✗[/red] [bold]{plugin.name}[/bold] — failed to load")
+                console.print(f"    [red]{plugin.error}[/red]")
+    if host.project_plugins_skipped:
+        console.print(f"  [yellow]{host.project_plugins_skipped} plugin(s) in this project are "
+                      f"not loaded: they run code from the repository, so they need "
+                      f"--with-project-plugins.[/yellow]")
+    for message in host.load_errors:
+        console.print(f"  [yellow]{escape(message)}[/yellow]")
+
+
 @app.command()
 def prompts(
     action: str = typer.Argument("list", help="list, show NAME, export [PATH], or path"),

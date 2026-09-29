@@ -1,0 +1,30 @@
+{
+  "name": "todo-scan",
+  "version": "1.0.0",
+  "description": "Find TODO/FIXME markers in the workspace. A worked example of the plugin contract.",
+  "author": "Adaptive Agent Harness",
+  "permissions": ["tools"],
+  "tools": [
+    {
+      "name": "scan_markers",
+      "description": "List TODO, FIXME, XXX and HACK comments under a directory, with file and line.",
+      "handler": "scan_markers",
+      "risk": "read",
+      "domains": ["coding", "research"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Directory to scan. Defaults to the workspace root."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum markers to report. Defaults to 50."
+          }
+        },
+        "required": []
+      }
+    }
+  ]
+}
