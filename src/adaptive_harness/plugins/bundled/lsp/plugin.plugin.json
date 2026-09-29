@@ -1,0 +1,120 @@
+{
+  "name": "lsp",
+  "version": "1.0.0",
+  "description": "Language tooling that works with no language server installed: syntax checks with the tools on the machine, and definition/reference/hover search by parsing the workspace. Says what it did not check.",
+  "author": "Adaptive Agent Harness",
+  "permissions": ["tools", "subprocess"],
+  "tools": [
+    {
+      "name": "lsp_status",
+      "description": "Report which language servers are installed on this machine and which are not, with the path each was found at or the command that would install it. Also names what these tools can do with no server at all. Use this first when you need to know whether a real type-checked diagnostic is available, rather than assuming one is.",
+      "handler": "lsp_status",
+      "risk": "read",
+      "domains": ["coding"],
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "lsp_diagnostics",
+      "description": "Report syntax errors in one file. Python is parsed in process; JavaScript is checked with `node --check` when node is installed. If no checker exists for the file type, or node is absent, the result says the file was NOT checked -- which is not the same as clean. This is a syntax check only: no type checking, no linting, no cross-file inference. It never launches a language server.",
+      "handler": "lsp_diagnostics",
+      "risk": "exec",
+      "domains": ["coding"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The file to check, relative to the workspace or absolute inside it. Must be a file, not a directory."
+          }
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "lsp_definitions",
+      "description": "Find where a symbol is defined, by parsing the workspace -- an AST walk for Python, a bounded regular expression for other languages. Needs no language server. A regex match is reported as an unconfirmed candidate, and 'not found' means not found by a parser rather than proven absent: a definition behind a code generator or a dynamic import will not appear. For Python, results carry the signature and the docstring.",
+      "handler": "lsp_definitions",
+      "risk": "read",
+      "domains": ["coding"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "A file in the workspace. Its language decides how the search is done, and it must exist."
+          },
+          "symbol": {
+            "type": "string",
+            "description": "The name to find: a function, class, method or module-level constant."
+          },
+          "directory": {
+            "type": "string",
+            "description": "Where to search. Defaults to the nearest project root above `path` (a directory containing .git, pyproject.toml, package.json and the like), falling back to the file's own directory -- the result says which was used."
+          }
+        },
+        "required": ["path", "symbol"]
+      }
+    },
+    {
+      "name": "lsp_references",
+      "description": "Find where a symbol is used across the workspace: AST-level for Python, word-boundary text matches for other languages. Needs no language server. The limits are stated in the result -- a name reached through getattr, eval or a template will not be counted, so the count is a lower bound, not the whole truth.",
+      "handler": "lsp_references",
+      "risk": "read",
+      "domains": ["coding"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "A file in the workspace. Its language decides how the search is done, and it must exist."
+          },
+          "symbol": {
+            "type": "string",
+            "description": "The name to find uses of."
+          },
+          "directory": {
+            "type": "string",
+            "description": "Where to search. Defaults to the nearest project root above `path`."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 80,
+            "default": 40,
+            "description": "How many references to return. Capped at 80; the result says how many matched in total when it cuts the list."
+          }
+        },
+        "required": ["path", "symbol"]
+      }
+    },
+    {
+      "name": "lsp_hover",
+      "description": "Describe what is at a line of a file, read from the source: the line itself, the comment block above it, and for Python the enclosing function or class with its signature and docstring. It is a reading of the file, not a type -- nothing is inferred and no symbol table is consulted.",
+      "handler": "lsp_hover",
+      "risk": "read",
+      "domains": ["coding"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The file to read, relative to the workspace or absolute inside it."
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The 1-indexed line to describe."
+          },
+          "symbol": {
+            "type": "string",
+            "description": "Optional. The symbol you expect at that line; if it is not there, the result says so rather than describing something else."
+          }
+        },
+        "required": ["path", "line"]
+      }
+    }
+  ]
+}

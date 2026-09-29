@@ -1,0 +1,48 @@
+{
+  "name": "agents-md",
+  "version": "1.0.0",
+  "description": "Read the project's own instructions -- AGENTS.md and .harness/instructions/*.md -- in precedence order, with an @include chain. Strictly a reader: it never creates or edits a file.",
+  "author": "Adaptive Agent Harness",
+  "permissions": ["tools"],
+  "tools": [
+    {
+      "name": "memory_load",
+      "description": "Read this project's instructions and return them as one block of text: AGENTS.md first, then .harness/instructions/*.md in sorted filename order, with any @relative/path.md includes expanded. Later files are the more specific layer and win where two instructions disagree, and the header says so. Returns an honest 'this project has none' rather than an empty string. Creates and edits nothing -- call memory_check first if you want to know what exists before spending the context.",
+      "handler": "memory_load",
+      "risk": "read",
+      "domains": ["coding", "research"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The workspace root to read from. Defaults to the run's workspace. Must be a directory inside the workspace."
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 500,
+            "maximum": 200000,
+            "default": 60000,
+            "description": "How many characters of combined instructions to return. Lower it if the project has a very long AGENTS.md; the result says when it cut."
+          }
+        }
+      }
+    },
+    {
+      "name": "memory_check",
+      "description": "Report whether this project has instructions: what exists, in what precedence order, how big it is, and what is missing (a root AGENTS.md with no topic files, or topic files with no root). If there are none, it prints the scaffold a user would need to create and states plainly that the harness did NOT create it -- this tool only reads, and writing a file into a repository the user merely pointed the agent at is not something it will do unasked.",
+      "handler": "memory_check",
+      "risk": "read",
+      "domains": ["coding", "research"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The workspace root to inspect. Defaults to the run's workspace."
+          }
+        }
+      }
+    }
+  ]
+}

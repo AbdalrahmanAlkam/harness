@@ -426,6 +426,12 @@ class DeveloperAgent:
         #: path can stop rather than reporting a run that was cut short
         #: as though it had simply finished.
         self._ceiling_breach: Optional[str] = None
+        #: Classifier health. A classifier that degrades silently makes every
+        #: run quietly worse, and the cost of being worse is invisible until
+        #: someone notices the bill.
+        from adaptive_harness.models.calibration_monitor import CalibrationMonitor
+        self.calibration = CalibrationMonitor()
+        self.calibration.register('skill', 0.5)
         # The Quality Controller's per-turn state. The requirement set is the
         # ground truth for the turn; the ledger is what was actually observed
         # while answering it. Both are replaced at the start of each turn.
@@ -841,6 +847,11 @@ class DeveloperAgent:
         ranked = sorted(probabilities.items(), key=lambda item: item[1], reverse=True)
         skill_res = SkillClassificationResult(classification.label, ranked[0][1], probabilities, ranked,
                                               classification.entropy, classification.margin)
+        # Tracked, so a classifier that quietly degrades is visible rather
+        # than merely felt. The outcome is resolved at the end of the turn,
+        # once there is evidence of what the run actually did.
+        calibration_decision = self.calibration.record(
+            "skill", skill_res.primary_skill, skill_res.confidence)
         yield AgentEvent(
             event_type="skill_classification",
             payload={
@@ -1782,6 +1793,14 @@ class DeveloperAgent:
             stop_reason = "skill_verification_failed"
         if not completed and not stop_reason and step >= max_steps:
             stop_reason = "step_limit"
+        # Resolve the routing decision against what the run actually did, so
+        # the monitor learns from outcomes rather than from its own confidence.
+        if calibration_decision is not None and calibration_decision.resolved is False:
+            self.calibration.resolve(
+                calibration_decision, "code_edit" if successful_mutations else "general_reasoning")
+        for drift in self.calibration.adjust_all():
+            yield AgentEvent("classifier_drift", drift)
+
         total_wall_ms = (time.perf_counter() - start_time) * 1000.0
         if self.repository is not None and completed and cache_eligible and cache_dependencies and final_answer:
             try:

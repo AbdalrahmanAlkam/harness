@@ -106,6 +106,12 @@ assert something that had not happened. Those are the substantive changes:
   to stdout so Rich cannot wrap it into something unparsable. `--max-cost` and
   `--max-turns` halt a run deterministically with an attributed stop reason
   instead of an unexplained truncation.
+- **Classifier self-calibration.** Every routing decision is tracked against
+  what the run actually did, and a decision threshold is adjusted within
+  bounded limits to hold a target accuracy. Drift is emitted as an event rather
+  than logged, because a log line nobody reads is not a signal. A classifier
+  that degrades silently makes every run quietly worse, and the cost of being
+  worse is invisible until someone notices the bill.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.
