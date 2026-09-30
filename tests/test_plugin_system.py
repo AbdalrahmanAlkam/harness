@@ -27,10 +27,9 @@ def _project(tmp_path: Path) -> Path:
 def _host(tmp_path: Path, *, bundled: bool = True) -> PluginHost:
     """A host for the fixture project, with the bundled example isolated.
 
-    The bundled example plugin ships with the package, so it is discovered for
-    every project. These tests assert about their own fixtures, so discovery is
-    narrowed to the project directory -- which the opt-in gate would otherwise
-    refuse -- and the bundled root is dropped by default.
+    The core ships with no plugins, so a host pointed at a fixture project
+    discovers nothing by default. These tests narrow discovery to the project
+    directory they are building.
     """
     host = PluginHost(project_root=tmp_path, allow_project_plugins=True)
     if not bundled:
@@ -373,10 +372,14 @@ def test_reserved_names_cannot_be_shadowed_by_the_registry():
 # --- the plugin that ships with the package --------------------------------
 
 
-def test_the_bundled_example_plugin_loads_and_is_contained(tmp_path: Path):
+def test_the_example_plugin_loads_and_is_contained(tmp_path: Path):
     """The example is documentation that executes. It must work, and it must
     hold the same containment guarantee as any other plugin."""
+    # The core ships with no plugins; point discovery at where this one is.
+    from plugin_paths import plugin_path
+
     host = PluginHost(project_root=tmp_path)
+    host.discovery_roots = lambda: [plugin_path("todo-scan").parent]
     plugins = host.discover()
     bundled = [plugin for plugin in plugins if plugin.name == "todo-scan"]
     assert bundled and bundled[0].ok, bundled[0].error if bundled else "not discovered"

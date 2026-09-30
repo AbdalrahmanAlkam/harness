@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from adaptive_harness.plugins.host import PluginHost
+from plugin_paths import plugin_path  # noqa: E402
 
 #: The one environment variable the plugin reads. Every test points it at
 #: tmp_path so a run of the suite cannot touch a real task list.
@@ -87,6 +88,8 @@ class Tasklist:
 
 def load(project_root: Path, state_file: Path) -> PluginHost:
     host = PluginHost(project_root=project_root)
+    # The core ships with no plugins; point discovery at this plugin.
+    host.discovery_roots = lambda: [plugin_path("tasklist").parent]
     host.discover()
     return host
 

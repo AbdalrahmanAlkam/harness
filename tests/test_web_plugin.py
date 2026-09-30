@@ -1,4 +1,4 @@
-"""The bundled web plugin: the guard, the cap, and the conversion.
+"""The web plugin: the guard, the cap, and the conversion.
 
 Nothing here touches the network. Every test that would otherwise open a
 socket gets a fake: ``_FETCHER`` is replaced with a stub, ``build_opener``
@@ -21,8 +21,10 @@ from urllib.error import HTTPError
 
 import pytest
 
-BUNDLED_DIR = (Path(__file__).resolve().parents[1] / "src" / "adaptive_harness"
-               / "plugins" / "bundled" / "web")
+# The core ships with no plugins, so the path is resolved rather than assumed.
+from plugin_paths import plugin_path  # noqa: E402
+
+BUNDLED_DIR = plugin_path("web")
 MANIFEST_PATH = BUNDLED_DIR / "plugin.plugin.json"
 
 #: A public address, so a test that is about something other than resolution
@@ -863,6 +865,7 @@ def test_the_plugin_loads_through_the_host():
     from adaptive_harness.plugins.host import PluginHost
 
     host = PluginHost(project_root=".")
+    host.discovery_roots = lambda: [BUNDLED_DIR.parent]
     host.discover()
     plugin = next(p for p in host.plugins if p.name == "web")
     assert plugin.ok, plugin.error
@@ -873,6 +876,7 @@ def test_both_tools_are_registered_with_net_risk():
     from adaptive_harness.plugins.host import PluginHost
 
     host = PluginHost(project_root=".")
+    host.discovery_roots = lambda: [BUNDLED_DIR.parent]
     host.discover()
     plugin = next(p for p in host.plugins if p.name == "web")
     tools = {tool.name: tool for tool in plugin.tools}
@@ -910,6 +914,7 @@ def test_the_tools_run_through_the_host_adapter(tmp_path):
     from adaptive_harness.plugins.host import PluginHost
 
     host = PluginHost(project_root=tmp_path)
+    host.discovery_roots = lambda: [BUNDLED_DIR.parent]
     host.discover()
     tools = {tool.name: tool for tool in host.build_tools(tmp_path)}
     assert "web_fetch" in tools

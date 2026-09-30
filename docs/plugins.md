@@ -63,10 +63,33 @@ Beyond the declared grant, three things are enforced regardless:
 sandbox. A plugin holding `subprocess` can do what any Python program can. That
 is the honest limit, which is why the permission is listed rather than assumed.
 
+## The core ships with none
+
+An install of the harness is a working agent and nothing else. Every extra
+capability is something you choose, because a toolbelt nobody chose and cannot
+find is the most common way an agent product feels cluttered.
+
+```bash
+adaptive-harness plugin available   # what there is, and why each exists
+adaptive-harness plugin install web  # add one
+adaptive-harness plugin list        # what you have
+adaptive-harness plugin uninstall web
+```
+
+`install` takes an official name or any path, validates before copying, and
+never overwrites without `--overwrite`. It copies rather than references, so a
+plugin installed from a git checkout keeps working when the checkout moves.
+
+**There is no privileged tier.** An official plugin installs into the same
+directory as a community one and is trusted exactly as much, because a plugin
+that deserves more trust belongs in the core and one that does not is whatever
+it says on its tin.
+
 ## Layout
 
 A plugin is a directory containing a manifest and, if it needs any code, a
-Python file:
+Python file. The manifest may be named `plugin.plugin.json` or after the plugin
+itself (`web.plugin.json`); any `*.plugin.json` is read.
 
 ```
 ~/.config/adaptive-harness/plugins/
@@ -75,12 +98,12 @@ Python file:
     └── plugin.py
 ```
 
-Three roots are searched, in increasing precedence, so a project can override
-something you installed globally:
+Two roots are searched, in increasing precedence:
 
-1. the bundled `src/adaptive_harness/plugins/bundled/`,
-2. `~/.config/adaptive-harness/plugins/`,
-3. `<project>/.harness/plugins/`.
+1. `~/.config/adaptive-harness/plugins/` — installed plugins, ours and the
+   community's alike.
+2. `<project>/.harness/plugins/` — a repository's own, opt-in, because a
+   repository you merely cloned must not be able to run code.
 
 **Root 3 is off unless you turn it on.** This is a coding agent that people
 point at repositories they did not write, so a repository you have merely

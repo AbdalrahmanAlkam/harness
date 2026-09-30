@@ -121,7 +121,9 @@ def test_validation_reports_a_handler_the_module_does_not_define(tmp_path: Path)
 
 def test_a_missing_manifest_is_an_error(tmp_path: Path):
     report = validate(tmp_path)
-    assert not report.ok and "plugin.plugin.json" in report.errors[0]
+    # Any *.plugin.json is accepted, so the message names the pattern rather
+    # than one fixed filename.
+    assert not report.ok and "*.plugin.json" in report.errors[0]
 
 
 def test_unparseable_json_is_an_error(tmp_path: Path):

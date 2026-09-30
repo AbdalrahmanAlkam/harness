@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from adaptive_harness.plugins.host import PluginHost
+from plugin_paths import plugin_path  # noqa: E402
 
 #: Resolved at import, before any fixture clears PATH. The fixture below
 #: deliberately removes every language server from PATH, so a test that wants
@@ -87,6 +88,7 @@ def lsp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Lsp:
     monkeypatch.setenv("PATH", str(empty_bin))
     monkeypatch.delenv("ADAPTIVE_HARNESS_LSP_SERVER", raising=False)
     host = PluginHost(project_root=tmp_path)
+    host.discovery_roots = lambda: [plugin_path("lsp").parent]
     host.discover()
     return Lsp(host)
 

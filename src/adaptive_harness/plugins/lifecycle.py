@@ -71,10 +71,16 @@ def validate(path: Path | str, *, import_module: bool = False) -> ValidationRepo
         directory = directory.parent if directory.suffix == ".json" else directory
     report = ValidationReport(path=directory)
 
+    # Any *.plugin.json will do. Requiring one exact filename meant a manifest
+    # named after the plugin -- the natural thing to do -- failed validation while
+    # discovery happily loaded it, so the two disagreed about what a plugin is.
     manifest_path = directory / MANIFEST_NAME
     if not manifest_path.is_file():
-        report.errors.append(f"no {MANIFEST_NAME} in {directory}")
-        return report
+        candidates = sorted(directory.glob("*.plugin.json"))
+        if not candidates:
+            report.errors.append(f"no *.plugin.json in {directory}")
+            return report
+        manifest_path = candidates[0]
 
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

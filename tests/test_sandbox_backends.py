@@ -23,8 +23,10 @@ import pytest
 
 from adaptive_harness.plugins.host import PluginHost
 
-PLUGIN_DIRECTORY = (Path(__file__).resolve().parents[1]
-                    / "src" / "adaptive_harness" / "plugins" / "bundled" / "sandbox")
+# The core ships with no plugins, so the path is resolved rather than assumed.
+from plugin_paths import plugin_path  # noqa: E402
+
+PLUGIN_DIRECTORY = plugin_path("sandbox")
 
 
 def _plugin_module():
@@ -50,7 +52,10 @@ sandbox = _plugin_module()
 
 
 def test_the_plugin_loads_and_declares_what_it_actually_uses(tmp_path: Path):
+    # The core ships with no plugins, so discovery is pointed at the directory
+    # this plugin actually lives in.
     host = PluginHost(project_root=tmp_path)
+    host.discovery_roots = lambda: [PLUGIN_DIRECTORY.parent]
     host.discover()
     plugin = next(p for p in host.plugins if p.name == "sandbox")
     assert plugin.ok, plugin.error

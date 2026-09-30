@@ -590,6 +590,8 @@ def dev(
 
 #: Plugin lifecycle. A plugin is a directory under one of the discovery roots,
 #: so these commands take a path and operate on it directly.
+from adaptive_harness.plugins.registry import OFFICIAL as _OFFICIAL
+
 plugin_app = typer.Typer(
     help="Create, validate, and package plugins.",
 )
@@ -651,6 +653,80 @@ def plugin_pack(
         console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(1) from exc
     console.print(f"[green]Packed[/green] {archive}")
+
+
+@plugin_app.command("install")
+def plugin_install(
+    name: str = typer.Argument(..., help="Official plugin name, or a path to a plugin directory"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Replace an installed plugin of the same name"),
+):
+    """Install a plugin. The core ships with none, so this is how capabilities arrive.
+
+    An official plugin name is looked up in the bundled `plugins/` directory that
+    ships beside the harness; any other argument is treated as a path. The
+    manifest is validated first, and validation parses the module rather than
+    importing it -- deciding whether to trust something and running it are
+    different acts.
+    """
+    from adaptive_harness.plugins.registry import InstallError, Registry, find_official
+
+    registry = Registry()
+    candidate = Path(name).expanduser()
+    if not candidate.is_dir():
+        found = find_official(name, _official_plugin_paths())
+        if found is None:
+            console.print(f"[red]No official plugin named {name!r}, and no such directory.[/red]")
+            console.print("[dim]Official plugins:[/dim] "
+                          + ", ".join(sorted(item["name"] for item in _OFFICIAL)))
+            raise typer.Exit(1)
+        candidate = found
+    try:
+        installed = registry.install(candidate, overwrite=overwrite)
+    except InstallError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]Installed[/green] {installed.name}")
+    console.print("[dim]Restart the harness, or it will load on next start.[/dim]")
+
+
+@plugin_app.command("uninstall")
+def plugin_uninstall(name: str = typer.Argument(..., help="Installed plugin name")):
+    """Remove an installed plugin."""
+    from adaptive_harness.plugins.registry import Registry
+
+    if Registry().uninstall(name):
+        console.print(f"[green]Removed[/green] {name}")
+        return
+    console.print(f"[yellow]{name} is not installed.[/yellow]")
+    raise typer.Exit(1)
+
+
+@plugin_app.command("available")
+def plugin_available():
+    """List the official plugins and why each one exists.
+
+    Nothing here is installed by default. The harness is a working agent with
+    no extras; a capability is something you choose, not something you inherit.
+    """
+    for item in _OFFICIAL:
+        console.print(f"  [bold]{item['name']}[/bold] — {item['summary']}")
+        console.print(f"    [dim]{item['why']}[/dim]")
+    console.print("[dim]Install one with: adaptive-harness plugin install <name>[/dim]")
+
+
+def _official_plugin_paths() -> list[Path]:
+    """Where the bundled official plugins live, if this checkout has them.
+
+    They are outside the installed package on purpose -- the core ships with no
+    plugins -- so a pip install finds none, and a checkout offers them for
+    anyone who wants to try one.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "plugins"
+        if candidate.is_dir() and any(candidate.glob("*/*.plugin.json")):
+            return [candidate]
+    return []
 
 
 @plugin_app.command("list")

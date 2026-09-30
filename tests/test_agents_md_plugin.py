@@ -32,6 +32,7 @@ from typing import Any
 import pytest
 
 from adaptive_harness.plugins.host import PluginHost
+from plugin_paths import plugin_path  # noqa: E402
 
 AGENTS_MD = """\
 # Project rules
@@ -72,6 +73,7 @@ class AgentsMd:
 
 def _load(workspace: Path) -> AgentsMd:
     host = PluginHost(project_root=workspace)
+    host.discovery_roots = lambda: [plugin_path("agents-md").parent]
     host.discover()
     return AgentsMd(host)
 

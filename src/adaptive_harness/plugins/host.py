@@ -153,6 +153,39 @@ class LoadedPlugin:
         return not self.error
 
 
+def discovery_roots_for(project_root: Path | str, *,
+                        allow_project_plugins: bool = False) -> List[Path]:
+    """Where plugins are looked for, in increasing precedence.
+
+    **The core ships with none.** An install of the harness is a working agent
+    and nothing else: every capability beyond that is opt-in, so a user is never
+    handed a tool they do not want and cannot find. Official plugins live in a
+    sibling ``plugins/`` directory and are installed into the user root, the
+    same place a third-party plugin goes -- there is no privileged tier,
+    because a community plugin deserves the same permissions and the same
+    scrutiny as one we wrote.
+
+    1. ``~/.config/adaptive-harness/plugins/`` -- installed plugins, ours and
+       the community's alike.
+    2. ``<project>/.harness/plugins/`` -- a repository's own, opt-in, because a
+       repository you merely cloned must not be able to run code.
+    """
+    roots = [Path(DEFAULT_CONFIG_DIR) / "plugins"]
+    project_plugins = Path(project_root) / ".harness" / "plugins"
+    if allow_project_plugins:
+        roots.append(project_plugins)
+    return [root for root in roots if root.is_dir()]
+
+
+def _count_project_plugins(project_root: Path | str) -> int:
+    """How many plugins a project is carrying that were not loaded."""
+    directory = Path(project_root) / ".harness" / "plugins"
+    if not directory.is_dir():
+        return 0
+    return sum(1 for path in directory.iterdir()
+               if path.is_dir() and list(path.glob("*.plugin.json")))
+
+
 class PluginHost:
     """Discovers plugins and answers what the core asks it.
 
@@ -179,16 +212,13 @@ class PluginHost:
     # -- discovery ---------------------------------------------------------
 
     def discovery_roots(self) -> List[Path]:
-        roots = [Path(__file__).resolve().parent.parent / "plugins" / "bundled",
-                 Path(DEFAULT_CONFIG_DIR) / "plugins"]
-        project_root = self.project_root / ".harness" / "plugins"
-        if self.allow_project_plugins:
-            roots.append(project_root)
-        elif project_root.is_dir():
-            self.project_plugins_skipped = sum(
-                1 for path in project_root.iterdir()
-                if path.is_dir() and list(path.glob("*.plugin.json")))
-        return [root for root in roots if root.is_dir()]
+        before = self.project_plugins_skipped
+        roots = discovery_roots_for(self.project_root,
+                                   allow_project_plugins=self.allow_project_plugins)
+        # A project full of plugins that were refused is a user left wondering
+        # why, so the count is surfaced rather than swallowed.
+        self.project_plugins_skipped = max(before, _count_project_plugins(self.project_root))
+        return roots
 
     def discover(self) -> List[LoadedPlugin]:
         """Load every plugin found, never raising.

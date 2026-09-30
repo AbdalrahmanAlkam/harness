@@ -69,9 +69,9 @@ Changelog = "https://github.com/AbdalrahmanAlkam/harness/blob/main/CHANGELOG.md"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The core deliberately ships no plugin data. Capabilities are installed, so a
+# user is never handed a tool they did not choose and cannot find.
 [tool.setuptools.package-data]
-# The bundled example plugin is data the package ships, not a subpackage.
-"adaptive_harness.plugins" = ["bundled/*/*.json", "bundled/*/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

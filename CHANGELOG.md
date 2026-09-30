@@ -123,6 +123,12 @@ assert something that had not happened. Those are the substantive changes:
   references, hover and diagnostics with no language server installed, and says
   so rather than pretending. `agents-md` loads `AGENTS.md` and
   `.harness/instructions/*.md` as a pure reader — it never writes to them.
+- **The core ships with no plugins.** An install is a working agent and nothing
+  else; every extra capability is something you choose. Official plugins live
+  beside the harness and install with `adaptive-harness plugin install <name>`,
+  which validates before copying and never overwrites silently. There is no
+  privileged tier — an official plugin lands in the same directory as a
+  community one and is trusted exactly as much.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.
