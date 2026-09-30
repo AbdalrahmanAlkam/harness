@@ -137,7 +137,7 @@ SESSION_SETTING_KEYS = (
 )
 
 COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/steps", "/prompts", "/safety", "/classifier", "/new",
-            "/context", "/memory", "/doctor",
+            "/context", "/memory", "/agents", "/doctor",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
             "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export",
             "/diff", "/isolation", "/swarm", "/settings")
@@ -167,6 +167,7 @@ COMMAND_DESCRIPTIONS = {
     "/session": "Load or save a session",
     "/usage": "Show token usage and cost",
     "/context": "Show the context budget: what is held, what was admitted, what was not",
+    "/agents": "Show every subagent: id, status, tool calls, tokens, elapsed",
     "/memory": "Durable memory: list, accept <id>, forget <id>, clear",
     "/doctor": "Check that this installation can do what it claims",
     "/skills": "Browse installed skills",
@@ -458,6 +459,11 @@ class AdaptiveHarnessApp(App):
             self.session = self.session_store.create(self.workspace_root)
         self.skill_catalog = SkillCatalog(self.workspace_root)
         self._busy = False
+        # One place every subagent the session spawns is tracked, so a run with
+        # several in flight can be watched, named, and accounted for.
+        from adaptive_harness.agent.subagents import SubagentRegistry
+
+        self.subagents = SubagentRegistry()
         self._show_telemetry = True
         self._last_tool_output = ""
         self._last_agent_content = ""
@@ -1977,6 +1983,9 @@ class AdaptiveHarnessApp(App):
             self._show_context()
         elif cmd == "/memory":
             self._show_memory(arg)
+        elif cmd == "/agents":
+            self.query_one("#chat-log", RichLog).write(
+                Text(self.subagents.describe(), style="dim"))
         elif cmd == "/doctor":
             self._show_doctor()
         elif cmd == "/copy":
@@ -2177,21 +2186,59 @@ class AdaptiveHarnessApp(App):
             pass
 
     def _render_subagent_event(self, event) -> None:
+        """Render a subagent lifecycle event.
+
+        The old shape was a one-line text dump per tool call, so a run with three
+        subagents interleaved into a wall of `⇢` with no way to tell whose work
+        you were reading. Now the agent id is on every line and the activity is
+        nested under the agent that produced it.
+        """
+        p = event.payload or {}
+        et = event.event_type
+        if et == "agent_spawned":
+            indent = "  " * (int(p.get("depth", 0)) + 1)
+            self.query_one("#chat-log", RichLog).write(Text(
+                f"{indent}⏺ {BULLET} {p.get('agentId', '?')} · {p.get('role', '?')} · "
+                f"{p.get('description', '')[:100]}", style="dim cyan"))
+        elif et == "agent_completed":
+            indent = "  " * (int(p.get("depth", 0)) + 1)
+            status = p.get("status", "?")
+            tools = len(p.get("tools") or [])
+            style = "dim green" if status == "completed" else "dim red"
+            if p.get("error"):
+                self.query_one("#chat-log", RichLog).write(Text(
+                    f"{indent}✗ {p.get('agentId', '?')} {status} after "
+                    f"{tools} tool(s) in {(p.get('elapsed_ms') or 0) / 1000:.1f}s"
+                    f" — {str(p.get('error'))[:120]}", style="dim red"))
+            else:
+                self.query_one("#chat-log", RichLog).write(Text(
+                    f"{indent}● {p.get('agentId', '?')} {status} · {tools} tool(s) · "
+                    f"{(p.get('elapsed_ms') or 0) / 1000:.1f}s", style=style))
+        elif et in {"tool_call", "tool_result", "prompt_injection", "response"}:
+            self._render_subagent_detail(et, p)
+
+    def _render_subagent_detail(self, et: str, p: dict) -> None:
+        """One line of subagent activity, attributed and indented."""
         log = self.query_one("#chat-log", RichLog)
-        et, p = event.event_type, event.payload
+        agent_id = p.get("agentId", "")
+        indent = "  " * (int(p.get("depth", 0)) + 2)
         if et == "tool_call":
-            log.write(Text(f"⇢ subagent tool call: {p.get('name')} {json.dumps(p.get('arguments', {}), ensure_ascii=False)[:160]}",
-                           style="dim cyan"))
+            target = p.get("arguments", {}) or {}
+            detail = ""
+            for key in ("path", "file_path", "command", "query", "url"):
+                value = target.get(key)
+                if isinstance(value, str) and value.strip():
+                    detail = " " + " ".join(value.split())[:56]
+                    break
+            log.write(Text(f"{indent}⏺ {p.get('name', '?')}{detail}"
+                           + (f"  [{agent_id}]" if agent_id else ""), style="dim"))
         elif et == "tool_result":
-            log.write(Text(f"⇢ subagent result: {p.get('name')} "
-                           f"{'ok' if p.get('success') else 'failed: ' + str(p.get('error') or '')[:160]}",
-                           style="dim cyan"))
+            status = "ok" if p.get("success") else "failed"
+            log.write(Text(f"{indent}  → {status}", style="dim red" if not p.get("success") else "dim green"))
         elif et == "prompt_injection":
-            log.write(Text(f"⇢ subagent prompt injected ({p.get('source')}): {str(p.get('content'))[:200]}",
-                           style="dim yellow"))
+            log.write(Text(f"{indent}⇢ prompt ({p.get('source', '?')})", style="dim yellow"))
         elif et == "response":
-            log.write(Text(f"⇢ subagent finished ({p.get('stop_reason') or 'completed'})",
-                           style="dim cyan"))
+            log.write(Text(f"{indent}  ({p.get('stop_reason') or 'done'})", style="dim"))
 
     def _prepare_swarm_telemetry(self, task_text: str) -> None:
         self._activity = "Preparing swarm"
@@ -2278,7 +2325,7 @@ class AdaptiveHarnessApp(App):
                 coordinator = SwarmCoordinator(DeveloperAgentWorker(llm_client_factory=self._swarm_client,
                     max_steps=self.agent.max_steps, step_policy=self.agent.step_policy,
                     repository=self.agent.repository, safety_profile=self.agent.safety_profile,
-                    on_event=self._subagent_event),
+                    on_event=self._subagent_event, registry=self.subagents),
                     on_status=lambda status: self.call_from_thread(self._swarm_status_changed, dict(status)))
                 report = coordinator.run(task_text, isolated.workspace if isolated else self.workspace_root,
                                          isolated=bool(isolated))

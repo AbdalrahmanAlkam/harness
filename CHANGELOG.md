@@ -139,6 +139,15 @@ assert something that had not happened. Those are the substantive changes:
   changes. A reset that leaves the prompt overridden — because a second file
   also overrides it — says so instead of reporting a success that did not
   happen.
+- **Named, watchable subagents.** Every subagent now has a short readable id
+  (`agent_7f3a`) carried on every one of its events, so a run with several in
+  flight can be read, referred to, and accounted for. `agent_spawned` and
+  `agent_completed` events carry the parent, so the whole agent tree can be
+  rebuilt from the event stream alone. `/agents` reports status, tool counts,
+  tokens and elapsed time for every agent without the run having been watched.
+  A subagent's chatter is no longer replayed into the parent: what comes back is
+  a bounded ledger, which is the difference between paying for a summary once
+  and paying for it on every later request.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.

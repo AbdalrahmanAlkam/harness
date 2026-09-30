@@ -80,6 +80,9 @@ class SwarmResult:
     artifacts: Mapping[str, Any] = field(default_factory=dict)
     verified: bool = False
     error: str | None = None
+    #: The subagent id this ran as, so a caller can correlate the result with
+    #: what it saw on screen. None when the run was not monitored.
+    agent_id: str | None = None
 
     @property
     def key(self) -> str:
@@ -89,7 +92,7 @@ class SwarmResult:
         return {"role": self.role.value, "phase": self.phase.value,
                 "success": self.success, "summary": self.summary,
                 "artifacts": dict(self.artifacts), "verified": self.verified,
-                "error": self.error}
+                "error": self.error, "agent_id": self.agent_id}
 
 
 @dataclass(frozen=True)
@@ -281,7 +284,8 @@ class DeveloperAgentWorker:
                  write_target: Path | Sequence[Path] | None = None,
                  system_prompt: str | None = None,
                  on_event: Callable[[Any], None] | None = None,
-                 budget_tokens: int | None = None) -> None:
+                 budget_tokens: int | None = None,
+                 registry: Any = None, parent_id: str = "main") -> None:
         if max_steps is not None and max_steps < 1:
             raise ValueError("max_steps must be positive")
         self.llm_client_factory = llm_client_factory
@@ -300,6 +304,11 @@ class DeveloperAgentWorker:
         self.write_target = write_target
         self.system_prompt = system_prompt
         self.on_event = on_event
+        # Lifecycle monitoring. Without it a subagent is an anonymous burst of
+        # tool calls; with it the same run is a named, watchable, stoppable
+        # agent that reports what it cost.
+        self.registry = registry
+        self.parent_id = parent_id
         # Per-assignment token ceiling. The research swarm passes one so a run
         # has a bound on what it can spend; None means unbounded, which is only
         # appropriate for a single interactive task.
@@ -388,7 +397,27 @@ class DeveloperAgentWorker:
         response: dict[str, Any] = {}
         evidence: list[dict[str, Any]] = []
         spent_tokens = 0
+
+        # Register as a subagent so a swarm run is monitored the same way a
+        # single delegation is. The id is on every event this worker emits,
+        # which is what lets the interface show whose work you are reading.
+        record = None
+        reporter = None
+        if self.registry is not None:
+            from adaptive_harness.agent.agent import AgentEvent
+            from adaptive_harness.agent.subagents import (
+                SubagentReporter, complete_event, spawn_event)
+
+            record = self.registry.spawn(parent_id=self.parent_id,
+                                         role=assignment.role.value,
+                                         description=assignment.directive.strip()[:120])
+            reporter = SubagentReporter(self.registry)
+            if self.on_event is not None:
+                self.on_event(AgentEvent("agent_spawned", spawn_event(record)))
+
         for event in agent.run_stream(prompt, max_steps=self.max_steps):
+            if reporter is not None and record is not None:
+                reporter.on_event(record.id, event)
             if self.on_event is not None:
                 self.on_event(event)
             if event.event_type == "response":
@@ -432,6 +461,14 @@ class DeveloperAgentWorker:
         error = ("Model refused the assigned role" if refused else
                  None if success else
                  f"Subagent run did not complete (stop reason: {stop_reason or 'unknown'})")
+        if record is not None and self.registry is not None:
+            from adaptive_harness.agent.subagents import complete_event
+
+            self.registry.complete(record.id, result=summary, error=error or "",
+                                   stop_reason=stop_reason or "")
+            if self.on_event is not None:
+                self.on_event(AgentEvent("agent_completed", complete_event(record)))
         return SwarmResult(assignment.role, assignment.phase, success,
             summary,
-            {"tool_evidence": evidence, "stop_reason": stop_reason}, verified, error=error)
+            {"tool_evidence": evidence, "stop_reason": stop_reason}, verified, error=error,
+            agent_id=record.id if record else None)
