@@ -31,7 +31,9 @@ NAME_GUTTER = 2
 
 #: Shown next to a prompt whose text is overridden, and counted in the width
 #: budget so an overridden row is not the one that wraps.
-OVERRIDE_FLAG = " *overridden"
+#: Padded to a fixed column so the flag lines up rather than trailing the
+#: preview, where a long line pushes it out of view.
+OVERRIDE_FLAG = "*edited"
 
 #: How each group is headed. The heading is the useful part: it says when the
 #: prompt can reach a model, which a flat alphabetical list does not.
@@ -74,6 +76,10 @@ class Row:
     preview: str
     size: int
     overridden: bool
+    #: Whether this width can afford the `*edited` column. Zero means the flag
+    #: is not shown, rather than stealing width from the preview.
+    flag_budget: int = 0
+    name_width: int = 0
 
     @property
     def marker(self) -> str:
@@ -133,9 +139,21 @@ def build_rows(registry, width: int | None = None, console=None) -> List[Row]:
     name_width = max((len(name) for name in registry.names()), default=20)
     name_width = max(name_width, 20)
     # 2 indent + name + 2 gutter + ">6c  " (the size column) + the override flag.
-    size_budget = 8 if layout - (2 + name_width + 2) > MIN_PREVIEW_WIDTH + 8 else 0
-    fixed = 2 + name_width + 2 + size_budget + len(OVERRIDE_FLAG)
-    preview_width = max(MIN_PREVIEW_WIDTH, layout - fixed)
+    size_field_width = len("000000c  ")   # the size column, as printed
+    size_budget = size_field_width if (
+        layout - (2 + name_width + 2) > MIN_PREVIEW_WIDTH + size_field_width) else 0
+    # The flag column is reserved only when it is actually affordable; a column
+    # that is always paid for but only used occasionally steals preview width.
+    flag_field_width = len(OVERRIDE_FLAG) + 1   # the flag, plus its separator
+    flag_budget = flag_field_width if (
+        layout - (2 + name_width + 2 + size_budget) > MIN_PREVIEW_WIDTH
+        + flag_field_width) else 0
+    fixed = 2 + name_width + 2 + size_budget + flag_budget
+    # The floor yields to a narrow terminal. A minimum preview that overruns
+    # the available width is just a wrap: the whole point of the budget is that
+    # a row is one line.
+    preview_width = max(0, min(max(MIN_PREVIEW_WIDTH, layout - fixed),
+                               layout - fixed))
 
     # Below this width the name column alone fills the line, so the size column
     # is dropped rather than the preview being cut to an ellipsis -- a prompt
@@ -148,7 +166,9 @@ def build_rows(registry, width: int | None = None, console=None) -> List[Row]:
         rows.append(Row(name=name,
                         preview=truncate(collapse(text), preview_width),
                         size=len(text) if show_size else 0,
-                        overridden=registry.is_overridden(name)))
+                        overridden=registry.is_overridden(name),
+                        flag_budget=flag_budget,
+                        name_width=name_width))
     return rows
 
 
@@ -175,10 +195,9 @@ def group_rows(rows: Iterable[Row]) -> List[Tuple[str, str, List[Row]]]:
 
 def render(registry, width: int | None = None, console=None) -> List[str]:
     """The whole listing as plain lines, so it can be printed or asserted on."""
-    rows = build_rows(registry, width, console)
+    rows = build_rows(registry, width, console)  # each row carries its budget
     layout = terminal_width(console) if width is None else width
     groups = group_rows(rows)
-    name_width = max((len(row.name) for row in rows), default=20)
     lines: List[str] = []
     for index, (heading, blurb, members) in enumerate(groups):
         if index:
@@ -190,6 +209,8 @@ def render(registry, width: int | None = None, console=None) -> List[str]:
         for row in members:
             flag = OVERRIDE_FLAG if row.overridden else ""
             size_field = f"{row.size:>6}c  " if row.size else ""
-            lines.append(f"  {row.name.ljust(name_width)}  "
-                         f"{size_field}{row.preview}{flag}")
+            flag_field = (f"{flag:<{row.flag_budget}}"
+                          if row.flag_budget else (flag and ""))
+            lines.append(f"  {row.name.ljust(row.name_width)}  "
+                         f"{size_field}{flag_field}{row.preview}")
     return lines

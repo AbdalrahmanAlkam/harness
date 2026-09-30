@@ -898,12 +898,28 @@ def plugins_cmd(
 
 @app.command()
 def prompts(
-    action: str = typer.Argument("list", help="list, show NAME, export [PATH], or path"),
-    name: str = typer.Argument("", help="Prompt name for `show`, or destination file for `export`"),
+    action: str = typer.Argument(
+        "list", help="list, show NAME, edit NAME, reset NAME, reset --all, "
+                     "export [PATH], or path"),
+    name: str = typer.Argument("", help="Prompt name, or destination file for `export`"),
+    scope: str = typer.Option(
+        "here", "--scope",
+        help="`here` writes into the current project when you are in one, "
+             "otherwise into your user config. `user` always writes to the user "
+             "config; `project` requires a project."),
 ):
-    """Inspect and customize every prompt the models receive."""
+    """Inspect and customize every prompt the models receive.
+
+    `edit` opens a prompt in $EDITOR and saves it as an override; `reset` puts a
+    prompt, or all of them, back to the built-in text. An override file is the
+    only thing `reset` touches -- the built-in prompts in the source are never
+    modified, so an upgrade never fights with your changes.
+    """
     from adaptive_harness.prompts import PromptRegistry, get_default_registry, DEFAULT_CONFIG_DIR
-    registry = get_default_registry()
+    # Load with the workspace, not the shared user-only registry: `prompts
+    # show` and `prompts list` are the audit view, and an audit view that
+    # silently omits the project's own overrides is worse than useless.
+    registry = PromptRegistry.for_workspace(Path.cwd())
     override_paths = [Path(DEFAULT_CONFIG_DIR) / "prompts.json",
                       Path(".harness") / "prompts.json",
                       Path(os.environ["ADAPTIVE_PROMPTS_FILE"]) if os.getenv("ADAPTIVE_PROMPTS_FILE") else None]
@@ -934,6 +950,58 @@ def prompts(
             console.print(Text(registry.get(name)))
         except KeyError as exc:
             raise typer.BadParameter(str(exc), param_hint="name") from exc
+    elif action == "edit":
+        from adaptive_harness.prompts_edit import PromptEditError, edit_prompt, sources_for
+
+        if not name:
+            raise typer.BadParameter("edit requires a prompt name", param_hint="NAME")
+        if name not in registry.names():
+            known = ", ".join(sorted(registry.names())[:6])
+            raise typer.BadParameter(
+                f"no prompt named {name!r}. Try `prompts list`; some names: {known}, ...",
+                param_hint="NAME")
+        workspace = Path.cwd() if scope != "user" else None
+        try:
+            if scope == "project" and workspace is None:
+                raise PromptEditError("--scope project needs to be run inside a project.")
+            destination, changed = edit_prompt(name, registry.get(name), workspace)
+        except PromptEditError as exc:
+            console.print(f"[red]{escape(str(exc))}[/red]")
+            raise typer.Exit(1) from exc
+        if changed:
+            console.print(f"[green]Saved[/green] {name} to {destination}")
+            others = [entry.path for entry in sources_for(name, workspace)]
+            if len(others) > 1:
+                console.print(f"[yellow]Also overridden in "
+                              f"{', '.join(str(path) for path in others)}; "
+                              f"that copy takes precedence.[/yellow]")
+        else:
+            console.print("[dim]No change made.[/dim]")
+    elif action == "reset":
+        from adaptive_harness.prompts_edit import PromptEditError, reset_all, reset_override
+
+        workspace = Path.cwd() if scope != "user" else None
+        if name in {"", "all", "*"}:
+            try:
+                count, message = reset_all(workspace)
+            except PromptEditError as exc:
+                console.print(f"[red]{escape(str(exc))}[/red]")
+                raise typer.Exit(1) from exc
+            console.print(f"[{'green' if count else 'dim'}]{escape(message)}[/"
+                          f"{'green' if count else 'dim'}]")
+            return
+        if name not in registry.names():
+            raise typer.BadParameter(
+                f"no prompt named {name!r}. Try `prompts list`.", param_hint="NAME")
+        try:
+            changed, message = reset_override(name, workspace)
+        except PromptEditError as exc:
+            console.print(f"[red]{escape(str(exc))}[/red]")
+            raise typer.Exit(1) from exc
+        colour = "green" if changed else "yellow"
+        console.print(f"[{colour}]{escape(message)}[/{colour}]")
+        if not changed:
+            raise typer.Exit(1)
     elif action == "export":
         target = Path(name or "output/prompts.json")
         target.parent.mkdir(parents=True, exist_ok=True)

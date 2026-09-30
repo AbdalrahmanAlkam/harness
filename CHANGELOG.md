@@ -133,6 +133,12 @@ assert something that had not happened. Those are the substantive changes:
   each prompt, with previews that fit the terminal instead of cutting
   mid-word. It was previously 41 flat rows whose previews were fragments of the
   middle of the text and wrapped into each other at any width.
+- **`prompts edit` and `prompts reset`.** Edit a prompt in `$EDITOR` and it
+  is saved as an override; reset one, or all of them, back to the built-in text.
+  The built-in prompts are never modified, so an upgrade never fights your
+  changes. A reset that leaves the prompt overridden — because a second file
+  also overrides it — says so instead of reporting a success that did not
+  happen.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.
