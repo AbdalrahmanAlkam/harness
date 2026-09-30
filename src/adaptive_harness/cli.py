@@ -908,11 +908,25 @@ def prompts(
                       Path(".harness") / "prompts.json",
                       Path(os.environ["ADAPTIVE_PROMPTS_FILE"]) if os.getenv("ADAPTIVE_PROMPTS_FILE") else None]
     if action == "list":
-        for prompt_name in registry.names():
-            marker = " [overridden]" if registry.is_overridden(prompt_name) else ""
-            preview = registry.get(prompt_name).strip().splitlines()[0][:90]
-            console.print(f"  [cyan]{prompt_name}[/cyan]{marker} [dim]{escape(preview)}[/dim]")
-        console.print("\n[dim]Override with a JSON file mapping names to new text; see `prompts path`.[/dim]")
+        # Grouped by what can trigger each prompt, and previewed to fit the
+        # terminal. A flat alphabetical list of 41 rows with mid-word cuts was
+        # unreadable, and a user auditing what the models receive needs to see
+        # which prompts can actually fire.
+        from adaptive_harness.prompt_preview import render as render_prompts
+
+        for line in render_prompts(registry, console=console):
+            if line and not line.startswith("  "):
+                console.print(f"[bold]{escape(line)}[/bold]")
+            elif line:
+                console.print(f"[dim]{escape(line)}[/dim]")
+            else:
+                console.print()
+        overridden = sum(1 for name in registry.names() if registry.is_overridden(name))
+        note = "\n[dim]Show one in full with `prompts show NAME`; "
+        note += "override with a JSON file, paths from `prompts path`."
+        if overridden:
+            note += f" {overridden} currently overridden.[/dim]"
+        console.print(note)
     elif action == "show":
         if not name:
             raise typer.BadParameter("show requires a prompt name", param_hint="name")

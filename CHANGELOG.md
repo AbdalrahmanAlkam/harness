@@ -129,6 +129,10 @@ assert something that had not happened. Those are the substantive changes:
   which validates before copying and never overwrites silently. There is no
   privileged tier — an official plugin lands in the same directory as a
   community one and is trusted exactly as much.
+- **`prompts list` is readable.** The audit view grouped by what can trigger
+  each prompt, with previews that fit the terminal instead of cutting
+  mid-word. It was previously 41 flat rows whose previews were fragments of the
+  middle of the text and wrapped into each other at any width.
 - Mid-turn steering: type while the agent works and the note reaches the model
   at the start of the next step, with `!` to stop and redirect instead.
 - Task cancellation on Escape, cooperative and attributed.
