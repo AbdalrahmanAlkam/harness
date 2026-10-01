@@ -129,11 +129,28 @@ def test_the_spawn_event_carries_everything_needed_to_rebuild_the_tree():
     record = SubagentRecord(id="agent_1a2b", parent_id="main", role="coder",
                             description="write the guard", model="sonnet", depth=1)
     payload = spawn_event(record)
-    assert payload["agentId"] == "agent_1a2b"
+    assert payload["agent_id"] == "agent_1a2b"
     assert payload["parent_id"] == "main"
     assert payload["role"] == "coder"
     assert payload["description"] == "write the guard"
     assert payload["depth"] == 1
+
+
+def test_the_payload_uses_claude_codes_field_naming():
+    """`agent_spawned` and `agent_completed` are this harness's own event
+    names -- there is no public contract for an internal event stream -- but the
+    *fields* follow the documented SubagentStart/SubagentStop naming exactly:
+    snake_case `agent_id`, and an `agent_` prefix on the id.
+
+    Getting this wrong is not cosmetic: a plugin written against the documented
+    shape would read none of it.
+    """
+    registry = SubagentRegistry()
+    record = registry.spawn(parent_id="main", role="coder", description="x")
+    for payload in (spawn_event(record), complete_event(record)):
+        assert "agent_id" in payload
+        assert "agentId" not in payload, "camelCase leaks in; Claude Code's is snake_case"
+        assert payload["agent_id"].startswith("agent_")
 
 
 def test_the_complete_event_carries_the_cost():

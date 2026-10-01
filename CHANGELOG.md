@@ -141,10 +141,11 @@ assert something that had not happened. Those are the substantive changes:
   happen.
 - **Named, watchable subagents.** Every subagent now has a short readable id
   (`agent_7f3a`) carried on every one of its events, so a run with several in
-  flight can be read, referred to, and accounted for. `agent_spawned` and
-  `agent_completed` events carry the parent, so the whole agent tree can be
-  rebuilt from the event stream alone. `/agents` reports status, tool counts,
-  tokens and elapsed time for every agent without the run having been watched.
+  flight can be read, referred to, and accounted for. `/tasks` reports status,
+  tool counts, tokens and elapsed time for every agent without the run having
+  been watched, and the payload naming follows Claude Code's documented
+  `SubagentStart`/`SubagentStop` fields (`agent_id`, snake_case) so a plugin
+  written against that shape reads it correctly.
   A subagent's chatter is no longer replayed into the parent: what comes back is
   a bounded ledger, which is the difference between paying for a summary once
   and paying for it on every later request.

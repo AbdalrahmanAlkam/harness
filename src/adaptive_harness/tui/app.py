@@ -137,7 +137,7 @@ SESSION_SETTING_KEYS = (
 )
 
 COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/steps", "/prompts", "/safety", "/classifier", "/new",
-            "/context", "/memory", "/agents", "/doctor",
+            "/context", "/memory", "/tasks", "/doctor",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
             "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export",
             "/diff", "/isolation", "/swarm", "/settings")
@@ -167,7 +167,7 @@ COMMAND_DESCRIPTIONS = {
     "/session": "Load or save a session",
     "/usage": "Show token usage and cost",
     "/context": "Show the context budget: what is held, what was admitted, what was not",
-    "/agents": "Show every subagent: id, status, tool calls, tokens, elapsed",
+    "/tasks": "Show every subagent: id, status, tool calls, tokens, elapsed",
     "/memory": "Durable memory: list, accept <id>, forget <id>, clear",
     "/doctor": "Check that this installation can do what it claims",
     "/skills": "Browse installed skills",
@@ -1988,7 +1988,7 @@ class AdaptiveHarnessApp(App):
             self._show_context()
         elif cmd == "/memory":
             self._show_memory(arg)
-        elif cmd == "/agents":
+        elif cmd == "/tasks":
             self.query_one("#chat-log", RichLog).write(
                 Text(self.subagents.describe(), style="dim"))
         elif cmd == "/doctor":
@@ -2203,7 +2203,7 @@ class AdaptiveHarnessApp(App):
         if et == "agent_spawned":
             indent = "  " * (int(p.get("depth", 0)) + 1)
             self.query_one("#chat-log", RichLog).write(Text(
-                f"{indent}⏺ {BULLET} {p.get('agentId', '?')} · {p.get('role', '?')} · "
+                f"{indent}⏺ {BULLET} {p.get('agent_id', '?')} · {p.get('role', '?')} · "
                 f"{p.get('description', '')[:100]}", style="dim cyan"))
         elif et == "agent_completed":
             indent = "  " * (int(p.get("depth", 0)) + 1)
@@ -2212,12 +2212,12 @@ class AdaptiveHarnessApp(App):
             style = "dim green" if status == "completed" else "dim red"
             if p.get("error"):
                 self.query_one("#chat-log", RichLog).write(Text(
-                    f"{indent}✗ {p.get('agentId', '?')} {status} after "
+                    f"{indent}✗ {p.get('agent_id', '?')} {status} after "
                     f"{tools} tool(s) in {(p.get('elapsed_ms') or 0) / 1000:.1f}s"
                     f" — {str(p.get('error'))[:120]}", style="dim red"))
             else:
                 self.query_one("#chat-log", RichLog).write(Text(
-                    f"{indent}● {p.get('agentId', '?')} {status} · {tools} tool(s) · "
+                    f"{indent}● {p.get('agent_id', '?')} {status} · {tools} tool(s) · "
                     f"{(p.get('elapsed_ms') or 0) / 1000:.1f}s", style=style))
         elif et in {"tool_call", "tool_result", "prompt_injection", "response"}:
             self._render_subagent_detail(et, p)
@@ -2225,7 +2225,7 @@ class AdaptiveHarnessApp(App):
     def _render_subagent_detail(self, et: str, p: dict) -> None:
         """One line of subagent activity, attributed and indented."""
         log = self.query_one("#chat-log", RichLog)
-        agent_id = p.get("agentId", "")
+        agent_id = p.get("agent_id", "")
         indent = "  " * (int(p.get("depth", 0)) + 2)
         if et == "tool_call":
             target = p.get("arguments", {}) or {}

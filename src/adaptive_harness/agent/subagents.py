@@ -12,8 +12,22 @@ So every subagent gets an identity and a lifecycle:
 - ``agent_spawned`` and ``agent_completed`` events carrying that id and the
   parent's, so the tree can be reconstructed from the event stream alone;
 - a per-agent record of status, tool calls, tokens and elapsed time, so
-  ``/agents`` can answer "what is running, and what has it cost me" without
+  ``/tasks`` can answer "what is running, and what has it cost me" without
   having been watching.
+
+**Where this deliberately differs from the Claude Code contract, and why.**
+Claude Code's documented hooks are ``SubagentStart`` and ``SubagentStop``, and
+their payloads use ``agent_id`` and ``agent_type`` in snake_case; the id format
+is an ``agent_`` prefix plus an alphanumeric suffix; and ``/tasks`` is the view
+that lists running subagents. This follows all four. Two deliberate departures:
+
+- ``parent_id`` exists here and does not in Claude Code. Their tree is two deep
+  -- a subagent is parented by the session -- whereas this harness can nest a
+  subagent under a subagent, so the parent has to be a real id or the deeper
+  levels cannot be reconstructed.
+- The event *names* are this harness's own, since no public contract defines an
+  internal event stream; what is mirrored is the payload field naming, the id
+  format, the display conventions, and the command name.
 
 The efficiency win is the same thing: a subagent's chatter is *not* replayed
 into the parent's context. What comes back is its result plus a short ledger, and
@@ -297,14 +311,14 @@ def spawn_event(record: SubagentRecord) -> Dict[str, Any]:
     Shaped so the whole agent tree can be reconstructed from the event stream
     alone, without a registry: id, parent, role, and what it was asked to do.
     """
-    return {"agentId": record.id, "parent_id": record.parent_id, "role": record.role,
+    return {"agent_id": record.id, "parent_id": record.parent_id, "role": record.role,
             "description": record.description, "model": record.model,
             "depth": record.depth, "status": record.status}
 
 
 def complete_event(record: SubagentRecord) -> Dict[str, Any]:
     """The `agent_completed` payload: what it did, what it cost, what came back."""
-    return {"agentId": record.id, "parent_id": record.parent_id, "role": record.role,
+    return {"agent_id": record.id, "parent_id": record.parent_id, "role": record.role,
             "status": record.status, "elapsed_ms": record.elapsed_ms,
             "tools": [list(item) for item in record.tools],
             "input_tokens": record.input_tokens, "output_tokens": record.output_tokens,
