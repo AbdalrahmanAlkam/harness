@@ -15,6 +15,8 @@ from pathlib import Path
 import re
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from adaptive_harness.llm.client import MODEL_TIERS
+
 # A refusal is structural: explicit decline phrasing AND no completed tool work.
 _REFUSAL_PHRASES = re.compile(
     r"\b(?:i refuse|i must decline"
@@ -280,6 +282,8 @@ class DeveloperAgentWorker:
                  tool_names: Sequence[str] | None = None,
                  forced_mode: str | None = None,
                  forced_thinking: str | None = None,
+                 explicit_model: str | None = None,
+                 memory_tier: str = "",
                  enable_skill_routing: bool = False,
                  write_target: Path | Sequence[Path] | None = None,
                  system_prompt: str | None = None,
@@ -296,6 +300,12 @@ class DeveloperAgentWorker:
         self.tool_names = tuple(tool_names) if tool_names else None
         self.forced_mode = forced_mode
         self.forced_thinking = forced_thinking
+        # A per-subagent model, from an agent definition's `model:` line. None
+        # means "whatever the caller was already using".
+        self.explicit_model = explicit_model
+        # Which memory tier this agent may read, from a definition's `memory:`
+        # line. Empty means the caller's default.
+        self.memory_tier = memory_tier
         self.enable_skill_routing = enable_skill_routing
         # One path, or the small set of paths this assignment is authorized to
         # write. The research swarm uses the set form: a proof worker's decider
@@ -325,6 +335,25 @@ class DeveloperAgentWorker:
         if isinstance(self.write_target, (str, Path)):
             return (Path(self.write_target),)
         return tuple(Path(item) for item in self.write_target)
+
+    def _client_for_assignment(self):
+        """Mint a client for this assignment, applying a per-agent model.
+
+        A tier name (`fast`, `standard`, `reasoning`) is resolved to that tier's
+        model; anything else is taken as a literal model id. Resolving matters:
+        the scaffold ships `model: fast`, and sending that string to a provider
+        as a model name fails on every request while looking fine against the
+        mock client.
+        """
+        if self.llm_client_factory is None:
+            return None
+        client = self.llm_client_factory()
+        if self.explicit_model and client is not None:
+            chosen = self.explicit_model
+            if chosen in MODEL_TIERS:
+                chosen = client.get_model_for_tier(chosen)
+            client.default_model = chosen
+        return client
 
     def _build_tools(self, root: str, assignment: SwarmAssignment) -> list[Any]:
         """Construct the tool list for one assignment."""
@@ -399,8 +428,10 @@ class DeveloperAgentWorker:
             prompts.get("system.default") + "\n" + prompts.get("swarm.role.coder") if assignment.may_edit else
             prompts.get("swarm.role.security") if assignment.role is SwarmRole.SECURITY else
             prompts.get("swarm.role.read_only"))
-        agent = DeveloperAgent(llm_client=self.llm_client_factory() if self.llm_client_factory else None,
+        agent = DeveloperAgent(llm_client=self._client_for_assignment(),
             tools=tools, workspace_root=root, repository=self.repository,
+            explicit_model=self.explicit_model,
+            memory_tier=self.memory_tier,
             forced_mode=self.forced_mode or ("security" if assignment.role is SwarmRole.SECURITY else "coding"),
             forced_thinking=self.forced_thinking,
             require_file_changes=assignment.may_edit,
@@ -429,7 +460,7 @@ class DeveloperAgentWorker:
 
             record = self.registry.spawn(parent_id=self.parent_id,
                                          role=assignment.role.value,
-                                         description=assignment.directive.strip()[:120])
+                                         description=assignment.task.strip()[:120])
             reporter = SubagentReporter(self.registry)
             if self.on_event is not None:
                 self.on_event(AgentEvent("agent_spawned", spawn_event(record)))

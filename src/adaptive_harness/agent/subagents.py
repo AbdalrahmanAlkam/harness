@@ -66,14 +66,26 @@ STATUS_FAILED = "failed"
 STATUS_STOPPED = "stopped"
 
 
-def _make_id() -> str:
-    """A short id from a counter and the clock.
+#: A monotonic counter behind every id. Ids derived from the clock alone
+#: collide inside a 65-second window, and the collision path grew the suffix
+#: past the documented width. Counting cannot collide, and a 24-bit counter
+#: still reads as a short hex id.
+_id_counter = itertools.count(1)
 
-    A random suffix would be prettier and less useful: ids that sort together are
-    ids that group together on screen.
+
+def _make_id() -> str:
+    """A short id, unique for the life of the process.
+
+    A clock-derived suffix looks tidier and is worse: it collides inside a
+    65-second window, and the collision path then produced ids wider than the
+    format this module documents.
     """
-    stamp = int(time.time() * 1000) % 0xFFFF
-    return f"{ID_PREFIX}{stamp:04x}"[-ID_LENGTH - len(ID_PREFIX):]
+    # Plain counter modulo the width. Mixing in a clock-derived seed looks
+    # better and is worse: folding a seed into 16 bits costs real collisions,
+    # because the space is then shared between the seed and the counter rather
+    # than spent entirely on uniqueness. Wrapping is fine -- the caller
+    # disambiguates, and the width is what the documented format promises.
+    return f"{ID_PREFIX}{next(_id_counter) % (16 ** ID_LENGTH):0{ID_LENGTH}x}"
 
 
 @dataclass
@@ -96,6 +108,9 @@ class SubagentRecord:
     error: str = ""
     stop_reason: str = ""
     depth: int = 0
+    #: An optional tint from a definition's `color:` line. Decorative only, and
+    #: it never carries meaning the glyph and the status word do not already.
+    color: str = ""
 
     @property
     def elapsed_ms(self) -> int:
@@ -137,14 +152,22 @@ class SubagentRecord:
             "error": self.error, "stop_reason": self.stop_reason, "depth": self.depth,
         }
 
+    #: Accepted tints, for a definition's `color:` line. An unlisted name is
+    #: ignored rather than being passed through to a terminal escape sequence.
+    COLORS = frozenset({"red", "green", "yellow", "blue", "magenta", "cyan",
+                         "white", "grey"})
+
     def line(self) -> str:
         """One row for the monitoring view."""
         mark = "●" if self.running else ("✓" if self.status == STATUS_COMPLETED else "✗")
         timing = f"{self.elapsed_ms / 1000:.1f}s"
         tokens = self.input_tokens + self.output_tokens
         cost = f"{tokens:,} tok" if tokens else "—"
+        # The tint is decorative and only ever names itself. Status stays in the
+        # glyph and the word, so nothing is carried by colour alone.
+        tint = f" [{self.color}]" if self.color in self.COLORS else ""
         return (f"{mark} {self.id}  {self.role:<12} {timing:>7}  {len(self.tools):>3} tools  "
-                f"{cost:>12}  {self.description[:48]}")
+                f"{cost:>12}{tint:<16} {self.description[:44]}")
 
 
 class SubagentRegistry:
@@ -184,6 +207,12 @@ class SubagentRegistry:
             record = self._records.get(agent_id)
             if record is None:
                 return None
+            if not record.running:
+                # A late completion must not overwrite a stop. The user pressed
+                # Esc, was told the run was being cancelled, and a background
+                # thread that finished minutes later would otherwise turn that
+                # into "failed" -- reporting a cancellation as a fault.
+                return record
             record.ended_at = time.time()
             record.result = result or record.result
             record.error = error or record.error
@@ -217,6 +246,18 @@ class SubagentRegistry:
             if record is None:
                 return
             record.tools.append((str(name), _short_target(target)))
+
+    def mark_failed(self, agent_id: str, name: str) -> None:
+        """Mark the most recent matching call as failed, rather than adding one."""
+        with self._lock:
+            record = self._records.get(agent_id)
+            if record is None:
+                return
+            for index in range(len(record.tools) - 1, -1, -1):
+                if record.tools[index][0] == name:
+                    target = f"{record.tools[index][1]} (failed)".strip()
+                    record.tools[index] = (name, target)
+                    return
 
     def record_usage(self, agent_id: str, *, input_tokens: int = 0,
                       output_tokens: int = 0, model: str = "") -> None:
@@ -259,7 +300,7 @@ class SubagentRegistry:
         }
 
     def describe(self) -> str:
-        """The monitoring view, printed by `/agents`."""
+        """The monitoring view, printed by `/tasks`."""
         records = self.all()
         if not records:
             return ("No subagents this session.\n"
@@ -343,11 +384,13 @@ class SubagentReporter:
         if event_type == "tool_call":
             self.registry.record_tool(agent_id, payload.get("name", "?"),
                                      payload.get("arguments", {}))
-        elif event_type == "tool_result":
-            # A failed call is the interesting one; recording successes twice
-            # would double-count every tool in the ledger.
-            if not payload.get("success"):
-                self.registry.record_tool(agent_id, payload.get("name", "?"), "(failed)")
+        elif event_type == "tool_result" and not payload.get("success"):
+            # A failure is marked on the entry the call already created, rather
+            # than appended as a second one. `tool_call` fires for every declared
+            # call before execution, so appending here counted every failure
+            # twice and inflated the very number a user reads to learn what a
+            # subagent cost.
+            self.registry.mark_failed(agent_id, payload.get("name", "?"))
         elif event_type == "response":
             usage = payload.get("usage") or {}
             self.registry.record_usage(

@@ -266,8 +266,33 @@ class MemoryStore:
             texts.append(memory.text)
         return texts
 
-    def as_context(self, task: str = "") -> str:
-        texts = self.recall(task)
+    def as_context(self, task: str = "", *, tier: str = "") -> str:
+        """The memory block for a subagent, honouring a `memory:` tier.
+
+        Claude Code's `memory:` frontmatter names which memory a subagent
+        reads: ``user``, ``project`` or ``local``. Honouring it here is what
+        stops the flag being a comment -- and it has a real effect, since a
+        privacy-conscious user can give a subagent the project tier and keep
+        their personal memories out of it.
+        """
+        if tier:
+            return self._as_tier(tier, task)
+        return self._render(self.recall(task))
+
+    def _as_tier(self, tier: str, task: str) -> str:
+        name = str(tier).strip().lower()
+        if name not in {"user", "project", "local"}:
+            # An unrecognised tier reads nothing rather than everything: a
+            # typo must not quietly widen what a subagent can see.
+            return ""
+        if name == "local":
+            # Local memories are scoped to the session, so there is no stored
+            # tier to read yet.
+            return ""
+        texts = self.recall(task, include_task_scope=(name == "project"))
+        return self._render(texts)
+
+    def _render(self, texts: List[str]) -> str:
         if not texts:
             return ""
         body = "\n".join(f"- {text}" for text in texts)

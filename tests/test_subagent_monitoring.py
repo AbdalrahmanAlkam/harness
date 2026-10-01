@@ -193,13 +193,33 @@ def test_the_reporter_tracks_tool_calls_and_usage():
     assert tracked.model == "m"
 
 
-def test_a_failed_tool_call_is_recorded_too():
-    """A failure is the interesting one, and it is what a user scans for."""
+def test_a_failed_tool_call_is_marked_not_appended():
+    """A failure marks the entry the call already made.
+
+    `tool_call` fires for every declared call *before* execution, so appending
+    the failure as a second entry counted it twice -- and the count is what a
+    user reads to learn what a subagent cost.
+    """
+    registry = SubagentRegistry()
+    record = registry.spawn(parent_id="main", role="coder", description="x")
+    reporter = SubagentReporter(registry)
+    reporter.on_event(record.id,
+                      _Event("tool_call", {"name": "Edit", "arguments": {"path": "a.py"}}))
+    reporter.on_event(record.id, _Event("tool_result", {"name": "Edit", "success": False}))
+
+    tools = registry.get(record.id).tools
+    assert len(tools) == 1, f"one failed call was recorded {len(tools)} times"
+    assert tools[0][0] == "Edit"
+    assert "failed" in tools[0][1]
+
+
+def test_a_failure_with_no_matching_call_does_not_invent_one():
     registry = SubagentRegistry()
     record = registry.spawn(parent_id="main", role="coder", description="x")
     SubagentReporter(registry).on_event(
-        record.id, _Event("tool_result", {"name": "Edit", "success": False}))
-    assert registry.get(record.id).tools == [("Edit", "(failed)")]
+        record.id, _Event("tool_result", {"name": "Ghost", "success": False}))
+    assert registry.get(record.id).tools == [], (
+        "a result for a call that was never declared invented an entry")
 
 
 def test_a_successful_result_does_not_double_count_the_tool():

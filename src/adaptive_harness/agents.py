@@ -50,15 +50,30 @@ PROJECT_DIR = Path(".harness") / "agents"
 
 #: Keys that change behaviour here. Everything else is recorded and passed
 #: through so a definition written for another tool is not silently truncated.
-KNOWN_KEYS = {
-    "name", "description", "tools", "disallowedTools", "model", "permissionMode",
-    "maxTurns", "effort", "isolation", "background", "color", "skills",
-    "memory", "omitClaudeMd", "mcpServers", "hooks", "initialPrompt",
-}
-
-#: Keys this harness acts on. The rest are carried, not enforced.
+#: Keys this harness acts on.
 ACTED_ON = {"name", "description", "tools", "disallowedTools", "model",
-            "permissionMode", "maxTurns", "effort", "isolation", "background"}
+            "permissionMode", "maxTurns", "effort", "isolation", "background",
+            "color", "memory"}
+
+#: Keys a definition may legitimately carry that this version does not act on:
+#: the same ones Claude Code documents, so a definition written for either tool
+#: loads here. They are *not* suppressed from the "not acted on" note -- a key
+#: that is silently dropped is the failure mode this module exists to prevent,
+#: and these are exactly the keys most likely to arrive from elsewhere.
+KNOWN_KEYS = ACTED_ON | {"skills", "omitClaudeMd", "mcpServers", "hooks",
+                          "initialPrompt"}
+
+#: Tools that change the workspace. A read-only agent is not given one, whatever
+#: its own `tools` line says -- otherwise `permissionMode: plan` is a comment
+#: rather than a restriction.
+MUTATING_TOOLS = frozenset({
+    "write_file", "edit_file", "run_bash", "run_pytest", "run_python_repl",
+    "run_lean_proof", "compile_typst", "plot_terminal", "write_in_file",
+})
+
+#: Reasoning levels a definition may ask for, matching the harness's own.
+VALID_EFFORTS = frozenset({"auto", "none", "low", "medium", "high", "xhigh",
+                           "max", "deep"})
 
 _LIST_KEYS = {"tools", "disallowedTools", "skills", "mcpServers"}
 _TRUE = {"true", "yes", "on", "1"}
@@ -104,6 +119,21 @@ class AgentDefinition:
         if self.permission_mode in {"plan"}:
             return False
         return bool(self.tools) and self.tools != self.disallowed_tools
+
+    def effective_tools(self) -> tuple[str, ...]:
+        """The tools this agent actually gets, after its permissions apply.
+
+        ``permissionMode: plan`` has to mean the agent cannot write. Choosing a
+        planning role is not enough on its own: a definition that lists
+        ``write_file`` would otherwise be handed it and could still write, so
+        the declaration in the file would be the thing that lied.
+        """
+        if not self.tools:
+            return ()
+        allowed = [name for name in self.tools if name not in self.disallowed_tools]
+        if not self.is_write_capable:
+            allowed = [name for name in allowed if name not in MUTATING_TOOLS]
+        return tuple(allowed)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -221,6 +251,15 @@ def load_definition(path: Path) -> AgentDefinition:
         raise AgentDefinitionError(
             f"{path}: maxTurns must be a whole number.") from None
 
+    # Validated here, next to isolation and maxTurns, so a typo in a file is a
+    # load error naming the file and the key. Left to the run, the same typo
+    # surfaced as "Thinking must be auto, none, low, ..." with no mention of
+    # which file was at fault.
+    effort = str(fields.get("effort") or "").strip()
+    if effort and effort not in VALID_EFFORTS:
+        raise AgentDefinitionError(
+            f"{path}: effort {effort!r} is not one of {', '.join(sorted(VALID_EFFORTS))}.")
+
     isolation = str(fields.get("isolation") or "").strip()
     if isolation and isolation != "worktree":
         raise AgentDefinitionError(
@@ -236,13 +275,15 @@ def load_definition(path: Path) -> AgentDefinition:
         model=str(fields.get("model") or "").strip(),
         permission_mode=str(fields.get("permissionMode") or "").strip(),
         max_turns=max_turns,
-        effort=str(fields.get("effort") or "").strip(),
+        effort=effort,
         isolation=isolation,
         background=bool(fields.get("background")),
         color=str(fields.get("color") or "").strip(),
         memory=str(fields.get("memory") or "").strip(),
         source=path,
-        extra={key: value for key, value in fields.items() if key not in KNOWN_KEYS},
+        # Anything this version does not act on is recorded, so the listing can
+        # say so. Membership of KNOWN_KEYS must not suppress the note.
+        extra={key: value for key, value in fields.items() if key not in ACTED_ON},
     )
 
 

@@ -260,11 +260,27 @@ def test_delegation_runs_a_named_definition_and_keeps_the_builtins():
         default_model = "mock"
         provider = "openrouter"
 
+        def __init__(self):
+            self.done = False
+
         def complete(self, messages, **kwargs):
+            if not self.done:
+                # A write-capable agent has to produce the file it was asked
+                # for, or the run correctly reports missing changes.
+                self.done = True
+                from adaptive_harness.llm.mock_client import ToolCall
+                return LLMResponse(model="mock", content="", tool_calls=[ToolCall(
+                    id="w1", name="write_file",
+                    arguments={"path": "review.md", "content": "safe"})])
             return LLMResponse(model="mock", content="Safe: additive and reversible.")
 
     root = Path(tempfile.mkdtemp())
-    _write(root / ".harness" / "agents", "db-reviewer", GOOD)
+    # No isolation here: this test is about a named definition running, and a
+    # worktree needs a repository, which a tmp_path is not.
+    _write(root / ".harness" / "agents", "db-reviewer",
+           "---\nname: db-reviewer\ndescription: Reviews a migration.\n"
+           "tools: read_file, write_file, run_bash\n---\n"
+           "You build database migrations.\n")
     (root / "m.sql").write_text("ALTER TABLE t ADD COLUMN c int;")
 
     tool = DelegateSubagentTool(root, llm_client_factory=Client)
@@ -272,8 +288,27 @@ def test_delegation_runs_a_named_definition_and_keeps_the_builtins():
     assert result.success, result.error
     assert "Safe" in result.output
 
-    # And a built-in role still runs, unchanged.
-    builtin = tool.execute(role="reviewer", task="check the migration")
+    # And a built-in role still runs, unchanged. `coder` with a client that
+    # writes: a `reviewer` deliberately needs test evidence and an `architect`
+    # is read-only, so neither is a fair check with a stub that writes a file.
+    class Writer:
+        default_model = "mock"
+        provider = "openrouter"
+
+        def __init__(self):
+            self.done = False
+
+        def complete(self, messages, **kwargs):
+            if not self.done:
+                self.done = True
+                from adaptive_harness.llm.mock_client import ToolCall
+                return LLMResponse(model="mock", content="", tool_calls=[ToolCall(
+                    id="w2", name="write_file",
+                    arguments={"path": "plan.md", "content": "plan"})])
+            return LLMResponse(model="mock", content="Wrote the plan.")
+
+    tool.llm_client_factory = Writer
+    builtin = tool.execute(role="coder", task="write the plan")
     assert builtin.success, builtin.error
 
 
@@ -311,11 +346,16 @@ def test_an_agent_declaration_reaches_the_worker(tmp_path: Path):
             seen.append(str(messages[0].get("content", "")))
             return LLMResponse(model="mock", content="ok")
 
-    _write(tmp_path / ".harness" / "agents", "db-reviewer", GOOD)
+    # A plan agent is stripped of mutating tools, so this one may write; and no
+    # isolation, since a worktree needs a repository and tmp_path is not one.
+    _write(tmp_path / ".harness" / "agents", "builder",
+           "---\nname: builder\ndescription: Builds things.\n"
+           "tools: read_file, write_file, run_bash\n---\n"
+           "You build database migrations.\n")
     tool = DelegateSubagentTool(tmp_path, llm_client_factory=Client)
-    tool.execute(role="db-reviewer", task="review m.sql")
+    tool.execute(role="builder", task="review m.sql")
     assert seen, "the agent never called the model"
-    assert any("You review database migrations." in text for text in seen), (
+    assert any("You build database migrations." in text for text in seen), (
         "the declared system prompt was not used")
 
 

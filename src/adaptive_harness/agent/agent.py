@@ -52,7 +52,8 @@ from adaptive_harness.tools.lean import RunLeanProofTool
 from adaptive_harness.tools.recall import ReadFullOutputTool
 from adaptive_harness.tools.research_swarm import CompileTypstTool
 from adaptive_harness.tools.workspace import ListDirectoryTool, SearchFilesTool
-from adaptive_harness.tools.delegation import DelegateSubagentTool
+from adaptive_harness.tools.delegation import (BackgroundResultTool,
+                                              DelegateSubagentTool)
 from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.skills.router import SkillRouter
 from adaptive_harness.skills.verifier import SkillVerifier
@@ -335,6 +336,7 @@ class DeveloperAgent:
         filter_tool_output: bool = True,
         plugins_enabled: bool = True,
         allow_project_plugins: bool = False,
+        memory_tier: str = "",
         quality_gate: bool = False,
     ):
         if safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
@@ -411,6 +413,14 @@ class DeveloperAgent:
         # existing embedder, test and swarm worker does exactly that.
         self.plugins = PluginHost(project_root=workspace_root,
                                   allow_project_plugins=allow_project_plugins)
+        # Every subagent this agent spawns, so a run can be watched and
+        # accounted for whether or not an interface is attached.
+        from adaptive_harness.agent.subagents import SubagentRegistry
+
+        self.subagents = SubagentRegistry()
+        # Which memory tier this agent may read, from a definition's `memory:`
+        # line. Empty means everything the store holds.
+        self.memory_tier = memory_tier
         # The context plane. Built on first use because the model's window is
         # only known once a model is selected, and embedders set
         # `context_window_override` after construction. Seeded with the
@@ -491,6 +501,21 @@ class DeveloperAgent:
             self._context_plane.contribute_many(
                 project_instruction_files(self.workspace_root))
             self._context_plane.contribute_many(self.plugins.context_fragments())
+            # Durable memory, scoped to whichever tier this agent was given. An
+            # agent declared `memory: project` does not see the user's personal
+            # memories, which is the point of declaring it.
+            from adaptive_harness.agent.memory import MemoryStore, _default_dir
+
+            store = MemoryStore(_default_dir())
+            block = store.as_context("", tier=self.memory_tier)
+            if block:
+                from adaptive_harness.agent.context_plane import PRIORITY_MEMORY
+                from adaptive_harness.plugins.types import ContextFragment, Trigger
+
+                self._context_plane.contribute(ContextFragment(
+                    source="memory:store", content=block, tokens=0,
+                    priority=PRIORITY_MEMORY, trigger=Trigger.parse("always"),
+                    provenance="memory"))
         return self._context_plane
 
     def rule_gate(self, tool: str, arguments: Dict[str, Any]) -> tuple[Decision, str]:
@@ -580,15 +605,23 @@ class DeveloperAgent:
                     default_model=source.default_model, force_mock=source.force_mock,
                     provider=source.provider, provider_keys=source.provider_keys,
                     backup_providers=source.backup_providers)
-            self.tools["delegate_subagent"] = DelegateSubagentTool(self.workspace_root,
+            delegate = DelegateSubagentTool(self.workspace_root,
                 llm_client_factory=client_factory,
                 repository=self.repository,
                 safety_profile=self.safety_profile,
                 step_policy=self.step_policy,
                 max_steps=self.max_steps,
+                registry=self.subagents,
+                parent_id="main",
                 on_event=getattr(self, "subagent_event_callback", None))
+            self.tools["delegate_subagent"] = delegate
+            # Collected by the same path that starts it. The tool schema tells
+            # the model to call `background_result`, so it has to exist --
+            # otherwise an id the model was handed has nothing to resolve it.
+            self.tools["background_result"] = BackgroundResultTool(delegate)
         else:
             self.tools.pop("delegate_subagent", None)
+            self.tools.pop("background_result", None)
 
     def enable_research(self, topic: str | None = None, *,
                         root: str | Path = "research",

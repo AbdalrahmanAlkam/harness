@@ -9,6 +9,34 @@ from typing import Any, Callable
 from adaptive_harness.tools.base import Tool, ToolResult, workspace_path
 
 
+#: How much of a subagent's own words come back to the parent. The rest stays
+#: in the registry. A subagent that writes a 4,000-character answer would
+#: otherwise pay for those 4,000 characters on every later request.
+RESULT_TO_PARENT_CHARS = 2000
+
+
+class BackgroundResultTool(Tool):
+    """Collect a subagent that was started with ``wait: false``.
+
+    The tool schema tells the model to collect a background agent by id, so
+    this has to be a real tool. An id the model is told to use, with nothing to
+    use it on, is an instruction to guess.
+    """
+
+    name = "background_result"
+    description = ("Collect a backgrounded subagent by the agent_id returned when it "
+                   "was started. Reports whether it is still running.")
+    parameters = {"type": "object", "properties": {
+        "agent_id": {"type": "string", "description": "The id the background call returned."},
+    }, "required": ["agent_id"]}
+
+    def __init__(self, delegate: "DelegateSubagentTool") -> None:
+        self.delegate = delegate
+
+    def execute(self, agent_id: str, **kwargs: Any) -> ToolResult:
+        return self.delegate.background_result(agent_id)
+
+
 class DelegateSubagentTool(Tool):
     name = "delegate_subagent"
     description = "Run an architect, coder, reviewer, or security subagent on a bounded workspace task."
@@ -47,6 +75,32 @@ class DelegateSubagentTool(Tool):
         # can keep working instead of sitting idle.
         self._background: dict[str, Any] = {}
         self.parent_id = parent_id
+
+    @staticmethod
+    def _finish_isolated(manager, worktree, result, definition):
+        """Say what an isolated agent did, and leave its work for review.
+
+        The patch is printed rather than applied: the whole point of isolation is
+        that a human decides whether the change is wanted. An agent that changed
+        nothing leaves no worktree behind.
+        """
+        from adaptive_harness.agent.swarm import SwarmResult
+
+        try:
+            patch = manager.patch(worktree)
+        except (OSError, RuntimeError):
+            patch = ""
+        if not patch.strip():
+            manager.abort(worktree)
+            return result
+        note = (f"\n\n[{definition.name} worked in an isolated worktree at "
+                f"{worktree.path}. Its changes are NOT applied. Review them with "
+                f"`git -C {worktree.path} diff`, and apply with "
+                f"`git apply` or `harness review`.\n\n```diff\n{patch[:6000]}\n```")
+        return SwarmResult(
+            role=result.role, phase=result.phase, success=result.success,
+            summary=(result.summary or "") + note, artifacts=dict(result.artifacts),
+            verified=result.verified, error=result.error, agent_id=result.agent_id)
 
     def background_result(self, agent_id: str) -> ToolResult:
         """Collect a backgrounded subagent, or say it is still going.
@@ -101,10 +155,15 @@ class DelegateSubagentTool(Tool):
                               error=f"No subagent named {role!r}. Define one at "
                                     f".harness/agents/{role}.md, or use one of: "
                                     f"{', '.join(known)}")
-        if role not in roles:
-            # A user-defined agent has no built-in phase. It is planned unless
-            # it asked to write, which is the honest default for something
-            # whose whole job is to produce an answer.
+        # A user file may shadow a built-in name, and then it is a user file
+        # that runs -- with its own permissions. Reading the role table first
+        # gave a `permissionMode: plan` agent the implement phase and
+        # `require_file_changes`, so it held no write tool and could never
+        # succeed, burning its whole retry budget every time.
+        shadowed = self.agents is not None and self.agents.get(role) is not None
+        if role not in roles or shadowed:
+            # Planned unless it asked to write, which is the honest default for
+            # something whose whole job is to produce an answer.
             roles[role] = ((SwarmRole.CODER if definition.is_write_capable
                             else SwarmRole.ARCHITECT),
                            SwarmPhase.IMPLEMENT if definition.is_write_capable
@@ -121,6 +180,30 @@ class DelegateSubagentTool(Tool):
             elif not root.is_dir():
                 return ToolResult(success=False, output="",
                                   error=f"Read-only subagent target directory does not exist: {target_dir}")
+            # `isolation: worktree` gives the subagent its own checkout, so its
+            # edits are reviewable rather than already applied. Parsed but
+            # ignored, the flag was a promise the file made and nothing kept.
+            worktree = None
+            manager = None
+            if definition.isolation == "worktree":
+                from adaptive_harness.workspace.worktree import WorktreeError, WorktreeManager
+
+                # The constructor itself raises outside a repository, so the
+                # check has to come first or the reason never reaches the user.
+                if not WorktreeManager.is_git_repo(root):
+                    return ToolResult(
+                        success=False, output="",
+                        error=(f"{definition.name} asks for isolation: worktree, but "
+                               f"{root} is not a git repository. An isolated agent "
+                               f"needs somewhere to put its changes."))
+                try:
+                    manager = WorktreeManager(root)
+                    worktree = manager.create()
+                except (WorktreeError, OSError, RuntimeError) as exc:
+                    return ToolResult(success=False, output="",
+                                      error=f"Could not create a worktree: {exc}")
+                root = worktree.workspace
+
             assignment = SwarmAssignment(selected_role, phase, task, root)
 
             record = None
@@ -134,6 +217,7 @@ class DelegateSubagentTool(Tool):
 
                 record = self.registry.spawn(parent_id=self.parent_id, role=role,
                                              description=task.strip()[:120])
+                record.color = definition.color
                 reporter = SubagentReporter(self.registry)
                 if self.plugins is not None:
                     self.plugins.run_subagent_start(record)
@@ -149,15 +233,37 @@ class DelegateSubagentTool(Tool):
             # The definition decides the tool surface, not just the name. An
             # agent handed write_file when its file said `permissionMode: plan`
             # would be a promise the file did not keep.
-            tools = list(definition.tools) or None
-            if tools is not None and definition.disallowed_tools:
-                tools = [name for name in tools if name not in definition.disallowed_tools]
+            # `effective_tools` applies the definition's own permissions, so a
+            # `permissionMode: plan` agent cannot be handed write_file.
+            # Two cases that look alike and need opposite defaults.
+            # Declaring no tools at all means "use the default set"; declaring
+            # tools and having every one filtered out means "this agent may do
+            # nothing" -- and handing it the full default set there is the
+            # worst possible answer, since a definition that disallowed both
+            # writing and reading would get both.
+            if not definition.tools:
+                tools = None
+            else:
+                tools = list(definition.effective_tools())
+                if not tools:
+                    return ToolResult(
+                        success=False, output="",
+                        error=(f"Every tool {definition.name} declares was removed by its "
+                               f"own permissions, so it would fall back to the full "
+                               f"default set. Give it a tool it is allowed, or drop "
+                               f"the `tools:` line to use the defaults."))
             worker = DeveloperAgentWorker(llm_client_factory=self.llm_client_factory,
                 repository=self.repository, safety_profile=self.safety_profile,
                 step_policy=self.step_policy,
                 max_steps=definition.max_turns or self.max_steps,
                 tool_names=tools,
                 system_prompt=definition.system_prompt or None,
+                # `model:` and `effort:` are the reason a subagent can cost
+                # less than the parent. Parsed but ignored, they were a promise
+                # the file made and the harness did not keep.
+                explicit_model=definition.model or None,
+                forced_thinking=definition.effort or None,
+                memory_tier=definition.memory or "",
                 on_event=forward)
             # A definition marked `background: true` runs without holding the
             # caller's turn. The id comes back immediately and the result is
@@ -183,6 +289,9 @@ class DelegateSubagentTool(Tool):
                     # the precise state a monitoring view exists to prevent.
                     try:
                         result = run_it()
+                        if worktree is not None:
+                            result = self._finish_isolated(manager, worktree,
+                                                           result, definition)
                         self._background[record.id] = {"result": result, "done": True}
                     except Exception as exc:  # noqa: BLE001 - reported, not lost
                         result = None
@@ -205,6 +314,8 @@ class DelegateSubagentTool(Tool):
                     "how_to_collect": "call background_result with this id",
                 }), metadata={"agent_id": record.id, "background": True})
             result = run_it()
+            if worktree is not None:
+                result = self._finish_isolated(manager, worktree, result, definition)
             # A stop hook may send a correction back to the subagent. This is
             # what makes the hook useful rather than decorative: "you did not
             # run the tests" has to reach the model that can act on it.
@@ -234,10 +345,26 @@ class DelegateSubagentTool(Tool):
             # subagent's chatter into every later request is one of the largest
             # avoidable costs in a tool loop, and the full stream is still
             # available in the monitoring view for anyone who asks.
-            payload = result.to_dict()
+            # What the parent receives is what gets replayed on every later
+            # request, so it is bounded here rather than in the display. The
+            # ledger is the capped account; the raw summary and the full tool
+            # evidence stay in the registry for anyone who asks to see them.
+            payload = {
+                "role": result.role.value,
+                "phase": result.phase.value,
+                "success": result.success,
+                "verified": result.verified,
+                "error": result.error,
+                "agent_id": record.id if record is not None else None,
+                "summary": (result.summary or "")[:RESULT_TO_PARENT_CHARS],
+                "ledger": record.ledger() if record is not None else "",
+            }
             if record is not None:
-                payload["agent_id"] = record.id
-                payload["ledger"] = record.ledger()
+                payload["tools"] = len(record.tools)
+                payload["input_tokens"] = record.input_tokens
+                payload["output_tokens"] = record.output_tokens
+                payload["elapsed_ms"] = record.elapsed_ms
+                payload["truncated"] = len(result.summary or "") > RESULT_TO_PARENT_CHARS
             # A tool the definition asked for and this build does not have. The
             # run continues without it, so the fact has to reach the user: an
             # agent quietly missing the tool it was declared with is a promise the
