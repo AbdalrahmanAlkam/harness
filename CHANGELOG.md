@@ -1,12 +1,178 @@
 # Changelog
 
-All notable changes to Adaptive Agent Harness. The entries under
-`[Unreleased]` cover the work in this push; earlier history is summarized in
-`git log`.
+All notable changes to Adaptive Agent Harness.
 
-## [Unreleased]
+`[2.0.0]` is the first public release. Anything earlier was development on an
+unpublished tree and is summarized in `git log` rather than here.
 
-### Added
+## [2.0.0] - 2026-09-29
+
+First public release. This is the version a customer installs; everything
+before it was development on an unpublished tree.
+
+### Fixed in this release
+The audit that produced this release found several ways the harness could
+assert something that had not happened. Those are the substantive changes:
+
+- The paper's Lean appendix listed every `.lean` file under a heading calling
+  them verified, including files the gate had rejected for a `sorry`. It now
+  lists only certified files, so a rejected proof can no longer appear in the
+  published PDF as a verified one.
+- The abstract and conclusion were hardcoded prose selected by a topic
+  substring. A run about the sum of the first n integers concluded that
+  balanced load allocation minimises delay variance. Both are now derived from
+  the verdicts the run actually reached.
+- `run_lean_proof` was the one file-touching tool that skipped workspace
+  containment: a model-supplied path could read any file the user can read and
+  overwrite any file it can write. It also certified a file declaring no
+  theorem, because Lean exits 0 on an empty file.
+- `5/0` evaluated to infinity and passed verification as a numeric answer. The
+  arithmetic verifier now re-evaluates the expression instead of checking only
+  that the value is a number, and roots are compared relatively so a true root
+  of 8.1e-9 is no longer reported as 0.0.
+- Prompt caching sent `cache_control` as a top-level field, which marks no
+  prefix. The system prompt and tool schemas were re-billed in full on every
+  step of every run. The breakpoint now lands on the system message.
+- A stop by the overseer left declared tool calls unanswered, which made every
+  later turn of a reused session fail the provider's validation.
+- The research swarm pinned every worker to one private model, so a customer
+  without access to it could not run research at all.
+
+### Added in this release
+- **A plugin system.** Anything most users will not use ships as a plugin
+  rather than in the core. A plugin can contribute a tool the model may call, a
+  skill, a persistent setting, a prompt override, a slash command with a model
+  or tier override, an MCP server, a specialist subagent, a context fragment,
+  and a hook. Adding one requires no change to a file in `src/adaptive_harness`.
+  Project-supplied plugins are off by default, so cloning a repository cannot
+  make it execute anything.
+- **`harness plugin init|validate|pack|list|info`.** `validate` checks a
+  manifest, its permissions, and its handlers by *parsing* the module rather
+  than importing it, so validating something you have not decided to trust does
+  not run it. A scaffolded plugin passes validation with zero edits.
+- **Hooks that can deny.** A `PRE_TOOL` hook runs before the risk classifier,
+  before the safety profile, and before dispatch, and may allow, deny with a
+  reason, or rewrite arguments. A hook that raises blocks the call rather than
+  failing open. A `POST_TOOL` hook may redact a successful result and
+  structurally cannot touch a failure.
+- **MCP support.** The host supervises the server subprocess, does the JSON-RPC
+  handshake, and exposes each remote tool through the existing tool adapter, so
+  the agent loop needs no MCP branch. Remote tools are pinned to network risk
+  and the manifest cannot downgrade them. No third-party dependency.
+- **Pluggable token estimation.** The default is still zero-dependency, but it
+  now counts CJK at roughly a token per character instead of four characters per
+  token — the old estimate was low by about 3x on Chinese, which let a request
+  run well past the window before anything compacted.
+- **A context plane.** Everything context-bearing reaches the model through
+  one module. A fragment is matched by a cheap local trigger, scored by a local
+  relevance classifier, and admitted only if it fits the budget — so a plugin
+  never gets its text into context by asserting it might be useful. Pinned
+  fragments (project instructions) survive a full window; everything else is
+  admitted by priority or by score, and every rejection carries a reason. A
+  plugin that understates its own size is measured rather than believed.
+  Project instructions load from `AGENTS.md` and `.harness/instructions/*.md`.
+- **A Quality Controller.** The requirements are extracted from your request
+  before the model acts, every tool result is recorded as evidence while it
+  runs, and the final answer is checked against that evidence. A summary that
+  claims work no tool call supports is reported, itemised, and — with
+  `--quality-gate` — sent back for repair rather than restarted. The gate never
+  rewrites your model's text; it reports, and the model authors. It reports by
+  default and only blocks when you ask it to, because a lexical evidence match
+  is a real signal but not a proof, and a gate that cries wolf gets switched
+  off.
+- **Permission rules.** `.harness/rules.json` holds ordered allow/deny/ask rules
+  over tool calls, evaluated inside the safety gate so a permissive
+  `--safety-profile` cannot route around them. First match wins and deny wins
+  ties. A deny must say why, a rule pattern must be a valid regex, a broken
+  rules file is reported rather than silently becoming "no rules", and
+  arguments are whitespace-normalized so a rule cannot be defeated by an extra
+  space. Rules are re-read per call, so tightening a policy takes effect on the
+  next tool call rather than the next run.
+- **Durable memory in three tiers.** Project instructions load from `AGENTS.md`
+  and `.harness/instructions/*.md`. A memory the *model* proposes never takes
+  effect on its own: it is scored for whether it is a durable project fact or a
+  one-off observation, shown as a one-line diff, and applies only when you
+  accept it. Memories that name a credential are refused before anything is
+  written, and accepted memories are private, revocable, and listed by
+  `/memory` or `adaptive-harness memory`.
+- **New commands.** `/context` shows the context budget waterfall — what is held,
+  what was admitted, what was deferred and why. `/doctor` checks that this
+  installation can do what it claims, reporting an absent optional tool as absent
+  rather than as fine. `/memory` manages durable memory.
+- **A non-interactive contract.** Exit codes now mean something a script can
+  branch on: `0` completed, `1` the agent did not finish, `2` a gate refused,
+  `3` a budget ceiling was reached, `4` something the run needed was missing.
+  `dev --json` emits one JSON object per event plus a summary, written straight
+  to stdout so Rich cannot wrap it into something unparsable. `--max-cost` and
+  `--max-turns` halt a run deterministically with an attributed stop reason
+  instead of an unexplained truncation.
+- **Classifier self-calibration.** Every routing decision is tracked against
+  what the run actually did, and a decision threshold is adjusted within
+  bounded limits to hold a target accuracy. Drift is emitted as an event rather
+  than logged, because a log line nobody reads is not a signal. A classifier
+  that degrades silently makes every run quietly worse, and the cost of being
+  worse is invisible until someone notices the bill.
+- **Measured calibration for the quality gate.** A gate that cries wolf gets
+  switched off, which is worse than having none, so the claim gate is now scored
+  against a labelled set of honest and hallucinated reports. Doing so found
+  three real defects: a path like `src/parse.py` never matched the word
+  "parser", so a genuine edit was read as a fabrication; merely *listing* a
+  tests directory satisfied "run the test suite"; and the agent recorded no
+  evidence at all, so the gate had nothing to judge against.
+- **Language-server and project-memory plugins.** `lsp` gives definitions,
+  references, hover and diagnostics with no language server installed, and says
+  so rather than pretending. `agents-md` loads `AGENTS.md` and
+  `.harness/instructions/*.md` as a pure reader — it never writes to them.
+- **The core ships with no plugins.** An install is a working agent and nothing
+  else; every extra capability is something you choose. Official plugins live
+  beside the harness and install with `adaptive-harness plugin install <name>`,
+  which validates before copying and never overwrites silently. There is no
+  privileged tier — an official plugin lands in the same directory as a
+  community one and is trusted exactly as much.
+- **`prompts list` is readable.** The audit view grouped by what can trigger
+  each prompt, with previews that fit the terminal instead of cutting
+  mid-word. It was previously 41 flat rows whose previews were fragments of the
+  middle of the text and wrapped into each other at any width.
+- **`prompts edit` and `prompts reset`.** Edit a prompt in `$EDITOR` and it
+  is saved as an override; reset one, or all of them, back to the built-in text.
+  The built-in prompts are never modified, so an upgrade never fights your
+  changes. A reset that leaves the prompt overridden — because a second file
+  also overrides it — says so instead of reporting a success that did not
+  happen.
+- **Subagent hooks and background agents.** `SubagentStart` / `SubagentStop`
+  equivalents let a plugin review a finished subagent and send a correction
+  back, so a hook is a control rather than an observer. `background: true` (or
+  `wait: false`) returns an agent id immediately instead of holding your turn,
+  and the result is collected later; the agent still registers, so `/tasks` sees
+  it start and finish.
+- **Subagents you define yourself.** A subagent is now a markdown file with a
+  frontmatter block under `.harness/agents/`, so you can add a database
+  reviewer or a performance auditor without editing the harness, and share it
+  with whoever works on the same repository. The frontmatter keys match the ones
+  Claude Code documents, so a definition written for either works in both.
+  `tools`, `model`, `permissionMode`, `maxTurns`, `effort`, `isolation` and
+  `background` are acted on; anything else is carried rather than dropped. The
+  four built-in roles still work, and a definition may shadow one of them.
+  `harness agent init <name>` scaffolds one, and `/tasks` lists what you can
+  spawn alongside what is running.
+- **Named, watchable subagents.** Every subagent now has a short readable id
+  (`agent_7f3a`) carried on every one of its events, so a run with several in
+  flight can be read, referred to, and accounted for. `/tasks` reports status,
+  tool counts, tokens and elapsed time for every agent without the run having
+  been watched, and the payload naming follows Claude Code's documented
+  `SubagentStart`/`SubagentStop` fields (`agent_id`, snake_case) so a plugin
+  written against that shape reads it correctly.
+  A subagent's chatter is no longer replayed into the parent: what comes back is
+  a bounded ledger, which is the difference between paying for a summary once
+  and paying for it on every later request.
+- Mid-turn steering: type while the agent works and the note reaches the model
+  at the start of the next step, with `!` to stop and redirect instead.
+- Task cancellation on Escape, cooperative and attributed.
+- An enforced per-worker token budget on research runs.
+- A LICENSE, SECURITY.md, and CONTRIBUTING.md.
+
+### Changed
+- A fresh session now starts in coding mode with the swarm off.
 - **A settings screen.** F7 or `/settings` lists every persistent setting with
   its live value, instead of one command and one function key per knob. Short
   fixed sets cycle in place; the two model rows open the existing catalogue
@@ -290,7 +456,7 @@ document says so rather than claiming a completed paper.
   durable record rather than re-running the compiler.
 - **Lean 4 as the machine-checked epistemic proof engine.** `RunLeanProofTool`
   (`run_lean_proof`) compiles and adjudicates Lean sources, and a sixth
-  invariant, `formal_verification`, requires that any theorem the paper asserts
+  invariant, `lean_formal_soundness`, requires that any theorem the paper asserts
   is machine-checked. The paper gains a *Formal Foundations* section with a
   certification box per proof and an appendix listing the full sources.
 - **The zero-sorry invariant, enforced three independent ways.** Established
@@ -386,9 +552,12 @@ document says so rather than claiming a completed paper.
   `linarith`, or `ring_nf`, so polynomial identities are distributed by hand.
   The tool still prefers `lake env lean` when a `lakefile` is present, so a
   Mathlib environment is used automatically where one exists.
-- The research swarm defaults to **mechanical mode**: no language model is called
-  unless `--author` is passed, so a default run makes zero network requests and
-  costs nothing. All verification is local and deterministic.
+- The research swarm is **live by default**: it calls a real model and costs
+  real money, so a default run is not free. `--offline-legacy` runs the earlier
+  fixed-topic examples with no network requests and no cost, and exists for
+  reproducing those examples rather than for normal use. All verification —
+  exact derivation, SymPy, Lean, the ledger — is local and deterministic either
+  way, and a run reports a cost estimate so the spend is visible.
 
 ### Added (earlier)
 - **Classifier-driven tool-step policy** (`--step-policy classifier|fixed|unbounded`,
@@ -396,7 +565,7 @@ document says so rather than claiming a completed paper.
   fixed step cap: the runtime overseer injects a visible stop-circling system
   prompt when the agent repeats unnecessary tool calls and stops the run with a
   termination verdict when interventions fail. `fixed` restores the previous
-  hardcoded budgets (4–20 steps by thinking level, cap 32); `unbounded` removes
+  hardcoded budgets (4–24 steps by thinking level, cap 32); `unbounded` removes
   the cap and all interventions. Explicit `max_steps` always wins, and swarm
   subagents inherit the session policy.
 - **Prompt-injection and system-prompt visibility.** Every classifier or harness

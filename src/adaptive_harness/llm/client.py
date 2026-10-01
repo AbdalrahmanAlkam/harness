@@ -56,6 +56,36 @@ def _fenced_tool_calls(content: str | None, tools: List[Dict[str, Any]] | None) 
     return calls
 
 
+def _with_cache_breakpoint(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Mark the stable conversation prefix as cacheable.
+
+    Anthropic prompt caching is opt-in per content block: the provider hashes
+    everything up to and including the last block carrying
+    ``cache_control`` and serves it from cache on later requests. The harness's
+    system prompt and the tool definitions are byte-identical on every step of a
+    run, so they are the ideal cached prefix -- but only if the marker is placed
+    on them. Without this, a 20-step loop re-bills the entire system prompt
+    twenty times.
+
+    The message list is copied, never mutated: ``self.messages`` is reused
+    across a whole session and the caller must not see a rewritten form.
+    """
+    marked: List[Dict[str, Any]] = []
+    breakpoint_placed = False
+    for message in messages:
+        if not breakpoint_placed and message.get("role") == "system":
+            content = message.get("content")
+            text = content if isinstance(content, str) else "".join(
+                block.get("text", "") for block in content if isinstance(block, dict))
+            marked.append({**message, "content": [
+                {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}},
+            ]})
+            breakpoint_placed = True
+            continue
+        marked.append(message)
+    return marked
+
+
 class LLMClient:
     """Multi-tier LLM Client with OpenRouter support and seamless offline fallback."""
 
@@ -212,10 +242,15 @@ class LLMClient:
                 "type": "enabled", "budget_tokens": max(1024, reasoning_budget_tokens)}
             kwargs["max_completion_tokens"] = max(1024, reasoning_budget_tokens) + 2048
 
-        # OpenRouter advances Anthropic's cache breakpoint as the conversation grows.
-        # Other providers handle compatible prompt prefixes implicitly.
+        # Anthropic prompt caching marks a *prefix boundary on a content block*.
+        # Sent as a top-level field it marks nothing, so every request paid full
+        # price for the system prompt and the tool schemas -- the two parts that
+        # never change between steps. That is the single largest recurring cost
+        # in a tool loop, so the system message is converted to a block list with
+        # a cache breakpoint on it. A cached prefix is typically an order of
+        # magnitude cheaper per token than the same tokens sent fresh.
         if is_openrouter and model_name.startswith("anthropic/claude"):
-            kwargs.setdefault("extra_body", {})["cache_control"] = {"type": "ephemeral"}
+            kwargs["messages"] = _with_cache_breakpoint(messages)
         if is_openrouter:
             # The OpenAI SDK has no `usage` keyword. `extra_body` sends this
             # OpenRouter extension as a top-level JSON field instead.

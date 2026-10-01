@@ -149,8 +149,21 @@ class AlgorithmStrategy(Strategy):
                 )
 
         # Parse edges: e.g. A-B:1.5 or A->B:2 or A-B (default weight 1)
+        # Scan only the `edges=` section, so the task's own marker word cannot be
+        # read as a graph edge -- `shortest-path:` used to inject a phantom
+        # SHORTEST--PATH edge of weight 1 into the graph.
         edges_str = text
-        edge_matches = re.findall(r"([a-zA-Z0-9_]+)\s*(?:-|->)\s*([a-zA-Z0-9_]+)(?:\s*[:=]\s*(\d+(?:\.\d+)?))?", edges_str)
+        section = re.search(r"edges?\s*[:=]\s*(.+)$", text)
+        if section:
+            edges_str = section.group(1)
+        # The weight may be signed, exponential, or carry thousands separators.
+        # Previously a leading `-` simply failed to match and the edge silently
+        # defaulted to 1.0, so `A-B:-5` reported a cost of 1 and verified.
+        edge_matches = re.findall(
+            r"([a-zA-Z0-9_]+)\s*(?:-|->)\s*([a-zA-Z0-9_]+)"
+            r"(?:\s*[:=]\s*([-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?))?",
+            edges_str,
+        )
         if not edge_matches:
             return Result(
                 value=None,
@@ -163,10 +176,23 @@ class AlgorithmStrategy(Strategy):
         parsed_edges = []
         for u, v, w in edge_matches:
             u, v = u.upper(), v.upper()
-            weight = float(w) if w else 1.0
+            weight = float(w.replace(",", "")) if w else 1.0
             graph.setdefault(u, []).append((v, weight))
             graph.setdefault(v, []).append((u, weight))  # undirected
             parsed_edges.append((u, v, weight))
+
+        # Dijkstra is only correct for non-negative weights, and it does not
+        # merely misreport on a negative edge -- it re-relaxes forever and hangs.
+        # Now that a signed weight parses at all, refuse rather than spin.
+        if any(weight < 0 for _, _, weight in parsed_edges):
+            return Result(
+                value=None,
+                strategy_name=self.name,
+                success=False,
+                error=("Shortest path requires non-negative edge weights. A negative "
+                       "weight is a shortest-path problem with a different algorithm "
+                       "(Bellman-Ford), not a Dijkstra one."),
+            )
 
         # Dijkstra algorithm
         dist: Dict[str, float] = {start: 0.0}

@@ -11,6 +11,17 @@ from adaptive_harness.models.domain import Task, Result, VerificationResult
 from adaptive_harness.strategies.base import Strategy
 
 
+def _checked_div(a: Union[int, float], b: Union[int, float]) -> Union[int, float]:
+    """Divide, refusing an undefined result rather than inventing one.
+
+    ``5/0`` used to evaluate to ``inf`` and then pass verification as a numeric
+    answer. Undefined is not a number, so it is reported as an error.
+    """
+    if b == 0:
+        raise ValueError("division by zero is undefined")
+    return a / b
+
+
 class SafeArithmeticEvaluator:
     """Safe AST-based arithmetic expression evaluator.
 
@@ -22,7 +33,10 @@ class SafeArithmeticEvaluator:
         ast.Add: lambda a, b: a + b,
         ast.Sub: lambda a, b: a - b,
         ast.Mult: lambda a, b: a * b,
-        ast.Div: lambda a, b: a / b if b != 0 else float("inf"),
+        # Division by zero is undefined, not infinity. Returning inf here made
+        # `5/0` a plausible-looking number that downstream code then reported as
+        # a verified answer.
+        ast.Div: lambda a, b: _checked_div(a, b),
         ast.FloorDiv: lambda a, b: a // b,
         ast.Mod: lambda a, b: a % b,
         ast.Pow: lambda a, b: SafeArithmeticEvaluator._safe_pow(a, b),
@@ -334,10 +348,30 @@ class ArithmeticStrategy(Strategy):
                 return VerificationResult(success=True, reason="Modulo verified")
 
             elif op in ("square", "cube", "sqrt", "expression"):
-                # Independent evaluation check
-                if isinstance(val, (int, float)):
+                # Actually re-evaluate rather than assert the value is a number.
+                # The old check was `isinstance(val, (int, float))`, which passed
+                # for a wrong answer and for `inf` alike, so it rubber-stamped
+                # the parse defects this strategy is prone to.
+                expr = result.metadata.get("expr")
+                if expr is not None and not math.isinf(val) and not math.isnan(val):
+                    try:
+                        recomputed = SafeArithmeticEvaluator().evaluate(str(expr))
+                    except Exception as exc:
+                        return VerificationResult(
+                            success=False, reason=f"Could not re-evaluate {expr!r}: {exc}")
+                    if recomputed is not None and not math.isclose(float(recomputed), float(val),
+                                                                 rel_tol=1e-9, abs_tol=1e-12):
+                        return VerificationResult(
+                            success=False,
+                            reason=(f"Re-evaluation disagrees: {expr!r} is {recomputed}, "
+                                    f"not {val}"))
                     return VerificationResult(success=True, reason="Numeric calculation verified")
-                return VerificationResult(success=False, reason=f"Unexpected value type: {type(val)}")
+                if not isinstance(val, (int, float)):
+                    return VerificationResult(success=False, reason=f"Unexpected value type: {type(val)}")
+                if math.isinf(val) or math.isnan(val):
+                    return VerificationResult(
+                        success=False, reason=f"Result is not a finite number: {val}")
+                return VerificationResult(success=True, reason="Numeric calculation verified")
 
             return VerificationResult(success=True, reason="Arithmetic result valid")
 

@@ -136,6 +136,12 @@ async def test_dragging_over_the_chat_log_copies_the_dragged_range(tmp_path: Pat
         copied: list[str] = []
         app.copy_to_clipboard = copied.append
         app._handle_slash_command("/copy")
+        # Delivery runs on a worker thread so a slow clipboard helper cannot
+        # freeze the interface, so wait for it rather than assuming it is done.
+        for _ in range(40):
+            if copied:
+                break
+            await pilot.pause()
         assert copied == ["COPYME-UNIQ"]
 
 

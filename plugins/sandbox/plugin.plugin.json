@@ -1,0 +1,42 @@
+{
+  "name": "sandbox",
+  "version": "1.0.0",
+  "description": "Run a shell command under OS-level confinement, and say which backend (if any) actually confined it.",
+  "author": "Adaptive Agent Harness",
+  "permissions": ["tools", "subprocess"],
+  "tools": [
+    {
+      "name": "sandbox_run",
+      "description": "Run a command under an OS-level sandbox. Detects which confinement backends this machine actually supports, runs the command under the best one, and reports which backend was used -- including saying plainly when no confinement was available.",
+      "handler": "sandbox_run",
+      "risk": "exec",
+      "domains": ["coding", "research"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "The command as an argv list, e.g. [\"pytest\", \"-q\"]. Prefer this: an argv list is never passed through a shell, so nothing in it is expanded, globbed or word-split."
+          },
+          "backend": {
+            "type": "string",
+            "description": "Which backend to use: landlock, bubblewrap, seatbelt, container, none, or \"auto\" to pick the best available. Defaults to auto. A name this plugin does not implement is refused rather than silently replaced.",
+            "enum": ["auto", "landlock", "bubblewrap", "seatbelt", "container", "none"],
+            "default": "auto"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "Seconds before the process group is killed. Defaults to 120, maximum 300.",
+            "default": 120
+          },
+          "workspace": {
+            "type": "string",
+            "description": "The directory the backends confine writes to. Defaults to the current working directory. Refused if it is the filesystem root, where confinement would be meaningless."
+          }
+        },
+        "required": ["command"]
+      }
+    }
+  ]
+}

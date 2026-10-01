@@ -121,7 +121,12 @@ def test_worker_iterates_in_a_tool_loop_and_logs_its_trajectory(tmp_path: Path):
     assert entries[0].recipient["role"] == "Theoretical Lead"
 
 
-def test_research_roles_use_space_bunny_alpha_only(tmp_path: Path):
+def test_research_workers_use_the_operator_chosen_model(tmp_path: Path):
+    """The swarm must not override the model the operator selected.
+
+    It used to pin every research worker to one private slug, so a customer
+    without access to that model could not run research at all.
+    """
     swarm = _swarm(tmp_path, [])
     agent_id = swarm.spawn_subagent("theory_lead_01", "SymPy Prover", "write a proof",
                                     ["write_file"])
@@ -131,6 +136,7 @@ def test_research_roles_use_space_bunny_alpha_only(tmp_path: Path):
     def factory():
         client = ScriptedClient([("write_file", {
             "path": str(target.relative_to(swarm.workspace.root)), "content": PROOF_BODY})])
+        client.default_model = "some/other-model"
         clients.append(client)
         return client
 
@@ -138,7 +144,7 @@ def test_research_roles_use_space_bunny_alpha_only(tmp_path: Path):
     swarm._run_worker(swarm.agents[agent_id], Division.THEORY, "Write a proof.",
                       success_criterion="File exists.", target=target)
     assert clients
-    assert all(client.default_model == "stealth/space-bunny-alpha" for client in clients)
+    assert all(client.default_model == "some/other-model" for client in clients)
 
 
 def test_division_leads_only_author_assignments(tmp_path: Path):
@@ -238,10 +244,24 @@ def test_theory_and_formal_workers_can_reach_the_lean_prover(tmp_path: Path):
         assert outcome["tool_calls"] == 1
 
 
-def test_unsupported_worker_tools_are_rejected_loudly():
+def test_one_unavailable_tool_is_dropped_and_reported():
+    """A definition is a file a person writes, so one stale tool name -- a
+    rename, a typo, a tool from a newer build -- costs that tool rather than the
+    run. It is never silent, though: the name is recorded for the caller."""
     from adaptive_harness.agent.swarm import DeveloperAgentWorker
 
     worker = DeveloperAgentWorker(tool_names=("read_file", "teleport"))
+    tools = worker._build_tools("/tmp", None)
+    assert [tool.name for tool in tools] == ["read_file"]
+    assert worker.unknown_tools == ["teleport"], (
+        "a dropped tool was dropped silently, which is the failure this guards")
+
+
+def test_a_definition_with_no_usable_tools_is_still_refused():
+    """An agent that cannot do anything is not worth starting."""
+    from adaptive_harness.agent.swarm import DeveloperAgentWorker
+
+    worker = DeveloperAgentWorker(tool_names=("teleport", "levitate"))
     with pytest.raises(ValueError, match="teleport"):
         worker._build_tools("/tmp", None)
 

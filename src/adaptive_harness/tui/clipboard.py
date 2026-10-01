@@ -34,7 +34,11 @@ import subprocess
 
 MIRROR_DIRECTORY = Path("output") / "clipboard"
 MIRROR_LIMIT = 50
-HELPER_TIMEOUT_SECONDS = 5.0
+#: A clipboard helper either answers immediately or is not going to answer. Five
+#: seconds is long enough that a user pressing the copy shortcut twice sees the
+#: interface appear to hang; the delivery runs on a worker thread regardless,
+#: so this only bounds how long the outcome takes to report.
+HELPER_TIMEOUT_SECONDS = 1.5
 
 #: Terminals that are known to ignore the OSC 52 clipboard sequence.
 _UNSUPPORTED_TERM_PROGRAMS = {

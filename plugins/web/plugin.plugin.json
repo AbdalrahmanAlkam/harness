@@ -1,0 +1,99 @@
+{
+  "name": "web",
+  "version": "1.0.0",
+  "description": "Fetch a public web page as readable markdown, and search if an API key is set. Guarded against SSRF, with a size cap and per-host rate limit.",
+  "author": "Adaptive Agent Harness",
+  "permissions": [
+    "env",
+    "net",
+    "tools"
+  ],
+  "tools": [
+    {
+      "name": "web_fetch",
+      "description": "Fetch a public http(s) URL and return the page as markdown: headings, lists, links and code preserved, scripts and styling removed. Use this to read a documentation page, an article, a spec or a changelog. Refuses private, loopback and link-local addresses (including a public hostname that resolves to one), refuses any scheme other than http/https, caps the body at 5 MB, follows at most 5 redirects, and allows 5 requests per host per minute. If you only need to know whether a page is worth reading, call read_result first.",
+      "handler": "web_fetch",
+      "risk": "net",
+      "domains": [
+        "research",
+        "coding"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The full http:// or https:// URL to fetch. A bare hostname is not enough, and a non-http(s) scheme is refused. Must be a public address: private, loopback and link-local targets are refused even if the name looks public."
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 200,
+            "maximum": 400000,
+            "default": 20000,
+            "description": "How many characters of markdown to return. The default of 20000 is roughly a full article. Raise it for long documentation, lower it to save context. The page itself is capped at 5 MB regardless."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    },
+    {
+      "name": "read_result",
+      "description": "Fetch a URL and report its shape -- final URL after redirects, HTTP status, content type, byte size, how much readable text it holds -- plus the first few thousand characters. Cheaper than web_fetch for deciding whether the rest of a page is worth reading, which is what it is for. Same SSRF guard, size cap and rate limit as web_fetch.",
+      "handler": "read_result",
+      "risk": "net",
+      "domains": [
+        "research",
+        "coding"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The full http:// or https:// URL to inspect. Non-http(s) schemes and private or loopback targets are refused."
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 200,
+            "maximum": 100000,
+            "default": 4000,
+            "description": "How many characters of the page to preview. The size and type summary is returned in full regardless."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    },
+    {
+      "name": "web_query",
+      "description": "Search the web and return titles, URLs and snippets. Requires BRAVE_SEARCH_API_KEY (or ADAPTIVE_HARNESS_SEARCH_API_KEY) in the environment; with no key it returns a message saying so and does nothing else, so it is safe to call before you know. Named web_query rather than web_search because the harness already ships a built-in web_search tool and a plugin cannot shadow a built-in. Prefer web_fetch when you already have a URL.",
+      "handler": "web_query",
+      "risk": "net",
+      "domains": [
+        "research"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The search terms. Plain keywords work best; natural-language questions return worse results."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 5,
+            "description": "How many results to return. Defaults to 5."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  ]
+}

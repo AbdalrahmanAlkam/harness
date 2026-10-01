@@ -5,14 +5,21 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from adaptive_harness.agent.compaction import compact_tool_output
+from adaptive_harness.agent.compaction import OPERATOR_PREFIX, compact_tool_output
+from adaptive_harness.agent.hierarchical import compact_hierarchically
 from adaptive_harness.llm.providers import context_window
 
 
 def estimate_tokens(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> int:
-    # A conservative character estimate until the provider reports usage.
-    serialized = json.dumps({"messages": messages, "tools": tools or []}, ensure_ascii=False, default=str)
-    return max(1, (len(serialized) + 3) // 4)
+    """Estimate the tokens a request would use.
+
+    Delegates to the active backend in `tokenizer`, which is a pluggable
+    estimator rather than a fixed `len//4`. The signature is unchanged, so
+    nothing that calls this had to move when the backends arrived.
+    """
+    from adaptive_harness.agent.tokenizer import count
+
+    return count(messages, tools)
 
 
 def prepare_context(messages: list[dict[str, Any]], model: str,
@@ -37,7 +44,12 @@ def prepare_context(messages: list[dict[str, Any]], model: str,
     protected.update(range(max(0, len(copied) - 8), len(copied)))
     for index, message in enumerate(copied):
         content = str(message.get("content") or "")
-        if "Diff:\n" in content or ("--- a/" in content and "+++ b/" in content):
+        # An operator steer is a user message sitting between two assistant
+        # tool-calling turns, so it lands squarely inside the old-turn window
+        # that the second pass replaces with a summary. Without this it would be
+        # reduced to nothing a few steps after the user typed it.
+        if (content.startswith(OPERATOR_PREFIX) or "Diff:\n" in content
+                or ("--- a/" in content and "+++ b/" in content)):
             protected.add(index)
     for index, message in enumerate(copied):
         if index in protected or message.get("role") != "tool":
@@ -49,20 +61,21 @@ def prepare_context(messages: list[dict[str, Any]], model: str,
 
     used = estimate_tokens(copied, tools)
     if used / capacity > threshold:
-        # Summarize only complete old turns, avoiding dangling tool-call pairs.
-        cutoff = max(1, len(copied) - 8)
-        first_old_user = next((i for i in range(1, cutoff) if copied[i].get("role") == "user"), None)
-        if first_old_user is not None:
-            end = max((i for i in range(first_old_user + 1, cutoff)
-                       if copied[i].get("role") == "user"), default=cutoff)
-            old = copied[first_old_user:end]
-            if old and not any(i in protected for i in range(first_old_user, end)):
-                requests = [str(item.get("content") or "")[:180] for item in old if item.get("role") == "user"]
-                outcomes = [str(item.get("content") or "")[:220] for item in old
-                            if item.get("role") == "assistant" and not item.get("tool_calls")]
-                note = "Earlier conversation summary (original turns retained in session storage):\n"
-                note += "Requests: " + " | ".join(requests[-6:]) + "\nOutcomes: " + " | ".join(outcomes[-6:])
-                copied[first_old_user:end] = [{"role": "user", "content": note[:2400]}]
+        # Map->reduce over the old cohort, replacing a single lossy pass. A
+        # second attempt is made if one fold was not enough.
+        # The foldable region starts after the protected head, which is the
+        # system message and anything pinned before it.
+        head = (max(protected) + 1) if protected else 0
+        tail = 8
+        for _ in range(2):
+            folded, report = compact_hierarchically(
+                copied, protected=protected, head=head, tail=tail,
+                estimate=lambda items: estimate_tokens(items, tools))
+            if not report.generations and report.messages_after == report.messages_before:
+                break
+            copied = folded
+            if estimate_tokens(copied, tools) / capacity <= threshold:
+                break
 
     compacted = estimate_tokens(copied, tools)
     info["compacted_tokens"] = max(0, original - compacted)

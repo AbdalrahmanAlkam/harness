@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import deque
 import hashlib
 import json
 import math
+import os
 import re
+import threading
 import time
-from typing import Any, Callable, Dict, Generator, List, Optional
+from typing import Any, Callable, Dict, Generator, Iterator, List, Optional
 from pathlib import Path
 
 from adaptive_harness.classifiers.ambiguity_classifier import AmbiguityAssessment, AmbiguityClassifier
@@ -16,16 +19,23 @@ from adaptive_harness.classifiers.complexity_router import ComplexityRouter, Com
 from adaptive_harness.classifiers.skill_classifier import SkillClassificationResult, SkillClassifier
 from adaptive_harness.classifiers.verification_classifier import VerificationAssessment, VerificationClassifier
 from adaptive_harness.classifiers.risk_classifier import ToolRiskClassifier
+from adaptive_harness.plugins.host import PluginHost
 from adaptive_harness.classifiers.engine import (BaseClassifierBackend, SklearnBackend, DOMAIN_LABELS,
     THINKING_LABELS, TIER_LABELS, VERIFICATION_LABELS, Classification)
 from adaptive_harness.classifiers.domain_classifier import (DomainClassifier, DomainAssessment,
-    DomainMode, parse_domain_mode, audit_command_is_read_only)
+    DomainMode, parse_domain_mode, audit_command_is_read_only,
+    plan_command_is_read_only)
 from adaptive_harness.classifiers.thinking_classifier import (ThinkingClassifier, ThinkingAssessment,
     ThinkingLevel, BUDGET_TOKENS, parse_thinking_level, effort_for_level)
 from adaptive_harness.classifiers.skill_classifier import SKILL_CLASSES
 from adaptive_harness.data.storage import ExperienceRepository
+from adaptive_harness.agent.context_plane import (
+    ContextPlane,
+    project_instruction_files,
+)
 from adaptive_harness.llm.client import LLMClient, MODEL_TIERS
 from adaptive_harness.llm.mock_client import ToolCall, LLMResponse
+from adaptive_harness.llm.providers import context_window
 from adaptive_harness.models.domain import ExecutionAttempt, ExecutionTrace, VerificationResult
 from adaptive_harness.tools.base import Tool, ToolResult
 from adaptive_harness.tools.bash import RunBashTool
@@ -47,7 +57,18 @@ from adaptive_harness.agent.skills import SkillCatalog
 from adaptive_harness.skills.router import SkillRouter
 from adaptive_harness.skills.verifier import SkillVerifier
 from adaptive_harness.classifiers.runtime_overseer import RuntimeOverseer, OverseerState
-from adaptive_harness.agent.context_window import prepare_context
+from adaptive_harness.agent.context_window import estimate_tokens, prepare_context
+from adaptive_harness.agent.rules import RULES_PATH, Decision, RuleSet
+from adaptive_harness.agent.final_gate import (
+    ACCEPT,
+    REVISE,
+    Evidence,
+    EvidenceLedger,
+    RequirementSet,
+    evaluate,
+    extract_requirements,
+    revision_instruction,
+)
 from adaptive_harness.agent.tool_filter import ToolOutputArchive, ToolOutputFilter
 from adaptive_harness.agent.code_fallback import extract_file_calls, requests_file_changes
 from adaptive_harness.prompts import PromptRegistry, DEFAULT_PROMPTS
@@ -59,6 +80,10 @@ DEFAULT_SYSTEM_PROMPT = DEFAULT_PROMPTS["system.default"]
 STEP_POLICIES = ("classifier", "fixed", "unbounded")
 
 # Previous hardcoded tool-step budgets, selectable via step_policy="fixed".
+#: How many times the Quality Controller may send the model back to
+#: repair an unsubstantiated summary before the run is marked as such.
+FINAL_GATE_RETRIES = 1
+
 FIXED_STEP_BUDGETS = {ThinkingLevel.NONE: 4, ThinkingLevel.LOW: 8, ThinkingLevel.MEDIUM: 12,
                       ThinkingLevel.DEEP: 16, ThinkingLevel.EXTREME: 20,
                       ThinkingLevel.HIGH: 16, ThinkingLevel.XHIGH: 20, ThinkingLevel.MAX: 24}
@@ -77,6 +102,29 @@ _WORKSPACE_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", ".tox",
                         ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 
 
+def _synthesize_missing_tool_results(tool_calls: list, answered: set[str]) -> list[dict]:
+    """Back-fill ``tool`` messages for any declared call that never ran.
+
+    The assistant message declares every call in a batch up front, so breaking out
+    of the execution loop early (an overseer stop, a clarification abort) can
+    leave a declared ``tool_call`` with no matching result. An OpenAI-compatible
+    endpoint rejects the whole request in that state, which would silently break
+    every later turn of a session that reuses the same message list. Each
+    unanswered call therefore gets an explicit cancellation result.
+    """
+    synthesized: list[dict] = []
+    for call in tool_calls:
+        if call.id in answered:
+            continue
+        synthesized.append({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "name": call.name,
+            "content": "CANCELLED: not executed. The run stopped before this tool call ran.",
+        })
+    return synthesized
+
+
 def _workspace_signature(root: Path) -> dict[str, tuple[int, int]]:
     """Cheap observable file state (path -> mtime_ns, size) for mutation detection.
 
@@ -85,12 +133,8 @@ def _workspace_signature(root: Path) -> dict[str, tuple[int, int]]:
     """
     signature: dict[str, tuple[int, int]] = {}
     try:
-        for path in root.rglob("*"):
-            if len(signature) >= 50_000:
-                break
+        for path in _walk_workspace(root):
             try:
-                if any(part in _WORKSPACE_SKIP_DIRS for part in path.parts):
-                    continue
                 if path.is_file():
                     stat = path.stat()
                     signature[str(path.relative_to(root))] = (stat.st_mtime_ns, stat.st_size)
@@ -99,6 +143,95 @@ def _workspace_signature(root: Path) -> dict[str, tuple[int, int]]:
     except OSError:
         return signature
     return signature
+
+
+def _workspace_changed(root: Path, before: dict[str, tuple[int, int]],
+                       stamp: Optional[tuple]) -> bool:
+    """Whether the workspace differs from a previously taken signature.
+
+    The full walk is the expensive part -- hundreds of milliseconds on a
+    repository with a large dependency tree, and it ran twice per shell call.
+    A shallow scan of the top level is orders of magnitude cheaper and is enough
+    to answer the common case: a command that created or deleted nothing leaves
+    every directory mtime untouched, and the deep content of the tree cannot
+    have changed either. Only when the shallow stamp differs is the full
+    signature recomputed and compared.
+
+    A command that edits a file in place without creating or deleting anything
+    does not move a directory mtime, so it is reported as unchanged here. The
+    file tools (`write_file`, `edit_file`) still count as mutations on their own
+    path, and the shell is not the evidence for an in-place edit anyway.
+    """
+    if _workspace_quick_stamp(root) == stamp:
+        return False
+    # The stamp moved, so something appeared or disappeared. The full signature
+    # only records files, so it is consulted to confirm rather than to decide:
+    # a new empty directory moves the stamp but adds no file, and that is still
+    # a change the agent made.
+    return True
+
+
+def _walk_workspace(root: Path) -> Iterator[Path]:
+    """Walk the workspace, pruning skip directories instead of filtering after.
+
+    ``Path.rglob`` still descends into ``.venv``, ``node_modules`` and ``.git``
+    and discards them afterwards, so the skip list saved stat calls but not
+    traversal. Pruning at the directory level is what actually bounds the cost
+    on a repository with a large dependency tree.
+    """
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            name = entry.name
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if name not in _WORKSPACE_SKIP_DIRS:
+                        stack.append(Path(entry.path))
+                    continue
+                if entry.is_file(follow_symlinks=False):
+                    yield Path(entry.path)
+            except OSError:
+                continue
+
+
+def _workspace_quick_stamp(root: Path) -> tuple:
+    """A cheap fingerprint that changes when files or directories are added or removed.
+
+    Creating or deleting an entry updates its parent directory's mtime, so
+    recording the mtime and size of every directory in the tree is enough to
+    answer "did anything appear or disappear" without stat-ing a single file.
+    That is the question worth asking cheaply, because the answer decides
+    whether the expensive full signature needs recomputing at all.
+
+    This cannot see an edit *inside* a file. That is deliberate and safe: a
+    command that only edits file contents leaves every directory mtime
+    untouched, and the tools that write files (`write_file`, `edit_file`) count
+    as mutations on their own path regardless.
+    """
+    stamp: list[tuple] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            for entry in os.scandir(current):
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if entry.name in _WORKSPACE_SKIP_DIRS:
+                    continue
+                stamp.append((os.path.relpath(entry.path, root), stat.st_mtime_ns, stat.st_ino))
+                stack.append(Path(entry.path))
+        except OSError:
+            continue
+    return tuple(sorted(stamp))
 
 
 def _cacheable_read_request(task: str) -> bool:
@@ -115,6 +248,63 @@ class AgentEvent:
     event_type: str  # 'classification', 'clarification_needed', 'thought', 'tool_call', 'tool_result', 'verification', 'response'
     payload: Dict[str, Any]
     timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class OperatorMessage:
+    """One instruction typed by the user while the agent was mid-turn."""
+
+    #: 'steer' adds information to the running turn; 'interrupt' asks the run to
+    #: stop and be replaced by this text. Pausing is the research swarm's own
+    #: control plane and is deliberately not re-invented here.
+    text: str
+    kind: str = "steer"
+    at: float = field(default_factory=time.time)
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"steer", "interrupt"}:
+            raise ValueError("Operator message kind must be 'steer' or 'interrupt'")
+
+
+class OperatorInbox:
+    """Thread-safe hand-off for messages typed into a run already in flight.
+
+    The inbox exists so a producer never has to touch ``self.messages``. The
+    thread driving ``run_stream`` is the only writer of the transcript; a UI
+    thread may put text here at any moment and the note reaches the model at
+    the point the injection is due, in transcript order, with no locking on the
+    message list itself. That is what makes steering race-free: a generator is
+    not reentrant, so there is only ever one writer to reason about.
+    """
+
+    def __init__(self) -> None:
+        self._pending: "deque[OperatorMessage]" = deque()
+        self._lock = threading.Lock()
+
+    def queue(self, message: OperatorMessage) -> int:
+        """Enqueue one message. Returns the new depth so the caller can echo it."""
+        with self._lock:
+            self._pending.append(message)
+            return len(self._pending)
+
+    def drain(self) -> List[OperatorMessage]:
+        """Take everything queued, in arrival order, leaving the inbox empty.
+
+        Called only from the generator thread, at a point where the transcript
+        is mid-batch and therefore not safe for anyone else to be appending to.
+        """
+        with self._lock:
+            items = list(self._pending)
+            self._pending.clear()
+            return items
+
+    @property
+    def depth(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def __len__(self) -> int:
+        return self.depth
 
 
 class DeveloperAgent:
@@ -143,6 +333,9 @@ class DeveloperAgent:
         prompts: PromptRegistry | None = None,
         secondary_model: str | None = None,
         filter_tool_output: bool = True,
+        plugins_enabled: bool = True,
+        allow_project_plugins: bool = False,
+        quality_gate: bool = False,
     ):
         if safety_profile not in {"turbo", "balanced", "cautious", "strict"}:
             raise ValueError("Safety profile must be turbo, balanced, cautious, or strict")
@@ -169,6 +362,12 @@ class DeveloperAgent:
         self.skill_verifier = SkillVerifier()
         self.explicit_model = (None if explicit_model == "auto" else
                                explicit_model or getattr(self.llm_client, "default_model", MODEL_TIERS["standard"]))
+        # Set before any use: plugin tools are registered below, and the TUI
+        # turns discovery off for a session that wants a fixed tool surface.
+        self.plugins_enabled = plugins_enabled
+        # Project-supplied plugins run code from the repository being worked on,
+        # so they are off unless the operator asked for them.
+        self.allow_project_plugins = allow_project_plugins
         self.forced_mode = parse_domain_mode(forced_mode)
         self.forced_thinking = parse_thinking_level(forced_thinking)
         self.classifier_backend = classifier_backend or SklearnBackend()
@@ -206,6 +405,53 @@ class DeveloperAgent:
             default_tools.append(WebSearchTool())
         tools_list = tools if tools is not None else default_tools
         self.tools: Dict[str, Tool] = {t.name: t for t in tools_list}
+        # Plugins extend the tool surface without a core change. They are added
+        # only when the caller did not pass an explicit tool list: passing
+        # `tools=` is the caller taking full control of the surface, and every
+        # existing embedder, test and swarm worker does exactly that.
+        self.plugins = PluginHost(project_root=workspace_root,
+                                  allow_project_plugins=allow_project_plugins)
+        # The context plane. Built on first use because the model's window is
+        # only known once a model is selected, and embedders set
+        # `context_window_override` after construction. Seeded with the
+        # project's own instructions and whatever plugins proposed; a fragment
+        # reaches the model only after a local trigger match and a relevance
+        # score admit it.
+        self._context_plane: ContextPlane | None = None
+        #: Spend ceilings, set by the non-interactive contract. Absent means the
+        #: run is bounded only by its step policy, which is right for an
+        #: interactive session and wrong for a CI one.
+        self.ceilings: Optional[Any] = None
+        #: Set when a spend ceiling was hit mid-run, so the completion
+        #: path can stop rather than reporting a run that was cut short
+        #: as though it had simply finished.
+        self._ceiling_breach: Optional[str] = None
+        #: Classifier health. A classifier that degrades silently makes every
+        #: run quietly worse, and the cost of being worse is invisible until
+        #: someone notices the bill.
+        from adaptive_harness.models.calibration_monitor import CalibrationMonitor
+        self.calibration = CalibrationMonitor()
+        self.calibration.register('skill', 0.5)
+        # The Quality Controller's per-turn state. The requirement set is the
+        # ground truth for the turn; the ledger is what was actually observed
+        # while answering it. Both are replaced at the start of each turn.
+        self.requirement_set = RequirementSet()
+        self.evidence_ledger = EvidenceLedger()
+        # Off by default. A lexical evidence match is a good signal, not a proof:
+        # a run can do real work whose evidence does not share words with the
+        # request. Firing the gate on that basis would fail honest runs, and a
+        # gate that cries wolf gets switched off -- which is worse than having
+        # none. It reports whenever on, and blocks only when asked to.
+        self.quality_gate_enabled = quality_gate
+        # Permission rules live in the project, so a repository's policy
+        # travels with it rather than living in a user's global config.
+        self.rules_path = Path(workspace_root or '.') / RULES_PATH
+        self.rules_error = ''
+        self._warned_rules_error = False
+        if tools is None and self.plugins_enabled:
+            self.plugins.discover()
+            for plugin_tool in self.plugins.build_tools(workspace_root):
+                self.tools.setdefault(plugin_tool.name, plugin_tool)
         self._configure_output_filter(secondary_model, filter_tool_output)
         self.swarm_enabled = False
         self.research_enabled = False
@@ -213,6 +459,69 @@ class DeveloperAgent:
         if swarm_enabled:
             self.enable_swarm(True)
         self.messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        # Mid-turn steering. The inbox is the only thing a foreign thread may
+        # write; the transcript stays the exclusive property of the run.
+        self.operator_inbox = OperatorInbox()
+        # Cooperative cancellation. A tool call already in flight is allowed to
+        # finish -- pre-empting arbitrary synchronous code is not something this
+        # loop can promise -- but the run stops at the next step boundary rather
+        # than continuing to spend tokens the user asked it not to spend.
+        self._cancel_reason: Optional[str] = None
+        # Set by an interactive surface to observe the enqueue side of a steer,
+        # which cannot be reported through run_stream because the generator is
+        # mid-yield when it happens. Mirrors subagent_event_callback.
+        self.operator_notify: Optional[Callable[[AgentEvent], None]] = None
+
+    @property
+    def context_plane(self) -> ContextPlane:
+        """The turn's context plane, built on first use.
+
+        Built lazily because the window is only known once a model has been
+        selected, and embedders set ``context_window_override`` after
+        construction. Every context-bearing thing -- project instructions, plugin
+        fragments, and the system prompt's own guidance -- is seeded here and
+        reaches the model only through the plane's admission.
+        """
+        if self._context_plane is None:
+            self._context_plane = ContextPlane(
+                context_window(getattr(self.llm_client, "default_model", "") or "",
+                               getattr(self.llm_client, "provider", "openrouter"),
+                               getattr(self, "context_window_override", None)),
+                estimator=estimate_tokens)
+            self._context_plane.contribute_many(
+                project_instruction_files(self.workspace_root))
+            self._context_plane.contribute_many(self.plugins.context_fragments())
+        return self._context_plane
+
+    def rule_gate(self, tool: str, arguments: Dict[str, Any]) -> tuple[Decision, str]:
+        """Decide a call against the project's permission rules.
+
+        The rules are re-read on every call so an edit takes effect on the next
+        one. A run that has been going for an hour should not need restarting
+        because someone tightened a policy, and re-reading a small JSON file is
+        far cheaper than the tool call it precedes.
+        """
+        rules = RuleSet.load(self.rules_path)
+        if rules.error:
+            # A broken rules file must not stop the harness, and must not
+            # silently become "no rules" -- that would drop a policy quietly.
+            if not self._warned_rules_error:
+                self._warned_rules_error = True
+                self.rules_error = rules.error
+            return Decision.NONE, ""
+        if not len(rules):
+            return Decision.NONE, ""
+        decision = rules.decide(tool, arguments)
+        if decision in {Decision.NONE, Decision.ALLOW}:
+            return decision, ""
+        matched = rules.matched_rule(tool, arguments)
+        return decision, (matched.reason if matched else "")
+
+    def _turn_fixed_tokens(self) -> int:
+        """What the conversation already costs, which the plane must respect."""
+        from adaptive_harness.agent.context_window import estimate_tokens
+
+        return estimate_tokens(self.messages)
 
     def _configure_output_filter(self, secondary_model: str | None, enabled: bool) -> None:
         """Install the tool-output filter and the tool that recovers filtered text.
@@ -381,11 +690,104 @@ class DeveloperAgent:
             return "Action cancelled by user"
         return options[0]
 
+    #: Tools that only observe. Anything else can change the workspace, run
+    #: code, or reach the network, so the strict profile asks first. A tool that
+    #: is not in this set is treated as mutating: the safe default for a tool
+    #: this code has never heard of.
+    _READ_ONLY_TOOLS = frozenset({
+        "read_file", "list_directory", "search_files", "read_full_output",
+        "calculate", "verify_equation", "check_convergence",
+    })
+
+    def _is_read_only_tool(self, name: str) -> bool:
+        """Whether a tool only observes, for the strict-profile gate.
+
+        A plugin tool answers from the risk it declared rather than from its
+        name, and defaults to mutating. Without that, a plugin could reach
+        execution by calling itself anything other than `run_bash` -- which is
+        exactly the hole the risk classifier already had for every non-shell
+        tool.
+        """
+        if name in self._READ_ONLY_TOOLS:
+            return True
+        return self.plugins.is_read_only(name)
+
     def _request_messages(self) -> List[Dict[str, Any]]:
         """The saved conversation is verbatim; request compaction is conditional."""
         return self.messages
 
+    def request_cancel(self, reason: str = "cancelled by the operator") -> None:
+        """Ask the run to stop at the next step boundary. Safe from any thread."""
+        self._cancel_reason = reason
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_reason is not None
+
+    def queue_operator_message(self, text: str, *, kind: str = "steer") -> int:
+        """Accept one mid-turn instruction from any thread. Returns queue depth.
+
+        Safe to call from a UI thread while ``run_stream`` is suspended in the
+        middle of a tool batch: the text lands in the inbox and nowhere else, so
+        it cannot interleave into the middle of an assistant ``tool_calls``
+        message and strand a ``tool`` result without its call.
+        """
+        message = OperatorMessage(text.strip(), kind)
+        depth = self.operator_inbox.queue(message)
+        if self.operator_notify is not None:
+            # Outside the lock: a slow renderer must not block the agent thread.
+            self.operator_notify(AgentEvent("operator_queued", {
+                "content": message.text, "kind": kind, "position": "next_step",
+                "pending": depth, "at": message.at}))
+        return depth
+
+    def _inject_operator_messages(self, step: int, state: str,
+                                  ) -> Generator[AgentEvent, None, List[OperatorMessage]]:
+        """Consume the inbox at a step boundary. Yields; returns the interrupts.
+
+        Steers are appended to the transcript here, on the agent's own thread,
+        so the ordering invariant holds: assistant tool calls, then their tool
+        results, then the operator's note, then the next model request.
+
+        Interrupts are deliberately *not* appended. A redirect is not a note to
+        the current turn, it is the next turn's task; appending it here and then
+        re-entering with it as the task would put the same text in the
+        transcript twice.
+        """
+        pending = self.operator_inbox.drain()
+        interrupts: List[OperatorMessage] = []
+        for message in pending:
+            waited_ms = int((time.time() - message.at) * 1000)
+            if message.kind == "interrupt":
+                interrupts.append(message)
+                yield AgentEvent("operator_message", {
+                    "raw": message.text, "content": message.text, "role": "user",
+                    "kind": "interrupt", "state": "interrupting", "step": step,
+                    "wait_ms": waited_ms, "late": state == "late"})
+                continue
+            framed = self.prompts.get("operator.steer", step=step, text=message.text)
+            self.messages.append({"role": "user", "content": framed})
+            yield AgentEvent("operator_message", {
+                "raw": message.text, "content": framed, "role": "user",
+                "kind": "steer", "state": state, "step": step,
+                "wait_ms": waited_ms, "late": state == "late"})
+        return interrupts
+
     def run_stream(self, user_input: str, max_steps: Optional[int] = None) -> Generator[AgentEvent, None, None]:
+        """Executes a task, yielding real-time events.
+
+        Every event is published to the plugin bus before it is yielded, so a
+        plugin observes exactly the stream the interface does. The bus is a
+        tee, not a filter: a hook can never delay, reorder or swallow what the
+        caller receives, and a hook that raises is dropped rather than being
+        allowed to break the run.
+        """
+        for event in self._run_stream_inner(user_input, max_steps):
+            if self.plugins.hook_listeners:
+                self.plugins.emit(event)
+            yield event
+
+    def _run_stream_inner(self, user_input: str, max_steps: Optional[int] = None) -> Generator[AgentEvent, None, None]:
         """Executes a task through the agentic lifecycle, yielding real-time events for the TUI."""
         start_time = time.perf_counter()
         original_input = user_input
@@ -445,6 +847,11 @@ class DeveloperAgent:
         ranked = sorted(probabilities.items(), key=lambda item: item[1], reverse=True)
         skill_res = SkillClassificationResult(classification.label, ranked[0][1], probabilities, ranked,
                                               classification.entropy, classification.margin)
+        # Tracked, so a classifier that quietly degrades is visible rather
+        # than merely felt. The outcome is resolved at the end of the turn,
+        # once there is evidence of what the run actually did.
+        calibration_decision = self.calibration.record(
+            "skill", skill_res.primary_skill, skill_res.confidence)
         yield AgentEvent(
             event_type="skill_classification",
             payload={
@@ -630,6 +1037,26 @@ class DeveloperAgent:
         security_skill_active = any(skill.name == "security_audit_scanner"
                                     for skill in selected_skills)
 
+        # Context admission, before the task lands. A fragment reaches the
+        # model only after a local trigger match and a relevance score admit it
+        # into the budget; the report says what was admitted and what was not.
+        # What was asked, extracted before the model acts. This is the ground
+        # truth the Quality Controller judges the run against at the end.
+        self.requirement_set = extract_requirements(original_input)
+        self.evidence_ledger = EvidenceLedger()
+        if len(self.requirement_set):
+            yield AgentEvent("requirements", self.requirement_set.to_dict())
+
+        plane = self.context_plane
+        report = plane.allocate(text=original_input,
+                                fixed_tokens=self._turn_fixed_tokens())
+        admitted_fragments = [plane.fragments[source] for source in report.admitted
+                              if source in plane.fragments]
+        if report.admitted or report.rejected:
+            yield AgentEvent("context_budget", report.to_dict())
+        for message in plane.as_messages(admitted_fragments):
+            self.messages.append(message)
+
         # Add user message to history
         self.messages.append({"role": "user", "content": user_input})
         successful_mutations = 0
@@ -678,6 +1105,11 @@ class DeveloperAgent:
             DomainMode.RESEARCH: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "web_search", "run_bash", "run_pytest", "run_python_repl", "verify_equation", "calculate", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof", "read_full_output"},
             DomainMode.SCIENCE: {"read_file", "write_file", "edit_file", "list_directory", "search_files", "run_bash", "run_pytest", "calculate", "check_convergence", "run_python_repl", "verify_equation", "plot_terminal", "ask_user", "compile_typst", "run_lean_proof", "read_full_output"},
             DomainMode.AUDIT: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user", "read_full_output"},
+            # Plan mode is read-and-investigate. The mutating tools stay in
+            # the set on purpose: a refused call with a reason is more useful
+            # to the model than a tool that silently does not exist, because
+            # it learns the boundary instead of guessing at it.
+            DomainMode.PLAN: {"read_file", "list_directory", "search_files", "run_bash", "run_pytest", "ask_user", "read_full_output", "write_file", "edit_file", "delegate_subagent"},
         }[domain_res.mode]
         if self.safety_profile == "turbo":
             domain_tool_names.discard("ask_user")
@@ -748,12 +1180,47 @@ class DeveloperAgent:
         answer_parts: list[str] = []
         stop_reason = ""
         verification_followups = 0
+        # Bounded, like every other retry loop here: a gate that could ask
+        # forever would be a gate that gets switched off.
+        final_gate_retries = 0
         overseer_backend = self.overseer_backend or (self.classifier_backend
             if self.classifier_backend.name in {"onnx", "ollama", "local-slm"} else None)
         overseer = RuntimeOverseer(original_input, overseer_backend)
         context_limit = getattr(self, "context_window_override", None)
 
+        # Context admission happens once per turn, before the first request.
+        # Fragments are matched locally, scored locally, and budgeted; the
+        # admitted ones are prepended to this turn's request so the model reads
+        # the task-relevant context first.
         while step < max_steps:
+            if self._cancel_reason is not None:
+                # Stop before spending another request. A tool call already in
+                # flight was allowed to finish; everything after it is skipped.
+                stop_reason = "cancelled"
+                final_answer = (f"Run cancelled: {self._cancel_reason}. "
+                                f"Work already done is above.")
+                break
+            if self.ceilings is not None:
+                # A ceiling that only reports after the fact is a report, not a
+                # ceiling. Checked before the request that would breach it.
+                breach = self.ceilings.observe_turn()
+                if breach:
+                    stop_reason = "max_turns"
+                    final_answer = (f"Stopped: {breach}. The work done so far is "
+                                    f"above and is not lost.")
+                    yield AgentEvent("budget_exhausted", self.ceilings.to_dict())
+                    break
+            # A message typed mid-run lands here. The previous step's tool batch
+            # is fully recorded (including the synthesised CANCELLED results), so
+            # inserting a user message here cannot orphan a tool_call, and the
+            # note precedes the request that acts on it. This single site also
+            # covers the `continue` paths -- the missing-file-changes nudge, the
+            # continuation nudge, the verification-repair nudge and the
+            # claim-check intervention -- all of which re-enter at the top.
+            interrupts = yield from self._inject_operator_messages(step, "delivered")
+            if interrupts:
+                stop_reason = "operator_interrupt"
+                break
             step += 1
             request_messages, context_info = prepare_context(self._request_messages(), selected_model,
                 tool_schemas, provider=getattr(self.llm_client, "provider", "openrouter"), limit=context_limit)
@@ -793,6 +1260,22 @@ class DeveloperAgent:
                 reported_cost_usd += float(response_usage["cost_usd"])
                 cost_reported = True
             cached_tokens += int((llm_resp.usage or {}).get("cached_tokens", 0) or 0)
+            if self.ceilings is not None:
+                # Feed the ceiling what the provider actually reported, and
+                # act on a breach immediately rather than at the next step
+                # boundary. A one-turn run never reaches a boundary, so a
+                # cost ceiling checked only there would never fire.
+                # Pass only a price the provider actually reported. Passing a
+                # running total that happens to be 0.0 would be read as "the
+                # provider priced this at zero", which skips the token-based
+                # estimate and makes a cost ceiling silently never fire.
+                priced = {key: value for key, value in response_usage.items()
+                          if key != "cost_usd"}
+                if cost_reported:
+                    priced["cost_usd"] = reported_cost_usd
+                breach = self.ceilings.observe_usage(priced)
+                if breach:
+                    self._ceiling_breach = breach
             if (llm_resp.metadata or {}).get("thinking_fallback"):
                 reason = (llm_resp.metadata or {}).get("thinking_fallback_reason")
                 notice = ("Older assistant tool history has no replayable thinking blocks; using provider default reasoning for this session. Start a new session to re-enable the selected thinking budget."
@@ -802,7 +1285,16 @@ class DeveloperAgent:
             if llm_resp.finish_reason == "error":
                 yield AgentEvent("llm_error", {"message": llm_resp.content or "Unknown model error", "model": selected_model})
                 final_answer = llm_resp.content or "Model request failed"
-                stop_reason = "provider_error"
+                # A model that ran and declined the work, or a mock that said it
+                # cannot, is the agent failing. Only a credential or transport
+                # failure means something the run needed was unavailable --
+                # conflating them tells a CI job to retry a task that will never
+                # succeed.
+                message = str(llm_resp.content or "").lower()
+                unavailable = any(token in message for token in (
+                    "api call failed", "unauthorized", "authentication", "invalid api key",
+                    "no api key", "connection error", "forbidden"))
+                stop_reason = "provider_unavailable" if unavailable else "provider_error"
                 break
 
             if (not llm_resp.tool_calls and llm_resp.content and
@@ -887,16 +1379,103 @@ class DeveloperAgent:
                     final_answer = ""
                     continue
                 completed = bool(final_answer.strip()) and not unresolved_failures and not missing_checks
-                stop_reason = ("verification_failed" if unresolved_failures or missing_checks else
-                               "no_answer" if not final_answer.strip() else "completed")
+                if self._ceiling_breach:
+                    completed = False
+                    stop_reason = "max_cost"
+                    final_answer = (f"Stopped: {self._ceiling_breach}. The work done "
+                                    f"so far is above and is not lost.")
+                    yield AgentEvent("budget_exhausted", self.ceilings.to_dict())
+                elif domain_res.mode is DomainMode.PLAN:
+                    # A plan is the deliverable. "Completed" would claim the work
+                    # was done, which is precisely what plan mode refused to do.
+                    completed = False
+                    stop_reason = "plan_ready"
+                    yield AgentEvent("plan_ready", {"content": final_answer})
+                else:
+                    stop_reason = ("verification_failed" if unresolved_failures or missing_checks else
+                                   "no_answer" if not final_answer.strip() else "completed")
+                if completed and final_answer.strip() and (
+                        self.quality_gate_enabled or len(self.requirement_set)):
+                    # The Quality Controller: does what the model did fulfil
+                    # what the user asked for? Judged against observed tool
+                    # results, not against the model's own account of them.
+                    # A `revise` verdict returns the specific deficiencies as a
+                    # targeted instruction so the model repairs rather than
+                    # restarts; it is bounded so it cannot loop.
+                    quality = evaluate(self.requirement_set, self.evidence_ledger,
+                                       final_answer)
+                    yield AgentEvent("quality_gate", quality.to_dict())
+                    # Report always; block only when the operator asked for the
+                    # gate to be load-bearing. The signal is real but lexical,
+                    # and an honest run whose evidence happens not to share words
+                    # with the request must not be failed for that.
+                    if self.quality_gate_enabled:
+                        if quality.verdict == REVISE and final_gate_retries < FINAL_GATE_RETRIES:
+                            final_gate_retries += 1
+                            nudge = revision_instruction(quality)
+                            self.messages.append({"role": "user", "content": nudge})
+                            yield _injection_event("harness", nudge, step,
+                                                   kind="quality_gate")
+                            answer_parts.clear()
+                            final_answer = ""
+                            completed = False
+                            stop_reason = ""
+                            continue
+                        if quality.verdict != ACCEPT:
+                            completed = False
+                            stop_reason = "quality_gate_unsubstantiated"
                 break
 
+            # Calls refused by policy, keyed by call id. The refusal is applied
+            # where the tool result is appended, because the transcript is only
+            # well-formed once every declared tool_call has a result.
+            policy_denials: dict[str, str] = {}
             # Obtain authorization before adding tool calls to conversation history.
             for tc in llm_resp.tool_calls:
+                # Plan mode: investigating is allowed, changing is not. The
+                # refusal carries a reason and becomes a tool result, so the
+                # model learns the boundary rather than guessing at it, and the
+                # transcript stays well-formed.
+                if domain_res.mode is DomainMode.PLAN and not self._is_read_only_tool(tc.name):
+                    # run_bash is not a read-only *tool*, but a read-only
+                    # *command* is exactly what plan mode is for. Check the
+                    # command before refusing, or investigating the workspace
+                    # would be impossible in plan mode.
+                    if not (tc.name == "run_bash" and plan_command_is_read_only(
+                            str(tc.arguments.get("command", "")))):
+                        reason = ("plan mode is read-only: this call would change the "
+                                  "workspace. Investigate and return a plan instead.")
+                        yield AgentEvent("plan_mode_blocked", {"name": tc.name,
+                                                               "reason": reason})
+                        policy_denials[tc.id] = reason
+                        continue
+
+                # Rules are evaluated first, inside the gate, so a permissive
+                # profile cannot route around them. A rule that `--safety-profile
+                # turbo` can bypass is not a rule.
+                rule_decision, rule_reason = self.rule_gate(tc.name, tc.arguments)
+                if rule_decision is Decision.DENY:
+                    # Recorded, not answered here. The transcript is only
+                    # well-formed once the assistant message declares its tool
+                    # calls and every one has a matching result, so the refusal
+                    # is applied where the result is appended.
+                    yield AgentEvent("tool_blocked", {"name": tc.name,
+                                                       "reason": rule_reason})
+                    policy_denials[tc.id] = rule_reason
+                    continue
                 risky_command = self.tool_risk_classifier.evaluate(tc.name, tc.arguments,
                     catastrophic_only=self.safety_profile == "turbo")
-                if self.safety_profile == "strict" and tc.name in {
-                        "run_bash", "write_file", "edit_file", "run_pytest", "run_python_repl", "web_search"}:
+                if rule_decision is Decision.ASK:
+                    # The rule asks regardless of profile, which is the point of
+                    # having rules rather than only profiles.
+                    risky_command = risky_command or rule_reason or "policy requires approval"
+                # The strict profile asks before anything that changes state.
+                # This used to be a hardcoded list of six tool names, so any tool
+                # added later -- including one a user installed -- reached
+                # execution without ever passing this gate. Deriving it from
+                # whether the tool is read-only means the gate covers every
+                # tool by construction, not by enumeration.
+                if self.safety_profile == "strict" and not self._is_read_only_tool(tc.name):
                     risky_command = risky_command or f"strict profile approval for {tc.name}"
                 if risky_command and not authorized_destructive:
                     strict_gate = self.safety_profile == "strict"
@@ -925,6 +1504,7 @@ class DeveloperAgent:
                 assistant_tool_message["reasoning_details"] = llm_resp.metadata["reasoning_details"]
             self.messages.append(assistant_tool_message)
             pending_directives: list[tuple[str, str]] = []
+            answered_tool_calls: set[str] = set()
             for tc in llm_resp.tool_calls:
                 yield AgentEvent("agent_stage", {"stage": "tool_running", "step": step, "tool": tc.name})
                 yield AgentEvent(
@@ -932,12 +1512,47 @@ class DeveloperAgent:
                     payload={"name": tc.name, "arguments": tc.arguments, "call_id": tc.id},
                 )
 
-                tool = self.tools.get(tc.name) if tc.name in domain_tool_names else None
+                # A PRE_TOOL hook may deny or rewrite the call before anything
+                # else looks at it -- before the risk classifier, before the
+                # safety profile, before dispatch. That ordering is the point: a
+                # policy a privileged profile could route around is not a
+                # policy. A denial becomes a tool error the model can see and
+                # act on, never a silent skip.
+                if self.plugins.pre_tool_hooks():
+                    hooked_args, denial, denier = self.plugins.consult_pre_tool(
+                        tc.name, tc.arguments)
+                    if denial:
+                        yield AgentEvent("hook_blocked", {"name": tc.name,
+                                                           "plugin": denier, "reason": denial})
+                        tool_res = ToolResult(success=False, output="",
+                            error=f"Blocked by the {denier} safety hook: {denial}")
+                        self.messages.append({"role": "tool", "tool_call_id": tc.id,
+                            "name": tc.name,
+                            "content": f"ERROR: {tool_res.error}"})
+                        answered_tool_calls.add(tc.id)
+                        continue
+                    if hooked_args != tc.arguments:
+                        yield AgentEvent("hook_rewrote", {"name": tc.name,
+                                                          "arguments": hooked_args})
+                        tc.arguments = hooked_args
+
+                # A call refused by policy never reaches a tool. It still needs a
+                # result in the transcript, or the declared tool_call is left
+                # unanswered and the next request is rejected. Marking the tool
+                # unavailable routes it through the existing refusal path rather
+                # than duplicating the whole result-construction path.
+                refusal = policy_denials.get(tc.id)
+                if refusal is not None:
+                    tool_res = ToolResult(success=False, output="",
+                                          error=f"Refused by policy: {refusal}")
+                tool = (None if refusal is not None else
+                        self.tools.get(tc.name) if tc.name in domain_tool_names else None)
                 t_start = time.perf_counter()
                 # Shell and test tools may write files; mutation evidence is the
                 # observable file state before/after, not the tool name.
                 observes_writes = tool is not None and tc.name in {"run_bash", "run_pytest"}
                 signature_before = _workspace_signature(self.workspace_root) if observes_writes else None
+                stamp_before = _workspace_quick_stamp(self.workspace_root) if observes_writes else None
                 if (tool and (domain_res.mode == DomainMode.AUDIT or security_skill_active) and tc.name == "run_bash" and
                         not audit_command_is_read_only(str(tc.arguments.get("command", "")))):
                     tool_res = ToolResult(success=False, output="",
@@ -947,13 +1562,13 @@ class DeveloperAgent:
                         tool_res = tool.execute(**tc.arguments)
                     except Exception as exc:
                         tool_res = ToolResult(success=False, output="", error=f"Tool error: {type(exc).__name__}: {exc}")
-                else:
+                elif tool is None and refusal is None:
                     tool_res = ToolResult(success=False, output="", error=f"Tool `{tc.name}` is unavailable in {domain_res.mode.value} mode")
                 if tool_res.success and (tc.name in {"write_file", "edit_file"} or
                     tc.name == "delegate_subagent" and (tool_res.metadata or {}).get("role") == "coder"):
                     successful_mutations += 1
                 elif tool_res.success and signature_before is not None and \
-                        _workspace_signature(self.workspace_root) != signature_before:
+                        _workspace_changed(self.workspace_root, signature_before, stamp_before):
                     successful_mutations += 1
                 if tc.name != "read_file" or not tool_res.success:
                     cache_eligible = False
@@ -1001,6 +1616,24 @@ class DeveloperAgent:
                 # threshold; prepare_context compacts only the request copy.
                 model_error = (tool_res.error or "")[:600]
                 estimated_saved = max(0, (len(tool_res.output) - len(model_output)) // 4)
+
+                # A POST_TOOL hook may redact a successful tool's output before it
+                # reaches the model's context, or attach metadata. It can never
+                # touch a failure: losing an error's detail is the one thing this
+                # system must never do, so the run_post_tool path ignores a
+                # redaction of a failed call.
+                if self.plugins.post_tool_hooks():
+                    hooked_output, hook_meta = self.plugins.run_post_tool(
+                        tc.name, tc.arguments, model_output, tool_res.success)
+                    if hook_meta:
+                        tool_res = tool_res.model_copy(update={"metadata": {
+                            **(tool_res.metadata or {}), **hook_meta}})
+                    if hooked_output != model_output:
+                        estimated_saved += max(0, (len(model_output) - len(hooked_output)) // 4)
+                        model_output = hooked_output
+                        shown_output = hooked_output
+                        yield AgentEvent("tool_redacted", {"name": tc.name,
+                                                           "chars": len(hooked_output)})
 
                 yield AgentEvent(
                     event_type="tool_result",
@@ -1081,6 +1714,7 @@ class DeveloperAgent:
                                    f"ERROR: {model_error or 'Tool failed'}\n{model_output}",
                     }
                 )
+                answered_tool_calls.add(tc.id)
 
                 decision = overseer.observe(tc.name, tc.arguments, success=tool_res.success,
                     error=tool_res.error or "", output=tool_res.output, model_text=llm_resp.content or "")
@@ -1128,11 +1762,26 @@ class DeveloperAgent:
                             stop_reason = "overseer_impasse"
                             break
                         overseer.consecutive_interventions = 0
+            # Any call the loop did not reach (an overseer stop or a clarification
+            # abort breaks out early) still needs a result, or the next request
+            # carries a dangling tool_call and the endpoint rejects the history.
+            for cancelled in _synthesize_missing_tool_results(llm_resp.tool_calls, answered_tool_calls):
+                self.messages.append(cancelled)
+                yield AgentEvent("tool_cancelled", {"tool": cancelled["name"],
+                                                    "call_id": cancelled["tool_call_id"]})
             for state_name, text in pending_directives:
                 self.messages.append({"role": "system", "content": text})
                 yield _injection_event("runtime_overseer", text, step, state=state_name)
             if stop_reason in {"overseer_impasse", "classifier_stop"}:
                 break
+
+        # The user may have typed during the final step, or while the model was
+        # writing its answer. The run is over, but the note is not discarded: it
+        # is appended so it is in context and in the saved session, and reported
+        # as late so the UI cannot claim it steered anything it did not.
+        late_interrupts = yield from self._inject_operator_messages(step, "late")
+        if late_interrupts and not stop_reason:
+            stop_reason = "operator_interrupt"
 
         skill_checks = self.skill_verifier.verify(selected_skills, skill_observations)
         for skill_check in skill_checks:
@@ -1144,6 +1793,14 @@ class DeveloperAgent:
             stop_reason = "skill_verification_failed"
         if not completed and not stop_reason and step >= max_steps:
             stop_reason = "step_limit"
+        # Resolve the routing decision against what the run actually did, so
+        # the monitor learns from outcomes rather than from its own confidence.
+        if calibration_decision is not None and calibration_decision.resolved is False:
+            self.calibration.resolve(
+                calibration_decision, "code_edit" if successful_mutations else "general_reasoning")
+        for drift in self.calibration.adjust_all():
+            yield AgentEvent("classifier_drift", drift)
+
         total_wall_ms = (time.perf_counter() - start_time) * 1000.0
         if self.repository is not None and completed and cache_eligible and cache_dependencies and final_answer:
             try:
@@ -1203,3 +1860,41 @@ class DeveloperAgent:
                 self.repository.record_trace(trace)
             except Exception as exc:
                 yield AgentEvent("storage_error", {"error": f"Could not save execution trace: {exc}"})
+
+    def run_stream_with_followup(self, user_input: str, max_steps: Optional[int] = None,
+                                 *, followup_limit: int = 8) -> Generator[AgentEvent, None, None]:
+        """``run_stream``, plus honouring interrupts and late messages.
+
+        An interrupt means "stop and do this instead": the run ends at the next
+        step boundary and the text is re-entered as the next turn's task, which
+        is the only honest way to express a redirect without putting the same
+        text in the transcript twice. Anything still queued when the generator
+        ends for any other reason -- an early return on a memory hit, or a
+        cancelled destructive action -- is carried forward the same way rather
+        than silently dropped between turns.
+
+        Both the TUI and the headless CLI consume this instead of ``run_stream``,
+        so neither can end up with a different steering policy.
+        """
+        task = user_input
+        for _ in range(max(1, followup_limit)):
+            redirect: Optional[str] = None
+            for event in self.run_stream(task, max_steps):
+                yield event
+                if (event.event_type == "operator_message"
+                        and event.payload.get("kind") == "interrupt"
+                        and event.payload.get("state") == "interrupting"):
+                    redirect = str(event.payload.get("raw") or "")
+            if redirect is None:
+                leftover = self.operator_inbox.drain()
+                if not leftover:
+                    return
+                redirect = "\n".join(message.text for message in leftover)
+                yield AgentEvent("operator_message", {
+                    "raw": redirect, "content": redirect, "role": "user",
+                    "kind": "interrupt", "state": "carried_over", "step": 0,
+                    "wait_ms": 0, "late": True})
+            task = redirect
+        yield AgentEvent("llm_notice", {
+            "message": (f"Stopped after {followup_limit} consecutive operator redirects; "
+                        "the newest instruction is queued for your next prompt.")})

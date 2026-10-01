@@ -139,7 +139,22 @@ def test_the_timeout_is_honoured(tmp_path: Path):
     tool = RunLeanProofTool(workspace_root=tmp_path)
     result = tool.execute(lean_code=VALID_ARITHMETIC, theorem_name="Timed", timeout_s=120)
     assert result.success, result.error
-    assert tool.verifier.timeout_s == 120
+
+
+@needs_lean
+def test_a_per_call_timeout_does_not_leak_into_the_next_proof(tmp_path: Path):
+    """A model-supplied timeout must bound its own call only.
+
+    Persisting it on the shared verifier meant one `timeout_s: 1` degraded every
+    later proof in the process to a one-second budget.
+    """
+    tool = RunLeanProofTool(workspace_root=tmp_path)
+    default = tool.verifier.timeout_s
+    tool.execute(lean_code=VALID_ARITHMETIC, theorem_name="Quick", timeout_s=1)
+    assert tool.verifier.timeout_s == default
+    # A real proof still compiles under the default budget afterwards.
+    again = tool.execute(lean_code=VALID_ARITHMETIC, theorem_name="After")
+    assert again.success, again.error
 
 
 def test_missing_lean_is_reported_without_crashing(tmp_path: Path, monkeypatch):

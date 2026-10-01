@@ -7,6 +7,8 @@ from typing import Optional
 import json
 import os
 import signal
+import sys
+import threading
 import typer
 from rich.console import Console
 from rich.markup import escape
@@ -16,6 +18,11 @@ from rich.text import Text
 
 from adaptive_harness.tui.formatting import format_model_markdown
 
+from adaptive_harness.cli_contract import (
+    Ceilings,
+    JsonStream,
+    exit_code_for,
+)
 from adaptive_harness.dashboard.report import (
     print_ablation_table,
     print_execution_trace,
@@ -49,6 +56,28 @@ app = typer.Typer(
     help="Adaptive Agent Harness CLI: ML routing brain with verification and fallback recovery.",
 )
 console = Console()
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        from adaptive_harness import __version__
+
+        console.print(f"adaptive-harness {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    version: bool = typer.Option(
+        False, "--version", callback=_version_callback, is_eager=True,
+        help="Show the installed version and exit."),
+) -> None:
+    """Adaptive Agent Harness.
+
+    Start with `dev "your task"` for a single headless run, or `tui` for the
+    interactive terminal interface. Run `research "a topic"` for the autonomous
+    research swarm, which verifies its own results before reporting a verdict.
+    """
 
 
 @app.command()
@@ -100,6 +129,11 @@ def run(
     if task_text:
         trace = harness.run(task_text)
         print_execution_trace(trace)
+        # Exit non-zero when the task was not solved, so a CI job or a shell
+        # script can detect failure. `run` always returning 0 meant an unsolved
+        # task was indistinguishable from a solved one.
+        if not getattr(trace, "success", True):
+            raise typer.Exit(1)
         return
 
     # Interactive REPL mode
@@ -124,6 +158,34 @@ def run(
             break
 
 
+def _start_operator_reader(agent) -> Optional[threading.Thread]:
+    """Let an operator steer a headless run by typing, in the same terminal.
+
+    Reads stdin on a daemon thread that only ever calls
+    ``queue_operator_message``; the run itself stays single-threaded on the main
+    thread. Nothing is read when stdin is not a TTY, so piped invocations and CI
+    are unaffected.
+    """
+    if not sys.stdin.isatty():
+        return None
+    console.print("[dim]type a note + Enter to steer the start of the next step · "
+                  "prefix it with ! to stop after the current step instead[/dim]")
+
+    def pump() -> None:
+        for line in sys.stdin:
+            text = line.strip()
+            if not text:
+                continue
+            interrupt = text.startswith("!")
+            body = text[1:].strip() if interrupt else text
+            depth = agent.queue_operator_message(body, kind="interrupt" if interrupt else "steer")
+            console.print(f"[cyan]⏳ queued ({depth} pending): {body}[/cyan]")
+
+    thread = threading.Thread(target=pump, daemon=True, name="operator-reader")
+    thread.start()
+    return thread
+
+
 @app.command()
 def tui(
     api_key: Optional[str] = typer.Option(None, "--key", "-k", help="OpenRouter or OpenAI API key"),
@@ -132,12 +194,17 @@ def tui(
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID (e.g. anthropic/claude-sonnet-4)"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
-    mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
+    mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, plan, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Model effort: auto, low, medium, high, xhigh, max (deep = high)"),
     secondary_model: Optional[str] = typer.Option(
         None, "--secondary-model",
         help="Cheap model that compresses low-value tool output (default: the primary model)"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
+    quality_gate: bool = typer.Option(
+        False, "--quality-gate",
+        help="Check the final answer against the tool calls that were actually "
+             "made, and send it back if it claims work nothing evidences. Reports "
+             "either way; this makes it load-bearing."),
     step_policy: str = typer.Option("classifier", "--step-policy", help="Tool-step limits: classifier (default; stops circling loops), fixed (hardcoded per-thinking budgets), unbounded"),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", min=1, help="Explicit tool-step cap overriding the step policy"),
     classifier_backend: str = typer.Option("auto", "--classifier-backend", "--classifier-engine", help="auto, semif, sklearn, ollama, local-slm, onnx, openrouter"),
@@ -153,7 +220,7 @@ def tui(
     skill: Optional[list[str]] = typer.Option(None, "--skill", help="Force a built-in or custom skill (repeatable)"),
     db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Path to experience database"),
 ):
-    """Launches the interactive Textual TUI development environment with pervasive classifiers."""
+    """Launch the interactive terminal interface. Requires a TTY."""
     from adaptive_harness.tui.app import AdaptiveHarnessApp
     from adaptive_harness.llm.client import MODEL_TIERS
     from adaptive_harness.llm.providers import PROVIDER_TIERS
@@ -208,6 +275,14 @@ def tui(
                 tui_app.agent.active_skills[name] = catalog.read(name)
             except (ValueError, OSError) as exc:
                 raise typer.BadParameter(str(exc), param_hint="--skill") from exc
+    # A full-screen Textual app on a non-TTY (a pipe, cron, CI, `nohup`) waits
+    # forever for a keypress that can never arrive. Fail with the one command
+    # that does work headlessly instead of hanging.
+    if not (sys.stdout.isatty() and sys.stdin.isatty()):
+        console.print("[bold red]The TUI needs an interactive terminal.[/bold red]")
+        console.print("It cannot run piped, redirected, or under a process manager.")
+        console.print("For a headless run use: [bold]adaptive-harness dev \"your task\"[/bold]")
+        raise typer.Exit(2)
     tui_app.run()
 
 
@@ -221,9 +296,25 @@ def dev(
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible task model endpoint"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Default model ID"),
     tier: Optional[str] = typer.Option(None, "--tier", help="Force model tier: fast, standard, reasoning"),
-    mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, security, auto"),
+    mode: str = typer.Option("auto", "--mode", help="Operational mode: coding, research, science, plan, security, auto"),
     thinking: str = typer.Option("auto", "--thinking", help="Model effort: auto, low, medium, high, xhigh, max (deep = high)"),
     safety: Optional[str] = typer.Option(None, "--safety", help="Interaction profile: turbo, balanced, cautious, strict (default turbo)"),
+    json_output: bool = typer.Option(
+        False, "--json",
+        help="Emit one JSON object per event, and a summary object at the end. "
+             "For scripting; the human-readable output is suppressed."),
+    max_cost: Optional[float] = typer.Option(
+        None, "--max-cost", min=0.0,
+        help="Stop the run once this much has been spent, in US dollars. The stop "
+             "is attributed: the exit code is 3, not 1."),
+    max_turns: Optional[int] = typer.Option(
+        None, "--max-turns", min=1,
+        help="Stop the run after this many model turns. Exit code 3 when reached."),
+    quality_gate: bool = typer.Option(
+        False, "--quality-gate",
+        help="Check the final answer against the tool calls that were actually "
+             "made, and send it back if it claims work nothing evidences. Reports "
+             "either way; this makes it load-bearing."),
     step_policy: str = typer.Option("classifier", "--step-policy", help="Tool-step limits: classifier (default; stops circling loops), fixed (hardcoded per-thinking budgets), unbounded"),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", min=1, help="Explicit tool-step cap overriding the step policy"),
     swarm: bool = typer.Option(False, "--swarm", help="Expose delegate_subagent to the coordinator agent"),
@@ -244,7 +335,7 @@ def dev(
     skill: Optional[list[str]] = typer.Option(None, "--skill", help="Enable a named workspace or user skill"),
     db_path: Path = typer.Option(Path("output/experience.db"), "--db", help="Path to experience database"),
 ):
-    """Runs a developer task through the DeveloperAgent with pervasive classification and verification."""
+    """Run one software-engineering task end to end, and exit non-zero if it is not completed."""
     from adaptive_harness.agent.agent import DeveloperAgent
     from adaptive_harness.llm.client import LLMClient
     from adaptive_harness.llm.client import MODEL_TIERS
@@ -317,7 +408,8 @@ def dev(
                            classifier_backend=backend, overseer_backend=overseer_backend,
                            forced_mode=selected_mode, forced_thinking=selected_thinking,
                            safety_profile=safety or "turbo", swarm_enabled=swarm,
-                           step_policy=step_policy, max_steps=max_steps)
+                           step_policy=step_policy, max_steps=max_steps,
+                           quality_gate=quality_gate)
     if research_topic:
         research_swarm = agent.enable_research(research_topic, root=research_root)
         console.print(f"[dim]Research swarm attached: {research_swarm.workspace.root} "
@@ -334,7 +426,22 @@ def dev(
 
     last_agent_content = ""
     task_succeeded = False
-    for event in agent.run_stream(task):
+    task_stop_reason = ""
+    json_stream = None
+    if json_output:
+        # Straight to stdout, never through Rich: Rich wraps at the terminal
+        # width, which turns one JSON object per line into something a parser
+        # cannot read. `--json` is a machine contract.
+        json_stream = JsonStream(lambda line: (sys.stdout.write(line + "\n"),
+                                               sys.stdout.flush()))
+    if max_cost is not None or max_turns is not None:
+        # Independent of --json: a ceiling is a ceiling whether or not anyone is
+        # parsing the output.
+        agent.ceilings = Ceilings(max_cost_usd=max_cost, max_turns=max_turns)
+    _start_operator_reader(agent)
+    for event in agent.run_stream_with_followup(task):
+        if json_stream is not None:
+            json_stream.emit(event)
         et = event.event_type
         p = event.payload
         if et == "skill_classification":
@@ -383,6 +490,36 @@ def dev(
             console.print(f"  [bold yellow]Prompt injected · {escape(label)}"
                           f"{(' · ' + escape(p['state'])) if p.get('state') else ''}:[/bold yellow]")
             console.print(Text(p["content"], style="yellow"))
+        elif et == "operator_queued":
+            console.print(f"  [cyan]⏳ operator queued ({p.get('pending', 1)} pending):[/cyan] "
+                          f"{escape(p.get('content', ''))}")
+        elif et == "operator_message":
+            console.print(f"  [bold cyan]⚡ operator:[/bold cyan] {escape(p.get('raw') or '')}")
+            note = ("run stops after this step" if p.get("kind") == "interrupt"
+                    else "the run had already finished; kept as context" if p.get("late")
+                    else f"delivered at the start of step {p.get('step')}")
+            console.print(f"  [dim]{escape(note)} · waited {p.get('wait_ms', 0)} ms[/dim]")
+        elif et == "requirements":
+            items = p.get("requirements", [])
+            if items:
+                console.print(f"  [dim]{len(items)} obligation(s): "
+                              f"{escape(', '.join(i.get('text', '') for i in items))}[/dim]")
+        elif et == "context_budget":
+            admitted, rejected = p.get("admitted", []), p.get("rejected", [])
+            console.print(f"  [dim]context: {p.get('used', 0):,}/{p.get('available', 0):,} "
+                          f"tokens · {len(admitted)} admitted, {len(rejected)} deferred[/dim]")
+        elif et == "quality_gate":
+            colour = {"accept": "green", "revise": "yellow", "reject": "red"}.get(
+                p.get("verdict", ""), "yellow")
+            console.print(f"  [bold {colour}]quality gate: {escape(str(p.get('verdict', '')).upper())}"
+                          f"[/bold {colour}] — {escape(p.get('reason', ''))}")
+            for item in p.get("adjudications", []):
+                if item.get("status") != "satisfied":
+                    console.print(f"    [yellow]{escape(item.get('id', ''))} "
+                                  f"{escape(item.get('status', ''))}: "
+                                  f"{escape(item.get('reason', ''))}[/yellow]")
+            for line in p.get("contradictions", []):
+                console.print(f"    [red]contradiction: {escape(line)}[/red]")
         elif et == "provider_failover":
             console.print(f"  [yellow]Provider failover: {escape(p['from'])} → {escape(p['to'])} "
                           f"({escape(p['model'])})[/yellow]")
@@ -411,6 +548,7 @@ def dev(
             console.print(f"  [dim]Verification Classifier: [{badge_col}]{p['status']}[/{badge_col}] -> Action: {p['action']}[/dim]")
         elif et == "response":
             task_succeeded = bool(p.get("success"))
+            task_stop_reason = str(p.get("stop_reason") or "")
             if p.get("content") and p["content"] != last_agent_content:
                 console.print("\n[bold magenta]Agent:[/bold magenta]")
                 console.print(Markdown(format_model_markdown(p["content"])))
@@ -426,27 +564,460 @@ def dev(
             color = "green" if p.get("success", True) else "yellow"
             console.print(f"\n[bold {color}]{status} in {p['total_time_ms']} ms ({p['steps']} steps)[/bold {color}]\n")
 
-    if not task_succeeded:
-        raise typer.Exit(code=1)
+    # A script's only signal is the exit status, so it has to carry a meaning.
+    # See cli_contract for the vocabulary.
+    if json_stream is not None:
+        # The summary is part of the machine contract, so it goes out the same
+        # unwrapped way the events did.
+        sys.stdout.write(json.dumps(json_stream.summary(), ensure_ascii=False,
+                                   default=str) + "\n")
+        sys.stdout.flush()
+    # Exit 4 means "something the run needed was not available", which is
+    # usually fixable by configuration. Detect it from the stop reason rather
+    # Exit 4 means "something the run needed was not available", which is
+    # usually fixable by configuration rather than by changing the task. That is
+    # specifically *a missing credential for a live provider* -- not a model that
+    # ran and declined the work, which is the agent failing (exit 1), and not an
+    # explicitly offline run, which asked for the mock and got it.
+    unavailable = bool(
+        not offline
+        and getattr(agent.llm_client, "is_mock", False)
+        and task_stop_reason in {"provider_error", "no_credential", ""}
+    )
+    raise typer.Exit(code=exit_code_for(task_stop_reason, success=task_succeeded,
+                                        unavailable=unavailable))
+
+
+#: Plugin lifecycle. A plugin is a directory under one of the discovery roots,
+#: so these commands take a path and operate on it directly.
+from adaptive_harness.plugins.registry import OFFICIAL as _OFFICIAL
+
+plugin_app = typer.Typer(
+    help="Create, validate, and package plugins.",
+)
+app.add_typer(plugin_app, name="plugin")
+
+
+@plugin_app.command("init")
+def plugin_init(
+    name: str = typer.Argument(..., help="Plugin name, e.g. csv-inspector"),
+    description: str = typer.Option("", "--description", help="One line about what it does"),
+    destination: Path = typer.Option(Path("."), "--dest", help="Where to create it (a plugin root)"),
+):
+    """Scaffold a plugin that passes `validate` with no edits.
+
+    Creates a manifest, a module, a README, and a test, in a directory you can
+    copy into your plugins folder.
+    """
+    from adaptive_harness.plugins.lifecycle import scaffold, validate
+
+    if not name.replace("-", "_").isidentifier():
+        console.print(f"[red]{name!r} is not a usable plugin name "
+                      f"(letters, digits, - and _ only).[/red]")
+        raise typer.Exit(2)
+    path = scaffold(destination, name=name, description=description)
+    report = validate(path)
+    console.print(f"[green]Created[/green] {path}")
+    console.print(report.render())
+    if not report.ok:
+        raise typer.Exit(1)
+
+
+@plugin_app.command("validate")
+def plugin_validate(
+    path: Path = typer.Argument(..., help="A plugin directory, or its manifest"),
+):
+    """Check a plugin's manifest, permissions, and handlers — without running it.
+
+    The module is parsed, not imported, so validating something you have not
+    decided to trust does not execute it.
+    """
+    from adaptive_harness.plugins.lifecycle import validate
+
+    report = validate(path)
+    console.print(report.render())
+    raise typer.Exit(0 if report.ok else 1)
+
+
+@plugin_app.command("pack")
+def plugin_pack(
+    path: Path = typer.Argument(..., help="A plugin directory"),
+    destination: Path = typer.Option(Path("dist"), "--out", help="Where to write the tarball"),
+):
+    """Bundle a validated plugin into a distributable tarball."""
+    from adaptive_harness.plugins.lifecycle import pack, validate
+
+    try:
+        archive = pack(path, destination)
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]Packed[/green] {archive}")
+
+
+@plugin_app.command("install")
+def plugin_install(
+    name: str = typer.Argument(..., help="Official plugin name, or a path to a plugin directory"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Replace an installed plugin of the same name"),
+):
+    """Install a plugin. The core ships with none, so this is how capabilities arrive.
+
+    An official plugin name is looked up in the bundled `plugins/` directory that
+    ships beside the harness; any other argument is treated as a path. The
+    manifest is validated first, and validation parses the module rather than
+    importing it -- deciding whether to trust something and running it are
+    different acts.
+    """
+    from adaptive_harness.plugins.registry import InstallError, Registry, find_official
+
+    registry = Registry()
+    candidate = Path(name).expanduser()
+    if not candidate.is_dir():
+        found = find_official(name, _official_plugin_paths())
+        if found is None:
+            console.print(f"[red]No official plugin named {name!r}, and no such directory.[/red]")
+            console.print("[dim]Official plugins:[/dim] "
+                          + ", ".join(sorted(item["name"] for item in _OFFICIAL)))
+            raise typer.Exit(1)
+        candidate = found
+    try:
+        installed = registry.install(candidate, overwrite=overwrite)
+    except InstallError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]Installed[/green] {installed.name}")
+    console.print("[dim]Restart the harness, or it will load on next start.[/dim]")
+
+
+@plugin_app.command("uninstall")
+def plugin_uninstall(name: str = typer.Argument(..., help="Installed plugin name")):
+    """Remove an installed plugin."""
+    from adaptive_harness.plugins.registry import Registry
+
+    if Registry().uninstall(name):
+        console.print(f"[green]Removed[/green] {name}")
+        return
+    console.print(f"[yellow]{name} is not installed.[/yellow]")
+    raise typer.Exit(1)
+
+
+@plugin_app.command("available")
+def plugin_available():
+    """List the official plugins and why each one exists.
+
+    Nothing here is installed by default. The harness is a working agent with
+    no extras; a capability is something you choose, not something you inherit.
+    """
+    for item in _OFFICIAL:
+        console.print(f"  [bold]{item['name']}[/bold] — {item['summary']}")
+        console.print(f"    [dim]{item['why']}[/dim]")
+    console.print("[dim]Install one with: adaptive-harness plugin install <name>[/dim]")
+
+
+def _official_plugin_paths() -> list[Path]:
+    """Where the bundled official plugins live, if this checkout has them.
+
+    They are outside the installed package on purpose -- the core ships with no
+    plugins -- so a pip install finds none, and a checkout offers them for
+    anyone who wants to try one.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "plugins"
+        if candidate.is_dir() and any(candidate.glob("*/*.plugin.json")):
+            return [candidate]
+    return []
+
+
+@plugin_app.command("list")
+def plugin_list(
+    with_project_plugins: bool = typer.Option(False, "--with-project-plugins",
+                                              help="Also load project-supplied plugins"),
+):
+    """List every discovered plugin and what it contributes."""
+    from adaptive_harness.plugins.host import PluginHost
+
+    host = PluginHost(project_root=Path.cwd(),
+                      allow_project_plugins=with_project_plugins)
+    found = host.discover()
+    if not found:
+        console.print("[dim]No plugins found.[/dim]")
+        return
+    for plugin in sorted(found, key=lambda item: item.name):
+        mark = "[green]●[/green]" if plugin.ok else "[red]✗[/red]"
+        console.print(f"{mark} [bold]{plugin.name}[/bold] {plugin.version} "
+                      f"— {plugin.description or 'no description'}")
+        if plugin.ok:
+            console.print(f"  [dim]permissions:[/dim] "
+                          f"{', '.join(sorted(plugin.permissions)) or 'none'}")
+        else:
+            console.print(f"  [red]{escape(plugin.error)}[/red]")
+
+
+@plugin_app.command("info")
+def plugin_info(name: str = typer.Argument(..., help="Plugin name")):
+    """Show one plugin in detail: what it provides and what it can do."""
+    from adaptive_harness.plugins.host import PluginHost
+
+    host = PluginHost(project_root=Path.cwd(), allow_project_plugins=True)
+    found = [p for p in host.discover() if p.name == name]
+    if not found:
+        console.print(f"[red]No plugin named {name!r}.[/red]")
+        raise typer.Exit(1)
+    plugin = found[0]
+    if not plugin.ok:
+        console.print(f"[red]{plugin.name} failed to load:[/red] {escape(plugin.error)}")
+        raise typer.Exit(1)
+    console.print(f"[bold]{plugin.name}[/bold] {plugin.version}")
+    console.print(f"  {plugin.description or 'no description'}")
+    if plugin.author:
+        console.print(f"  [dim]author:[/dim] {plugin.author}")
+    console.print(f"  [dim]permissions:[/dim] "
+                  f"{', '.join(sorted(plugin.permissions)) or 'none'}")
+    if plugin.tools:
+        console.print("  [bold]tools:[/bold]")
+        for tool in plugin.tools:
+            console.print(f"    {tool.name} [{tool.risk}] — {tool.description}")
+    if plugin.skills:
+        console.print("  [bold]skills:[/bold] " + ", ".join(s.name for s in plugin.skills))
+    if plugin.settings:
+        console.print("  [bold]settings:[/bold] " + ", ".join(s.key for s in plugin.settings))
+    if plugin.commands:
+        console.print("  [bold]commands:[/bold] " + ", ".join(sorted(plugin.commands)))
+    if plugin.subagents:
+        console.print("  [bold]subagents:[/bold] " + ", ".join(s.name for s in plugin.subagents))
+    if plugin.mcp_servers:
+        console.print("  [bold]mcp servers:[/bold] " + ", ".join(s.name for s in plugin.mcp_servers))
+    if plugin.context:
+        console.print("  [bold]context:[/bold] " + ", ".join(f.source for f in plugin.context))
+    active = [name for name, hook in plugin.hooks.__dict__.items() if hook]
+    if active:
+        console.print("  [bold]hooks:[/bold] " + ", ".join(sorted(active)))
+
+
+@app.command("agent")
+def agent_cmd(
+    action: str = typer.Argument("list", help="list, show NAME, or init NAME"),
+    name: str = typer.Argument("", help="Agent name"),
+    description: str = typer.Option("", "--description", help="What the agent does, for `init`"),
+    scope: str = typer.Option("project", "--scope", help="`project` writes to .harness/agents/, `user` to your config"),
+):
+    """The subagents you can spawn.
+
+    A subagent is a markdown file with a small frontmatter block, so you can
+    add one -- a database reviewer, a performance auditor -- without touching
+    the harness, and share it with whoever works on the same repository.
+
+        harness agent init db-reviewer --description "Reviews a migration."
+
+    The frontmatter keys match the ones Claude Code documents, so a definition
+    written for one works here. Only `tools`, `model`, `permissionMode`,
+    `maxTurns`, `effort`, `isolation` and `background` change behaviour here;
+    anything else is carried rather than dropped.
+    """
+    from adaptive_harness.agents import (
+        AgentDefinitionError, AgentRegistry, load_definition, scaffold,
+    )
+    from adaptive_harness.data.config import DEFAULT_CONFIG_DIR
+
+    if action == "init":
+        if not name:
+            raise typer.BadParameter("init requires a name", param_hint="NAME")
+        target = (Path(DEFAULT_CONFIG_DIR) / "agents" if scope == "user"
+                  else Path.cwd() / ".harness" / "agents")
+        try:
+            path = scaffold(target, name, description)
+        except AgentDefinitionError as exc:
+            console.print(f"[red]{escape(str(exc))}[/red]")
+            raise typer.Exit(1) from exc
+        console.print(f"[green]Created[/green] {path}")
+        console.print("[dim]Edit the system prompt, then it is available to "
+                      "`delegate_subagent` and listed by /tasks.[/dim]")
+        return
+    if action == "show":
+        if not name:
+            raise typer.BadParameter("show requires a name", param_hint="NAME")
+        registry = AgentRegistry(Path.cwd())
+        registry.discover()
+        definition = registry.get(name)
+        if definition is None:
+            for path in list(registry.roots()):
+                candidate = path / f"{name}.md"
+                if candidate.is_file():
+                    try:
+                        definition = load_definition(candidate)
+                    except AgentDefinitionError as exc:
+                        console.print(f"[red]{escape(str(exc))}[/red]")
+                        raise typer.Exit(1) from exc
+                    break
+        if definition is None:
+            console.print(f"[yellow]No subagent named {name!r}.[/yellow]")
+            raise typer.Exit(1)
+        console.print(f"[bold]{definition.name}[/bold] — {definition.description}")
+        for key, value in definition.to_dict().items():
+            if key not in {"name", "description"} and value:
+                console.print(f"  {key}: {escape(str(value))}")
+        if definition.system_prompt:
+            console.print()
+            console.print(Text(definition.system_prompt))
+        return
+
+    registry = AgentRegistry(Path.cwd())
+    registry.discover()
+    console.print(registry.describe())
+    for warning in registry.warnings:
+        console.print(f"  [yellow]{escape(warning)}[/yellow]")
+    console.print("[dim]Scaffold one with: adaptive-harness agent init <name>[/dim]")
+
+
+@app.command("memory")
+def memory_cmd(
+    action: str = typer.Argument("list", help="list, accept ID, forget ID, or clear"),
+    memory_id: str = typer.Argument("", help="Memory id, for accept or forget"),
+    add: str = typer.Option("", "--add", help="Propose a memory and show what would be stored"),
+):
+    """Inspect and manage what the harness remembers about this project.
+
+    A memory the model proposed never takes effect on its own. It is shown as a
+    one-line diff and applies only when you accept it, which is the only way a
+    model can end up changing what it is told in a later session.
+    """
+    from adaptive_harness.agent.memory import MemoryStore
+
+    store = MemoryStore()
+    try:
+        if add:
+            proposal = store.propose(add)
+            console.print(f"[bold]Proposed[/bold] {proposal.preview}")
+            console.print(f"[dim]id: {proposal.memory.id} · {proposal.reason}[/dim]")
+            console.print("[dim]It is not in effect. "
+                          "Accept it with: adaptive-harness memory accept <id>[/dim]")
+            return
+        if action == "accept":
+            memory = store.accept(memory_id)
+            if memory is None:
+                console.print(f"[yellow]No pending memory with id {memory_id!r}.[/yellow]")
+                raise typer.Exit(1)
+            console.print(f"[green]Remembered:[/green] {memory.text}")
+            return
+        if action == "forget":
+            if not store.forget(memory_id):
+                console.print(f"[yellow]No memory with id {memory_id!r}.[/yellow]")
+                raise typer.Exit(1)
+            console.print("[green]Forgotten.[/green]")
+            return
+        if action == "clear":
+            console.print(f"[green]Cleared {store.clear()} memory(ies).[/green]")
+            return
+        console.print(store.describe())
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(2) from exc
+
+
+@app.command("plugins")
+def plugins_cmd(
+    workspace: Optional[Path] = typer.Option(None, "--workspace", help="Project root to discover plugins in"),
+    with_project_plugins: bool = typer.Option(
+        False, "--with-project-plugins",
+        help="Also load plugins from <project>/.harness/plugins. These run code from "
+             "the repository, so they are off unless you ask."),
+):
+    """List installed plugins, what each contributes, and the permissions it holds.
+
+    Plugins extend the harness without editing it: a tool the model can call, a
+    skill, a setting, a prompt override, a command. Each one declares what it
+    wants permission to do, and anything it did not declare is refused.
+
+    A plugin is third-party code that runs with your privileges. Read the
+    permission line before trusting one.
+    """
+    from adaptive_harness.plugins.host import PluginHost
+
+    host = PluginHost(project_root=workspace or Path.cwd(),
+                      allow_project_plugins=with_project_plugins)
+    found = host.discover()
+    console.print(f"[bold cyan]Plugins[/bold cyan] ({len(found)} found)")
+    if not found:
+        console.print("[dim]None installed.[/dim]")
+    else:
+        for plugin in sorted(found, key=lambda item: item.name):
+            if plugin.ok:
+                granted = ", ".join(sorted(plugin.permissions)) or "none"
+                console.print(f"  [green]●[/green] [bold]{plugin.name}[/bold] {plugin.version}"
+                              f" — {plugin.description or 'no description'}")
+                console.print(f"    [dim]permissions:[/dim] {granted}")
+                counts = []
+                if plugin.tools:
+                    counts.append(f"{len(plugin.tools)} tool(s)")
+                if plugin.skills:
+                    counts.append(f"{len(plugin.skills)} skill(s)")
+                if plugin.settings:
+                    counts.append(f"{len(plugin.settings)} setting(s)")
+                if plugin.commands:
+                    counts.append(f"{len(plugin.commands)} command(s)")
+                for spec in plugin.tools:
+                    counts.append(f"{spec.name} [{spec.risk}]")
+                if counts:
+                    console.print(f"    [dim]provides:[/dim] {', '.join(counts)}")
+            else:
+                console.print(f"  [red]✗[/red] [bold]{plugin.name}[/bold] — failed to load")
+                console.print(f"    [red]{plugin.error}[/red]")
+    if host.project_plugins_skipped:
+        console.print(f"  [yellow]{host.project_plugins_skipped} plugin(s) in this project are "
+                      f"not loaded: they run code from the repository, so they need "
+                      f"--with-project-plugins.[/yellow]")
+    for message in host.load_errors:
+        console.print(f"  [yellow]{escape(message)}[/yellow]")
 
 
 @app.command()
 def prompts(
-    action: str = typer.Argument("list", help="list, show NAME, export [PATH], or path"),
-    name: str = typer.Argument("", help="Prompt name for `show`, or destination file for `export`"),
+    action: str = typer.Argument(
+        "list", help="list, show NAME, edit NAME, reset NAME, reset --all, "
+                     "export [PATH], or path"),
+    name: str = typer.Argument("", help="Prompt name, or destination file for `export`"),
+    scope: str = typer.Option(
+        "here", "--scope",
+        help="`here` writes into the current project when you are in one, "
+             "otherwise into your user config. `user` always writes to the user "
+             "config; `project` requires a project."),
 ):
-    """Inspect and customize every prompt the models receive."""
+    """Inspect and customize every prompt the models receive.
+
+    `edit` opens a prompt in $EDITOR and saves it as an override; `reset` puts a
+    prompt, or all of them, back to the built-in text. An override file is the
+    only thing `reset` touches -- the built-in prompts in the source are never
+    modified, so an upgrade never fights with your changes.
+    """
     from adaptive_harness.prompts import PromptRegistry, get_default_registry, DEFAULT_CONFIG_DIR
-    registry = get_default_registry()
+    # Load with the workspace, not the shared user-only registry: `prompts
+    # show` and `prompts list` are the audit view, and an audit view that
+    # silently omits the project's own overrides is worse than useless.
+    registry = PromptRegistry.for_workspace(Path.cwd())
     override_paths = [Path(DEFAULT_CONFIG_DIR) / "prompts.json",
                       Path(".harness") / "prompts.json",
                       Path(os.environ["ADAPTIVE_PROMPTS_FILE"]) if os.getenv("ADAPTIVE_PROMPTS_FILE") else None]
     if action == "list":
-        for prompt_name in registry.names():
-            marker = " [overridden]" if registry.is_overridden(prompt_name) else ""
-            preview = registry.get(prompt_name).strip().splitlines()[0][:90]
-            console.print(f"  [cyan]{prompt_name}[/cyan]{marker} [dim]{escape(preview)}[/dim]")
-        console.print("\n[dim]Override with a JSON file mapping names to new text; see `prompts path`.[/dim]")
+        # Grouped by what can trigger each prompt, and previewed to fit the
+        # terminal. A flat alphabetical list of 41 rows with mid-word cuts was
+        # unreadable, and a user auditing what the models receive needs to see
+        # which prompts can actually fire.
+        from adaptive_harness.prompt_preview import render as render_prompts
+
+        for line in render_prompts(registry, console=console):
+            if line and not line.startswith("  "):
+                console.print(f"[bold]{escape(line)}[/bold]")
+            elif line:
+                console.print(f"[dim]{escape(line)}[/dim]")
+            else:
+                console.print()
+        overridden = sum(1 for name in registry.names() if registry.is_overridden(name))
+        note = "\n[dim]Show one in full with `prompts show NAME`; "
+        note += "override with a JSON file, paths from `prompts path`."
+        if overridden:
+            note += f" {overridden} currently overridden.[/dim]"
+        console.print(note)
     elif action == "show":
         if not name:
             raise typer.BadParameter("show requires a prompt name", param_hint="name")
@@ -454,6 +1025,58 @@ def prompts(
             console.print(Text(registry.get(name)))
         except KeyError as exc:
             raise typer.BadParameter(str(exc), param_hint="name") from exc
+    elif action == "edit":
+        from adaptive_harness.prompts_edit import PromptEditError, edit_prompt, sources_for
+
+        if not name:
+            raise typer.BadParameter("edit requires a prompt name", param_hint="NAME")
+        if name not in registry.names():
+            known = ", ".join(sorted(registry.names())[:6])
+            raise typer.BadParameter(
+                f"no prompt named {name!r}. Try `prompts list`; some names: {known}, ...",
+                param_hint="NAME")
+        workspace = Path.cwd() if scope != "user" else None
+        try:
+            if scope == "project" and workspace is None:
+                raise PromptEditError("--scope project needs to be run inside a project.")
+            destination, changed = edit_prompt(name, registry.get(name), workspace)
+        except PromptEditError as exc:
+            console.print(f"[red]{escape(str(exc))}[/red]")
+            raise typer.Exit(1) from exc
+        if changed:
+            console.print(f"[green]Saved[/green] {name} to {destination}")
+            others = [entry.path for entry in sources_for(name, workspace)]
+            if len(others) > 1:
+                console.print(f"[yellow]Also overridden in "
+                              f"{', '.join(str(path) for path in others)}; "
+                              f"that copy takes precedence.[/yellow]")
+        else:
+            console.print("[dim]No change made.[/dim]")
+    elif action == "reset":
+        from adaptive_harness.prompts_edit import PromptEditError, reset_all, reset_override
+
+        workspace = Path.cwd() if scope != "user" else None
+        if name in {"", "all", "*"}:
+            try:
+                count, message = reset_all(workspace)
+            except PromptEditError as exc:
+                console.print(f"[red]{escape(str(exc))}[/red]")
+                raise typer.Exit(1) from exc
+            console.print(f"[{'green' if count else 'dim'}]{escape(message)}[/"
+                          f"{'green' if count else 'dim'}]")
+            return
+        if name not in registry.names():
+            raise typer.BadParameter(
+                f"no prompt named {name!r}. Try `prompts list`.", param_hint="NAME")
+        try:
+            changed, message = reset_override(name, workspace)
+        except PromptEditError as exc:
+            console.print(f"[red]{escape(str(exc))}[/red]")
+            raise typer.Exit(1) from exc
+        colour = "green" if changed else "yellow"
+        console.print(f"[{colour}]{escape(message)}[/{colour}]")
+        if not changed:
+            raise typer.Exit(1)
     elif action == "export":
         target = Path(name or "output/prompts.json")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -667,6 +1290,15 @@ def research(
                               help="A checkable claim as 'lhs == rhs' in SymPy syntax, decided directly"),
     symbols: str = typer.Option("", "--symbols", help="Comma-separated free symbols for --claim"),
     seed: int = typer.Option(20260926, "--seed", help="Pinned seed for every experiment"),
+    worker_budget: int = typer.Option(
+        16000, "--worker-budget-tokens", min=0,
+        help="Token ceiling per worker attempt. 0 removes the ceiling. A research "
+             "run fans out to many workers, so this is what bounds what one "
+             "invocation can cost."),
+    install_typst: bool = typer.Option(
+        False, "--install-typst",
+        help="Allow the harness to pip install the pinned Typst binding if no "
+             "engine is found. Off by default: it mutates your environment."),
     max_cycles: Optional[int] = typer.Option(None, "--max-cycles",
                                              help="Operator safety valve; the loop is not turn-limited by default"),
     patience: int = typer.Option(2, "--patience", help="No-progress cycles tolerated before escalating"),
@@ -691,6 +1323,10 @@ def research(
                                 help="Recover the persisted task board and ledger from an interrupted run"),
     provider: str = typer.Option("openrouter", "--provider",
                                  help="Configured API provider for independent research agents"),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m",
+        help="Model the research agents use. Defaults to the provider's own "
+             "default, which any account with that provider can call."),
     author: bool = typer.Option(True, "--author/--offline-legacy",
                                help="Run the live LLM research swarm (default); "
                                     "offline legacy mode is for reproducibility only"),
@@ -710,15 +1346,13 @@ def research(
     reports EXTERNAL_STOP with the operator named, rather than leaving orphaned
     child processes and a ledger that claims the loop converged.
     """
+    from adaptive_harness.research.claim import Verdict
     from adaptive_harness.research.swarm import ResearchSwarm, SwarmConfig
 
     client_factory = None
     if author:
-        if provider.lower() != "openrouter":
-            raise typer.BadParameter("live research uses OpenRouter with stealth/space-bunny-alpha",
-                                     param_hint="--provider")
         try:
-            client_factory = _llm_client_factory(provider=provider)
+            client_factory = _llm_client_factory(provider=provider, model=model)
         except Exception as exc:  # noqa: BLE001 - surfaced to the operator
             raise typer.BadParameter(str(exc), param_hint="--author") from exc
 
@@ -734,6 +1368,8 @@ def research(
                          seed=seed,
                          llm_client_factory=client_factory,
                          claim=claim,
+                         worker_budget_tokens=worker_budget,
+                         auto_install_typst=install_typst,
                          claim_symbols=tuple(name.strip() for name in symbols.split(",") if name.strip()))
     swarm = ResearchSwarm(topic, root=root, config=config)
     console.print(f"[bold cyan]Research swarm[/bold cyan] {topic}")
@@ -794,7 +1430,18 @@ def research(
 
     verdict = swarm.claims.headline
     color = {"PROVEN": "green", "DISPROVEN": "red"}.get(verdict.value, "yellow")
-    console.print(f"\n[bold {color}]VERDICT: {verdict.value}[/bold {color}]")
+    # Two different verdicts are reported: the mathematical one (what the
+    # derivations decided) and the process one (whether the run met every
+    # invariant). Printing a green PROVEN next to UNSOLVED and exiting 2 was
+    # the single most misleading thing this command could do, so the process
+    # verdict is stated first and the relationship is spelled out.
+    process = "COMPLETE" if outcome.solved else "INCOMPLETE"
+    process_color = "green" if outcome.solved else "red"
+    console.print(f"\n[bold {process_color}]RUN: {process} — {outcome.stop_reason.value}[/bold {process_color}]")
+    if not outcome.solved and verdict is Verdict.PROVEN:
+        console.print("[yellow]The mathematics was decided, but the run did not satisfy every "
+                      "invariant, so nothing is published as settled.[/yellow]")
+    console.print(f"[bold {color}]MATHEMATICAL VERDICT: {verdict.value}[/bold {color}]")
     console.print(swarm.claims.summary())
     for item in swarm.claims.adjudications:
         console.print(f"  [dim]{item.prop_id}[/dim] {item.verdict.value:<13} {item.statement[:66]}")
@@ -814,12 +1461,17 @@ def research(
         raise typer.Exit(code=2)
 
 
-def _llm_client_factory(provider: str = "openrouter"):
+def _llm_client_factory(provider: str = "openrouter", model: Optional[str] = None):
     """Build a factory that mints a fresh LLM client per research worker.
 
     A new client per worker is deliberate: each subagent needs its own
     conversation, tool set, and system prompt, and sharing one would interleave
     their histories.
+
+    ``model`` lets an operator choose the research model. The default comes from
+    the provider's entry, which is a model any account with that provider can
+    actually call -- research previously pinned one private slug, so a customer
+    without access to it could not run the product's headline feature at all.
     """
     from adaptive_harness.llm.client import LLMClient
     from adaptive_harness.data.credentials import CredentialsManager
@@ -827,12 +1479,15 @@ def _llm_client_factory(provider: str = "openrouter"):
     saved_keys = CredentialsManager().load()
     probe = LLMClient(provider=provider, provider_keys=saved_keys)
     if probe.is_mock:
-        raise RuntimeError(f"no live {provider} model is configured; use the harness credentials "
-                           "command or provider environment variable before research")
+        raise RuntimeError(
+            f"no live {provider} model is configured. Set the provider's environment "
+            f"variable (for example OPENROUTER_API_KEY), or save a key in the TUI with "
+            f"/key {provider} <key>, then run research again.")
+    chosen = model or probe.default_model
 
     def factory():
         return LLMClient(api_key=probe.api_key, base_url=probe.base_url,
-                         default_model=probe.default_model, force_mock=False,
+                         default_model=chosen, force_mock=False,
                          provider=probe.provider, provider_keys=probe.provider_keys,
                          backup_providers=probe.backup_providers)
 

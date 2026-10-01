@@ -80,6 +80,9 @@ class SwarmResult:
     artifacts: Mapping[str, Any] = field(default_factory=dict)
     verified: bool = False
     error: str | None = None
+    #: The subagent id this ran as, so a caller can correlate the result with
+    #: what it saw on screen. None when the run was not monitored.
+    agent_id: str | None = None
 
     @property
     def key(self) -> str:
@@ -89,7 +92,7 @@ class SwarmResult:
         return {"role": self.role.value, "phase": self.phase.value,
                 "success": self.success, "summary": self.summary,
                 "artifacts": dict(self.artifacts), "verified": self.verified,
-                "error": self.error}
+                "error": self.error, "agent_id": self.agent_id}
 
 
 @dataclass(frozen=True)
@@ -280,7 +283,9 @@ class DeveloperAgentWorker:
                  enable_skill_routing: bool = False,
                  write_target: Path | Sequence[Path] | None = None,
                  system_prompt: str | None = None,
-                 on_event: Callable[[Any], None] | None = None) -> None:
+                 on_event: Callable[[Any], None] | None = None,
+                 budget_tokens: int | None = None,
+                 registry: Any = None, parent_id: str = "main") -> None:
         if max_steps is not None and max_steps < 1:
             raise ValueError("max_steps must be positive")
         self.llm_client_factory = llm_client_factory
@@ -299,6 +304,19 @@ class DeveloperAgentWorker:
         self.write_target = write_target
         self.system_prompt = system_prompt
         self.on_event = on_event
+        # Lifecycle monitoring. Without it a subagent is an anonymous burst of
+        # tool calls; with it the same run is a named, watchable, stoppable
+        # agent that reports what it cost.
+        self.registry = registry
+        self.parent_id = parent_id
+        #: Tool names a definition asked for that this build does not have.
+        #: Dropped rather than fatal, but never silent.
+        self.unknown_tools: list[str] = []
+        # Per-assignment token ceiling. The research swarm passes one so a run
+        # has a bound on what it can spend; None means unbounded, which is only
+        # appropriate for a single interactive task.
+        self.budget_tokens = budget_tokens
+        self.total_tokens_spent = 0
 
     def _authorized_writes(self) -> tuple[Path, ...] | None:
         """The write allow-list for this assignment, or None when unrestricted."""
@@ -324,10 +342,13 @@ class DeveloperAgentWorker:
             available = {
                 "read_file": lambda: ReadFileTool(workspace_root=root),
                 "write_file": lambda: WriteFileTool(workspace_root=root, allowed_paths=authorized),
-                "edit_file": lambda: EditFileTool(workspace_root=root),
+                "edit_file": lambda: EditFileTool(workspace_root=root, allowed_paths=authorized),
                 "list_directory": lambda: ListDirectoryTool(workspace_root=root),
                 "search_files": lambda: SearchFilesTool(workspace_root=root),
-                "run_bash": lambda: RunBashTool(workspace_root=root),
+                # A worker must be able to execute its own decider, so the shell
+                # stays unrestricted; the allow-list is enforced separately on
+                # any path the command tries to *write*.
+                "run_bash": lambda: RunBashTool(workspace_root=root, allowed_write_paths=authorized),
                 "run_pytest": lambda: RunPytestTool(workspace_root=root),
                 "run_python_repl": lambda: RunPythonReplTool(),
                 "run_lean_proof": lambda: RunLeanProofTool(workspace_root=root,
@@ -335,9 +356,25 @@ class DeveloperAgentWorker:
                 "web_search": lambda: WebSearchTool(allow_public_metadata=True),
                 "compile_typst": lambda: CompileTypstTool(workspace_root=root),
             }
+            # A definition naming a tool this build does not have is a mistake
+            # in the file, and the person who wrote it should find out at once.
+            # Silently running the agent with fewer tools than it declared would
+            # A tool this build does not have is dropped, loudly. An agent
+            # definition is a file a person writes, and one stale tool name --
+            # a rename, a typo, a tool from a newer build -- should not cost
+            # the whole run. It is never silent: the names land in
+            # `unknown_tools` for the caller to surface, and a definition that
+            # ends up with no tools at all is still refused, because an agent
+            # that cannot do anything is not worth starting.
             unknown = [name for name in self.tool_names if name not in available]
             if unknown:
-                raise ValueError(f"Unsupported worker tools requested: {unknown}")
+                self.unknown_tools = list(unknown)
+                usable = tuple(name for name in self.tool_names if name in available)
+                if not usable:
+                    raise ValueError(
+                        f"None of the requested tools exist: {unknown}. "
+                        f"Available: {', '.join(sorted(available))}")
+                self.tool_names = usable
             return [available[name]() for name in self.tool_names]
 
         tools = [ReadFileTool(workspace_root=root), ListDirectoryTool(workspace_root=root),
@@ -378,7 +415,28 @@ class DeveloperAgentWorker:
             prompt += prompts.get("swarm.context_header") + json.dumps(assignment.context, ensure_ascii=False)
         response: dict[str, Any] = {}
         evidence: list[dict[str, Any]] = []
+        spent_tokens = 0
+
+        # Register as a subagent so a swarm run is monitored the same way a
+        # single delegation is. The id is on every event this worker emits,
+        # which is what lets the interface show whose work you are reading.
+        record = None
+        reporter = None
+        if self.registry is not None:
+            from adaptive_harness.agent.agent import AgentEvent
+            from adaptive_harness.agent.subagents import (
+                SubagentReporter, complete_event, spawn_event)
+
+            record = self.registry.spawn(parent_id=self.parent_id,
+                                         role=assignment.role.value,
+                                         description=assignment.directive.strip()[:120])
+            reporter = SubagentReporter(self.registry)
+            if self.on_event is not None:
+                self.on_event(AgentEvent("agent_spawned", spawn_event(record)))
+
         for event in agent.run_stream(prompt, max_steps=self.max_steps):
+            if reporter is not None and record is not None:
+                reporter.on_event(record.id, event)
             if self.on_event is not None:
                 self.on_event(event)
             if event.event_type == "response":
@@ -387,6 +445,19 @@ class DeveloperAgentWorker:
                 evidence.append({"tool": event.payload.get("name"),
                                  "success": bool(event.payload.get("success")),
                                  "error": event.payload.get("error")})
+            usage = event.payload.get("usage") if event.event_type == "response" else None
+            if isinstance(usage, dict):
+                spent_tokens += int(usage.get("total_tokens")
+                                    or (usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)))
+            if self.budget_tokens and spent_tokens >= self.budget_tokens:
+                # The budget used to be recorded in the spawn ledger entry and
+                # never compared to anything, so the audit trail attested to a
+                # limit that did not exist. Stop here, and say so.
+                response.setdefault("content", "")
+                response["stop_reason"] = "token_budget_exhausted"
+                self.total_tokens_spent += spent_tokens
+                break
+        self.total_tokens_spent += spent_tokens
         stop_reason = response.get("stop_reason")
         test_results = [item for item in evidence if item["tool"] == "run_pytest"]
         successful_tests = bool(test_results and test_results[-1]["success"])
@@ -409,6 +480,14 @@ class DeveloperAgentWorker:
         error = ("Model refused the assigned role" if refused else
                  None if success else
                  f"Subagent run did not complete (stop reason: {stop_reason or 'unknown'})")
+        if record is not None and self.registry is not None:
+            from adaptive_harness.agent.subagents import complete_event
+
+            self.registry.complete(record.id, result=summary, error=error or "",
+                                   stop_reason=stop_reason or "")
+            if self.on_event is not None:
+                self.on_event(AgentEvent("agent_completed", complete_event(record)))
         return SwarmResult(assignment.role, assignment.phase, success,
             summary,
-            {"tool_evidence": evidence, "stop_reason": stop_reason}, verified, error=error)
+            {"tool_evidence": evidence, "stop_reason": stop_reason}, verified, error=error,
+            agent_id=record.id if record else None)

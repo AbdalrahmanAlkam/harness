@@ -81,6 +81,20 @@ DEFAULT_PROMPTS: dict[str, str] = {
         "severity, evidence, and a concrete mitigation."
     ),
 
+    "domain.guidance.plan": (
+        "You are in PLAN MODE. Investigate thoroughly and produce a plan; do not modify "
+        "anything. You may read files, search, and list directories freely, and you may "
+        "delegate investigation to a subagent. Any attempt to write, edit, or run a "
+        "mutating command will be refused.\n\n"
+        "End your answer with a plan under the heading '## Plan', as an ordered list of "
+        "concrete steps. For each step, name the file(s) it touches and what it changes. "
+        "State anything you could not determine rather than guessing; the operator will "
+        "approve, edit, or reject this plan, so its accuracy matters more than its "
+        "confidence.\n\n"
+        "Also include a '## Risks' section naming what could go wrong, and a "
+        "'## Open questions' section for anything you need the operator to decide."
+    ),
+
     # Tool-output compression, asked of the *secondary* model only.
     "tool_filter.summarize": (
         "You are compressing the output of the `{tool}` tool so it fits in a small context window. "
@@ -138,6 +152,18 @@ DEFAULT_PROMPTS: dict[str, str] = {
         "The task is not complete. Repair failed tools and perform the missing checks before answering. "
         "Failed tools: {failures}. Missing checks: {checks}. "
         "If a check cannot be completed, state the concrete blocker instead of claiming success."
+    ),
+    # Live operator steering: the human speaking into a run already in flight.
+    # Framed rather than raw so the model reads it as a course correction from
+    # its principal, not as a new task and not as harness policy. It is a user
+    # message, never a system one: system messages in this transcript mean the
+    # harness is speaking, and that distinction is what the TUI renders.
+    "operator.steer": (
+        "[Operator · sent at step {step}, while you were still working on the original task]\n"
+        "{text}\n"
+        "Treat this as a course correction from the person you are working for. Apply it from your "
+        "next action onward. Do not restart work you have already verified, and do not report it as "
+        "a separate task."
     ),
 
     # Swarm subagent prompts.

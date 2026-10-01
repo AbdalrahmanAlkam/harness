@@ -14,6 +14,9 @@ from adaptive_harness.models.domain import ExecutionTrace
 
 DEFAULT_DB_PATH = Path("output/experience.db")
 
+#: Bumped whenever a migration in ``ExperienceRepository._migrate`` is added.
+SCHEMA_VERSION = 2
+
 
 class ExperienceRepository:
     """Encapsulates SQLite persistence for execution traces and verified agent feedback."""
@@ -24,9 +27,48 @@ class ExperienceRepository:
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        # WAL lets the read-only harvester keep reading while a writer holds the
+        # database, and a busy timeout gives concurrent swarm threads room
+        # instead of failing on the 5-second default.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+        except sqlite3.DatabaseError:
+            # A database on a filesystem without WAL support still works; it
+            # just keeps the default locking.
+            pass
         return conn
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add any column the current code needs that an older database lacks.
+
+        ``CREATE TABLE IF NOT EXISTS`` is a silent no-op on an existing table,
+        so without this a database created by an earlier build simply lacks the
+        new column and every write naming it raises. The agent loop downgrades
+        that to a ``storage_error`` event, so the run still "succeeds" while
+        silently discarding every trace -- which disables the whole learning
+        loop with no visible symptom.
+        """
+        expected = {
+            "executions": {
+                "task_id": "TEXT", "task_text": "TEXT", "predicted_strategy": "TEXT",
+                "selected_strategy": "TEXT", "verified_strategy": "TEXT",
+                "harness_success": "BOOLEAN", "recovered": "BOOLEAN",
+                "attempts_count": "INTEGER", "execution_time_ms": "REAL",
+                "confidence": "REAL", "entropy": "REAL", "margin": "REAL",
+                "probabilities_json": "TEXT",
+            },
+        }
+        for table, columns in expected.items():
+            present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if not present:
+                continue  # table does not exist yet; CREATE TABLE will make it
+            for name, decl in columns.items():
+                if name not in present:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def _init_db(self) -> None:
         """Initializes database schema and indices."""
@@ -72,6 +114,8 @@ class ExperienceRepository:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_verified_workspace "
                          "ON agent_traces(verified_success, workspace)")
+            self._migrate(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def save_agent_trace(self, workspace: str, prompt: str, trajectory: list[dict[str, Any]],
                          solution: str, *, verified_success: bool) -> None:
@@ -226,12 +270,19 @@ class ExperienceRepository:
         with self._get_connection() as conn:
             total = conn.execute("SELECT COUNT(*) as cnt FROM executions").fetchone()["cnt"]
             if total == 0:
+                # Every key the populated branch returns, so a caller never
+                # has to special-case an empty database. `report` is one of the
+                # first commands a new user runs, and it crashed with a
+                # KeyError here before.
                 return {
                     "total_executions": 0,
                     "success_rate": 0.0,
                     "recovery_count": 0,
                     "avg_time_ms": 0.0,
                     "avg_attempts": 0.0,
+                    "avg_confidence": 0.0,
+                    "avg_entropy": 0.0,
+                    "strategy_distribution": {},
                 }
 
             row = conn.execute(

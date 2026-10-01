@@ -10,6 +10,25 @@ from adaptive_harness.models.domain import Task, Result, VerificationResult
 from adaptive_harness.strategies.arithmetic import SafeArithmeticEvaluator
 from adaptive_harness.strategies.base import Strategy
 
+#: Tolerance for deciding a reported root matches an exact one. Relative, so a
+#: genuine root far from zero is not confused with a truncation of it.
+_ROOT_REL_TOL = 1e-9
+_ROOT_ABS_TOL = 1e-15
+
+
+def _roots_agree(exact, reported) -> bool:
+    """Whether an exact root and a reported one are the same number.
+
+    An absolute tolerance alone cannot do this job: it treats the true root of
+    ``123456789*x = 1`` (8.1e-9) as identical to the 0.0 that a rounded display
+    produced, and then certifies a wrong answer.
+    """
+    exact_value = complex(exact)
+    reported_value = complex(reported)
+    scale = max(abs(exact_value), abs(reported_value), 1.0)
+    return abs(exact_value - reported_value) <= max(
+        _ROOT_REL_TOL * scale, _ROOT_ABS_TOL)
+
 
 class EquationStrategy(Strategy):
     """Specialist handler for linear and quadratic single-variable equations."""
@@ -55,6 +74,14 @@ class EquationStrategy(Strategy):
             c = p0
             a = (p1 + pm1 - 2.0 * c) / 2.0
             b = (p1 - pm1) / 2.0
+            # The interpolation above differences two samples that are both
+            # ~-c whenever |c| >> |b|, so b is then pure cancellation noise:
+            # it came out as 0.0 for a perfectly ordinary equation, declaring it
+            # inconsistent. Where SymPy can read the coefficients off the
+            # expression it does so exactly and the noisy path is not used.
+            exact = self._exact_coefficients(lhs_expr, rhs_expr, var)
+            if exact is not None:
+                a, b, c = exact
 
             # Verify quadratic assumption at test point x=2
             expected_p2 = a * (2.0 ** 2) + b * 2.0 + c
@@ -93,7 +120,7 @@ class EquationStrategy(Strategy):
                             error="Inconsistent equation: no solution exists",
                         )
                 root = -c / b
-                solutions = [round(root, 6)]
+                solutions = [root]
             else:
                 # Quadratic: a*x^2 + b*x + c = 0
                 discriminant = b ** 2 - 4 * a * c
@@ -112,12 +139,12 @@ class EquationStrategy(Strategy):
                     )
                 elif abs(discriminant) <= 1e-9:
                     root = -b / (2 * a)
-                    solutions = [round(root, 6)]
+                    solutions = [root]
                 else:
                     sqrt_d = math.sqrt(discriminant)
                     r1 = (-b - sqrt_d) / (2 * a)
                     r2 = (-b + sqrt_d) / (2 * a)
-                    solutions = sorted([round(r1, 6), round(r2, 6)])
+                    solutions = sorted([r1, r2])
 
             return Result(
                 value={"roots": solutions, "variable": var},
@@ -196,6 +223,32 @@ class EquationStrategy(Strategy):
         s = re.sub(rf"(\d+)\s*{var}", rf"\1*{var}", s)
         # Variable followed by number without operator (rare, but handle)
         return s
+
+    def _exact_coefficients(self, lhs_expr: str, rhs_expr: str, var: str):
+        """Read (a, b, c) for ``a*x^2 + b*x + c`` exactly, or return None.
+
+        Interpolating the coefficients from p(0), p(1), p(-1) is ill-conditioned
+        when the constant term dwarfs the linear one: both samples round to -c,
+        their difference is cancellation noise, and the solver either loses
+        digits or concludes the equation is inconsistent. SymPy can read the
+        coefficients straight off the expression, so prefer that and fall back
+        to interpolation only when the expression is not polynomial.
+        """
+        try:
+            import sympy as sp
+        except ImportError:
+            return None
+        try:
+            symbol = sp.Symbol(var)
+            poly = sp.Poly(sp.expand(sp.sympify(lhs_expr) - sp.sympify(rhs_expr)), symbol)
+            if poly.degree() > 2:
+                return None
+            # nth(k) is the coefficient of x**k, so it is correct for a
+            # constant, linear, or quadratic polynomial alike. all_coeffs()
+            # returns descending order and would misindex a linear one.
+            return (float(poly.nth(2)), float(poly.nth(1)), float(poly.nth(0)))
+        except (sp.SympifyError, TypeError, ValueError, AttributeError, ZeroDivisionError):
+            return None
 
     def _substitute(self, expr: str, var: str, val: float) -> str:
         """Substitutes numeric value in parentheses for the variable."""
@@ -292,7 +345,13 @@ class EquationStrategy(Strategy):
                 return VerificationResult(success=False, reason="Reported root count differs from exact solutions")
             remaining = list(valid_roots)
             for rounded in reported:
-                match = next((root for root in remaining if abs(complex(sp.N(root)) - complex(rounded)) <= 1e-5), None)
+                # Compare complex values by magnitude: math.isclose rejects a
+                # complex argument outright, and an exact root can carry a tiny
+                # imaginary residue from solveset. A relative-or-absolute
+                # comparison is what tells a real root of 8.1e-9 apart from
+                # the 0.0 that an absolute 1e-5 tolerance used to accept.
+                match = next((root for root in remaining
+                              if _roots_agree(sp.N(root), rounded)), None)
                 if match is None:
                     return VerificationResult(success=False,
                                               reason=f"Reported root {rounded} does not satisfy the exact symbolic equation")

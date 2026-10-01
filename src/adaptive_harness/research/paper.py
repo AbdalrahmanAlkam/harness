@@ -54,11 +54,14 @@ def typst_raw_block(text: str, *, max_lines: int = 40) -> str:
 
     ``raw`` takes a *string* argument, not content, so the text is emitted as a
     single literal with newlines encoded as ``\\n``. Backticks are neutralized
-    because model-generated message text would otherwise terminate the literal.
+    because model-generated message text would otherwise terminate the literal,
+    and the quote and backslash are escaped because an unescaped quote closes the
+    literal and lets the remainder be parsed as Typst markup -- which for a
+    model-authored Lean source means a forged ``#lean-box`` certification badge.
     """
     lines = [line for line in str(text).splitlines()[:max_lines] if line.strip()]
     body = "\\n".join(line.replace("`", "'") for line in lines)
-    return f'#raw(block: true, lang: none, "{body}")'
+    return f'#raw(block: true, lang: none, "{typst_escape_str(body)}")'
 
 
 def escape_math_free(text: str) -> str:
@@ -191,7 +194,7 @@ class PaperBuilder:
     """Render a Typst mathematical paper from verified propositions and compile it."""
 
     def __init__(self, workspace_root: str | Path, *, typst_root: str | Path | None = None,
-                 allow_install_typst: bool = True):
+                 allow_install_typst: bool = False):
         self.workspace_root = Path(workspace_root).resolve()
         self.typst_root = Path(typst_root).resolve() if typst_root else self.workspace_root
         self.allow_install_typst = allow_install_typst
@@ -331,7 +334,12 @@ class PaperBuilder:
                 lines.append("")
             lines.append(f"  #text(weight: \"bold\")[Statement.] {escape_math_free(prop.statement)}")
             for equation in prop.display:
-                lines.append(f"  #block(width: 100%, above: 0.5em, below: 0.5em)[$ {equation} $]")
+                # `display` is model-authored and lands inside a Typst math span,
+                # where a stray bracket or `#` would otherwise be read as markup
+                # (a forged #lean-box included). Escaping the delimiters keeps the
+                # span a math span.
+                safe = str(equation).replace("\\", "\\\\").replace("$", "\\\\$").replace("#", "\\\\#")
+                lines.append(f"  #block(width: 100%, above: 0.5em, below: 0.5em)[$ {safe} $]")
             proved = verdict == Verdict.PROVEN.value
             heading = "Proof." if proved else "Derivation attempt."
             lines.append(f"  #text(weight: \"bold\")[{heading}] "
@@ -517,10 +525,16 @@ class PaperBuilder:
         if claim is None:
             return ""
         if claim.headline is Verdict.PROVEN:
-            body = ("The results above settle the question posed. In the regime where the delay "
-                    "distribution has a finite variance, the balanced allocation minimises the "
-                    "variance contributed by load imbalance, and the exact excess of any other "
-                    "split is identified.")
+            # Report the propositions this run actually decided. The wording must
+            # stay tied to the results above: a hardcoded sentence here would
+            # assert a finding about a topic this run never investigated.
+            props = list(inputs.propositions or [])
+            verdicts = {item.prop_id: item.verdict for item in (inputs.adjudications or [])}
+            proved = [prop for prop in props if verdicts.get(prop.prop_id) is Verdict.PROVEN]
+            titles = "; ".join(typst_escape(prop.name) for prop in proved[:5]) or "the results above"
+            body = (f"The results above settle the question posed. {len(proved)} proposition(s) "
+                    f"were decided by an executed exact derivation: {titles}. Each is stated with "
+                    f"the expression its script evaluated, so the reader can re-execute it.")
         elif claim.headline is Verdict.DISPROVEN:
             body = ("The claim as stated does not survive. A derivation script exhibited a "
                     "concrete counterexample, and the refutation is recorded above with the "
@@ -574,16 +588,26 @@ class PaperBuilder:
                                        tag=f"PROOF-{index:03d}"))
                 lines.append("")
         if inputs.lean_sources:
-            lines += ["== Appendix D: Lean 4 Listings", "",
-                      "The complete verified Lean sources, so a reader can reproduce the "
-                      "verification independently. Each file is checked with "
-                      "`lean proofs/lean/<name>.lean`; the axiom audit appended by the harness "
-                      "shows the only dependencies are Lean's own foundations.", ""]
-            for name, source in sorted(inputs.lean_sources.items()):
-                lines.append(f"#text(weight: \"bold\")[{typst_escape(name)}]")
-                lines.append("")
-                lines.append(typst_raw_block(render_lean_listing(source), max_lines=70))
-                lines.append("")
+            # Only a file the gate actually certified may appear under a heading
+            # that calls it verified. Listing a rejected file here would place a
+            # `sorry`-bearing source in the paper beside the Formal Foundations
+            # section that just reported it as refused.
+            certified_names = {Path(item.path).name
+                               for item in (inputs.lean_receipts or [])
+                               if getattr(item, "certified", False)}
+            listings = {name: source for name, source in inputs.lean_sources.items()
+                        if certified_names and name in certified_names}
+            if listings:
+                lines += ["== Appendix D: Lean 4 Listings", "",
+                          "The complete verified Lean sources, so a reader can reproduce the "
+                          "verification independently. Each file is checked with "
+                          "`lean proofs/lean/<name>.lean`; the axiom audit appended by the harness "
+                          "shows the only dependencies are Lean's own foundations.", ""]
+                for name, source in sorted(listings.items()):
+                    lines.append(f"#text(weight: \"bold\")[{typst_escape(name)}]")
+                    lines.append("")
+                    lines.append(typst_raw_block(render_lean_listing(source), max_lines=70))
+                    lines.append("")
         if inputs.outcome is not None:
             lines += ["== Appendix C: Convergence History", "",
                       "The loop is not turn-limited; it terminates on convergence or on *proven* "

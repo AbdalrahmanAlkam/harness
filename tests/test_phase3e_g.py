@@ -197,6 +197,13 @@ def test_provider_reports_actual_cached_tokens_and_stable_prefix():
         assert response.usage["reasoning_tokens"] == 5
         assert response.usage["cache_write_tokens"] == 8
         assert response.usage["cost_usd"] == 0.0123
-    assert requests[0]["messages"][0] == requests[1]["messages"][0] == prefix
-    assert requests[0]["extra_body"]["cache_control"] == {"type": "ephemeral"}
+    # The cached prefix must be byte-identical across requests, or the provider
+    # misses the cache and re-bills the system prompt every step. It now carries
+    # the marker on a content block, which is what Anthropic actually reads.
+    assert requests[0]["messages"][0] == requests[1]["messages"][0]
+    assert requests[0]["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert requests[0]["messages"][0]["content"][0]["text"] == "Stable project instructions"
+    assert "cache_control" not in requests[0]["extra_body"]
     assert requests[0]["extra_body"]["usage"] == {"include": True}
+    # The caller's own message list is never rewritten, since it is reused.
+    assert prefix == {"role": "system", "content": "Stable project instructions"}

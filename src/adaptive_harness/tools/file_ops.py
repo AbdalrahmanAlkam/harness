@@ -150,8 +150,14 @@ class EditFileTool(Tool):
         "required": ["path", "target_text", "replacement_text"],
     }
 
-    def __init__(self, workspace_root: Optional[Path | str] = None):
+    def __init__(self, workspace_root: Optional[Path | str] = None,
+                 allowed_paths: Optional[Sequence[Path | str]] = None):
         self.workspace_root = Path(workspace_root or os.getcwd()).resolve()
+        # Mirrors WriteFileTool. Without it, an editing worker can rewrite a
+        # sibling's leased artifact and defeat the coordination board's
+        # exclusivity guarantee, which only ever constrained write_file.
+        self.allowed_paths = ({workspace_path(self.workspace_root, str(path))
+                               for path in allowed_paths} if allowed_paths is not None else None)
 
     def execute(
         self,
@@ -164,6 +170,13 @@ class EditFileTool(Tool):
             file_path = workspace_path(self.workspace_root, path)
         except ValueError as exc:
             return ToolResult(success=False, output="", error=str(exc))
+        if self.allowed_paths is not None and file_path not in self.allowed_paths:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(f"Write refused: {path} is not one of the paths this worker is authorized "
+                       f"to edit. You are confined to your own leased artifacts."),
+            )
         if not file_path.exists():
             return ToolResult(success=False, output="", error=f"File not found: {path}")
 

@@ -1,14 +1,22 @@
 # Swarm/subagent design vs. modern harness practice
 
-> **Status: fully implemented.** Every recommendation in this document is now
-> covered by code and regression tests: observable subagents (`on_event`
-> forwarding, never-empty summaries, surfaced stop reasons), structural refusal
-> detection, file-state mutation evidence, evidence-based QA verification,
-> feedback retries, a bounded QA→coder repair loop, the reachable security
-> reviewer role, genuinely parallel read-only review waves, shared delegation
-> machinery (`run_assignment`), memory/safety inheritance for subagents, and
-> model-driven delegation (auto mode pipelines only explicit multi-agent
-> requests; long prompts are never hijacked).
+> **Status: historical. Read the code, not this document.** This is the
+> audit that drove the swarm rewrite, kept as a record of why it was rewritten.
+> The *recommendations* below are done. The *descriptions of the old code* are
+> not current: the fixed one-shot pipeline, the 2-worker executor, the unused
+> security role, and the silent refusal handling this document criticises were
+> all replaced, and the line references below point at code that has since
+> moved. See `src/adaptive_harness/agent/swarm.py` for what it does now —
+> four waves, a genuinely parallel read-only review wave, and a bounded
+> repair loop.
+>
+> What was implemented, as the banner originally claimed: observable subagents
+> (`on_event` forwarding, never-empty summaries, surfaced stop reasons),
+> structural refusal detection, file-state mutation evidence, evidence-based QA
+> verification, feedback retries, a bounded QA→coder repair loop, the reachable
+> security reviewer role, genuinely parallel read-only review waves, shared
+> delegation machinery (`run_assignment`), memory/safety inheritance for
+> subagents, and model-driven delegation.
 
 Analysis of `SwarmCoordinator` + `DeveloperAgentWorker` + `DelegateSubagentTool`
 against how contemporary agent harnesses (Claude Code subagents, OpenAI Agents

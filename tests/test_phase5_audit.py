@@ -134,12 +134,24 @@ async def test_copy_shortcut_copies_latest_agent_output(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "copy_to_clipboard", copied.append)
     async with app.run_test(size=(100, 24)) as pilot:
         await pilot.pause()
+
+        async def wait_for_copy() -> None:
+            # Delivery runs on a worker thread so a slow clipboard helper
+            # cannot freeze the interface, so wait for it to land.
+            for _ in range(40):
+                if copied:
+                    return
+                await pilot.pause()
+
         app._last_agent_content = "Useful answer with exact result."
         app._handle_slash_command("/copy")
+        await wait_for_copy()
         assert copied == ["Useful answer with exact result."]
         app._last_agent_content = ""
         app._review_patch = "diff --git a/a.py b/a.py"
+        copied.clear()
         await pilot.press("ctrl+y")
+        await wait_for_copy()
         assert copied[-1] == app._review_patch
 
 

@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import sys
 import threading
 from typing import Optional
 from rich.syntax import Syntax
@@ -31,6 +32,7 @@ from adaptive_harness.classifiers.domain_classifier import DomainMode, parse_dom
 from adaptive_harness.classifiers.thinking_classifier import parse_thinking_level, BUDGET_TOKENS, effort_for_level
 from adaptive_harness.llm.effort import supported_efforts
 from adaptive_harness.data.storage import ExperienceRepository
+from adaptive_harness import __version__
 from adaptive_harness.data.config import (ConfigManager, PromptHistoryStore,
                                           DEFAULT_DOMAIN_MODE, DEFAULT_MODEL, DEFAULT_MODEL_SELECTION,
                                           DEFAULT_SWARM_MODE)
@@ -53,6 +55,81 @@ SAFETY_PROFILES = ("turbo", "balanced", "cautious", "strict")
 STEP_POLICIES = ("classifier", "fixed", "unbounded")
 SWITCH_MODES = ("auto", "on", "off")
 
+#: Which slash command owns each setting the screen cannot cycle in place.
+#: The names differ from the setting keys, so this is explicit rather than
+#: derived: `max_steps` is set through `/steps`, not `/max_steps`.
+def _human_duration(milliseconds: float) -> str:
+    """Render a duration the way a person would say it.
+
+    "86.37 ms" is instrumentation. Sub-second work is reported in whole
+    milliseconds, anything longer in seconds or minutes.
+    """
+    if milliseconds < 1000:
+        return f"{round(milliseconds)} ms"
+    seconds = milliseconds / 1000
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    minutes, remainder = divmod(int(seconds), 60)
+    return f"{minutes}m {remainder}s"
+
+
+def _doctor_checks(app) -> list[tuple[str, bool, str]]:
+    """What this installation can actually do, reported honestly.
+
+    A green light for something that will fail later is worse than a yellow one,
+    so an absent optional tool is reported as absent rather than as fine.
+    """
+    import shutil
+
+    checks: list[tuple[str, bool, str]] = []
+    for binary, label in (("lean", "Lean 4 (formal proofs)"),
+                          ("typst", "Typst (papers)"),
+                          ("bwrap", "Bubblewrap (science sandbox)"),
+                          ("git", "git (worktrees)")):
+        found = shutil.which(binary)
+        checks.append((label, bool(found), found or "not installed"))
+    try:
+        from adaptive_harness.agent.tokenizer import available_backends
+        backends = available_backends()
+        checks.append(("token estimator", "tiktoken" in backends,
+                       ", ".join(backends) + " (chars4 is the default)"))
+    except Exception as exc:  # noqa: BLE001 - a probe must not crash the command
+        checks.append(("token estimator", False, f"unavailable: {exc}"))
+    try:
+        found = app.plugins.discover()
+        broken = [plugin.name for plugin in found if not plugin.ok]
+        checks.append(("plugins", not broken,
+                       f"{len(found)} loaded" + (f", {len(broken)} broken" if broken else "")))
+        if broken:
+            checks.append(("broken plugins", False, ", ".join(broken)))
+    except Exception as exc:  # noqa: BLE001
+        checks.append(("plugins", False, f"discovery failed: {exc}"))
+    try:
+        from adaptive_harness.plugins.mcp import McpHost
+        checks.append(("MCP", True, "host available; no servers declared"))
+    except Exception:  # noqa: BLE001
+        checks.append(("MCP", False, "host unavailable"))
+    key_env = [name for name in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
+                                  "OPENAI_API_KEY", "GEMINI_API_KEY")
+               if os.environ.get(name)]
+    try:
+        from adaptive_harness.data.credentials import CredentialsManager
+        saved = CredentialsManager().load()
+        has_key = bool(saved)
+    except Exception:  # noqa: BLE001
+        has_key = False
+    checks.append(("provider key", bool(key_env or has_key),
+                   f"{len(key_env)} in the environment" if key_env
+                   else ("saved credentials" if has_key else "none configured")))
+    return checks
+
+
+_SETTING_COMMANDS = {
+    "max_steps": "/steps",
+    "provider": "/provider",
+    "classifier": "/classifier",
+}
+
 #: Session settings that a `/new` must carry forward instead of dropping.
 SESSION_SETTING_KEYS = (
     "mode", "thinking", "safety", "step_policy", "max_steps",
@@ -60,6 +137,7 @@ SESSION_SETTING_KEYS = (
 )
 
 COMMANDS = ("/key", "/provider", "/model", "/mode", "/models", "/tier", "/theme", "/thinking", "/steps", "/prompts", "/safety", "/classifier", "/new",
+            "/context", "/memory", "/tasks", "/doctor",
             "/clear", "/history", "/help", "/exit", "/reset", "/workspace", "/sessions", "/usage",
             "/session", "/skills", "/skill", "/output", "/tool-output", "/copy", "/export",
             "/diff", "/isolation", "/swarm", "/settings")
@@ -88,6 +166,10 @@ COMMAND_DESCRIPTIONS = {
     "/sessions": "Browse saved sessions",
     "/session": "Load or save a session",
     "/usage": "Show token usage and cost",
+    "/context": "Show the context budget: what is held, what was admitted, what was not",
+    "/tasks": "Show running subagents (id, status, tools, tokens, elapsed) and the ones you can spawn",
+    "/memory": "Durable memory: list, accept <id>, forget <id>, clear",
+    "/doctor": "Check that this installation can do what it claims",
     "/skills": "Browse installed skills",
     "/skill": "Force or disable a skill",
     "/output": "Select or copy the latest agent response",
@@ -199,6 +281,11 @@ class AdaptiveHarnessApp(App):
         ("ctrl+shift+c", "copy_output", "Copy Output"),
         ("ctrl+y", "copy_output", "Copy Output"),
         ("ctrl+n", "new_session", "New Session"),
+        # Textual's stock palette offers Maximize, Screenshot and Theme -- none of
+        # the 32 commands this app has -- and it traps focus, so Tab lands in its
+        # input with no way out but Escape. Ctrl+P opens the harness's own.
+        ("ctrl+p", "open_command_palette", "Commands"),
+        ("escape", "cancel_task", "Cancel"),
         ("f1", "show_help", "Help"),
         ("f2", "choose_theme", "Theme"),
         ("f3", "review_diff", "Diff Review"),
@@ -207,6 +294,33 @@ class AdaptiveHarnessApp(App):
         ("f6", "toggle_telemetry", "Telemetry"),
         ("f7", "settings", "Settings"),
     ]
+
+    #: The stock Textual command palette is replaced by the harness's own.
+    ENABLE_COMMAND_PALETTE = False
+
+    def action_open_command_palette(self) -> None:
+        """Open the harness command palette, pre-seeded with the `/` prefix."""
+        self.query_one("#prompt-input", HistoryInput).value = "/"
+        self.action_palette()
+
+    def action_cancel_task(self) -> None:
+        """Escape cancels a run in flight; otherwise it is left to the dialogs.
+
+        A long task used to be uninterruptible: Ctrl+C only offers to quit, and
+        Esc only dismissed a question. On a paid tool that is not shippable.
+        """
+        if self._busy:
+            self.agent.request_cancel("operator pressed Esc")
+            # Mark the subagents too. Without this the monitoring view keeps
+            # showing them as running for a run that is already over, which is
+            # the state a user checks `/agents` in precisely to avoid trusting.
+            stopped = self.subagents.stop_all("the run was cancelled")
+            note = (f" and {len(stopped)} subagent(s)" if stopped else "")
+            self.query_one("#chat-log", RichLog).write(
+                Text(f"Cancelling after the current step{note}…", style="yellow"))
+            return
+        # Not busy: let a modal or the settings screen handle Escape itself.
+
 
     def __init__(
         self,
@@ -350,6 +464,11 @@ class AdaptiveHarnessApp(App):
             self.session = self.session_store.create(self.workspace_root)
         self.skill_catalog = SkillCatalog(self.workspace_root)
         self._busy = False
+        # One place every subagent the session spawns is tracked, so a run with
+        # several in flight can be watched, named, and accounted for.
+        from adaptive_harness.agent.subagents import SubagentRegistry
+
+        self.subagents = SubagentRegistry()
         self._show_telemetry = True
         self._last_tool_output = ""
         self._last_agent_content = ""
@@ -792,6 +911,12 @@ class AdaptiveHarnessApp(App):
         log = self.query_one("#chat-log", PinnedRichLog)
         log.clear()
         log._set_pinned(False)
+        # An empty bordered box reads as a broken app. Say what happened and
+        # what to do next, in the space that was just freed.
+        log.write(Text(""))
+        log.write(Text("Chat cleared. The session and its settings are untouched.", style="dim"))
+        log.write(Text("Ask for anything, or type /help to see what this can do.",
+                       style="dim cyan"))
 
     def deliver_to_clipboard(self, text: str) -> clipboard.ClipboardDelivery:
         """Copy ``text`` to the best available clipboard and remember the result.
@@ -830,12 +955,27 @@ class AdaptiveHarnessApp(App):
             log.write(Text("Nothing to copy yet. Drag across the chat log to select text, "
                            "or run a task first.", style="yellow"))
             return
-        delivery = self.deliver_to_clipboard(selected)
+        # The clipboard helper is an external process that can take seconds to
+        # fail. Running it inline froze the whole app for the duration -- no
+        # repaint, no keystroke, no Ctrl+C -- on two of the most-used shortcuts.
+        # Acknowledge immediately and deliver on a worker thread.
+        self._activity = "Copying"
+        self._refresh_status()
+        self._copy_in_background(selected)
+
+    @work(thread=True)
+    def _copy_in_background(self, text: str) -> None:
+        """Deliver to the clipboard off the event loop, then report the outcome."""
+        delivery = self.deliver_to_clipboard(text)
+        log = self.query_one("#chat-log", RichLog)
         style = "green" if delivery.delivered else "yellow"
         message = delivery.summary()
         if not delivery.delivered:
-            message += " Install wl-clipboard/xclip, or run: xclip -selection clipboard"
+            # Only suggest a helper when none was found. The old text advised
+            # installing the very tool that had just been found and failed.
+            message += " No clipboard helper answered; the text was still written to output/clipboard/."
         log.write(Text(message, style=style))
+        self.call_from_thread(self._refresh_status)
 
     def action_copy_or_quit(self) -> None:
         """``ctrl+c``: copy the selection when there is one, otherwise quit."""
@@ -1213,8 +1353,54 @@ class AdaptiveHarnessApp(App):
             self._show_model_picker(self._model_catalog, secondary=True)
             return
         # Everything else already has a working command; reuse it rather than
-        # growing a second implementation of the same behaviour.
-        self._handle_slash_command(f"/{key}")
+        # growing a second implementation of the same behaviour. The mapping is
+        # explicit because the setting key and the command name are not always
+        # the same: `max_steps` is owned by `/steps`, and dispatching `/{key}`
+        # verbatim sent the user to an "Unknown command" error and dropped them
+        # out of the settings screen.
+        command = _SETTING_COMMANDS.get(key)
+        if command is None:
+            self.query_one("#chat-log", RichLog).write(
+                Text(f"No flow is wired up for the {key} setting yet.", style="yellow"))
+            return
+        # `/provider` and `/classifier` print their current value and exit when
+        # given no argument, which reads as a dead end from a settings screen.
+        # They open the app's own picker: a blocking Prompt.ask here would read
+        # stdin on Textual's event loop, freeze the app, and leave the screen
+        # stack half-popped when it hit EOF.
+        if command in {"/provider", "/classifier"}:
+            self._show_value_picker(command.lstrip("/"))
+            return
+        self._handle_slash_command(command)
+
+    def _show_value_picker(self, what: str) -> None:
+        """Open a searchable picker for a setting that owns a slash command.
+
+        Reuses the same modal the model picker uses, so a value chosen here
+        arrives through the command that already owns the behaviour rather than
+        through a second implementation of it.
+        """
+        if what == "provider":
+            choices = [(name, f"Use {name} for this session") for name in PROVIDERS]
+            current = self.provider_name
+        else:
+            backends = ["sklearn", "semif", "onnx"]
+            choices = [(name, f"Use the {name} classifier backend") for name in backends]
+            current = self._classifier_summary_name()
+
+        def chosen(selection: str | None) -> None:
+            if not selection:
+                return
+            self._handle_slash_command(f"/{what} {selection}")
+
+        self.push_screen(QuickSelectModal(what.title(), choices, current=current),
+                          callback=chosen)
+
+    def _classifier_summary_name(self) -> str:
+        try:
+            return self.agent.classifier_backend.name
+        except AttributeError:
+            return "sklearn"
 
     def _refresh_settings_screen(self) -> None:
         """Update the open screen's rows in place after a change."""
@@ -1353,42 +1539,49 @@ class AdaptiveHarnessApp(App):
         self._has_focus = True
 
     def action_show_help(self) -> None:
+        """Print the command list, generated so it cannot drift from the code.
+
+        This used to be a hand-maintained block of plain strings written into a
+        ``markup=True`` log, so every literal ``[...]`` -- the argument
+        placeholders, which are the most useful part of each line -- was eaten as
+        markup and silently deleted from the help.
+        """
         log = self.query_one("#chat-log", RichLog)
-        log.write("[bold yellow]Available Commands:[/bold yellow]")
-        log.write("  /provider <name>       - Switch OpenRouter, Anthropic, OpenAI, DeepSeek, Google, Groq, or local")
-        log.write("  /key <provider> <key>   - Save a private provider key; /key status or /key clear <provider>")
-        log.write("  /model [MODEL_ID]      - Browse models (F4) or set one directly")
-        log.write("  /models                - Search live OpenRouter catalog")
-        log.write("  /tier <fast|standard|reasoning> - Force model tier")
-        log.write("  /copy                   - Copy selected chat text or latest agent reply")
-        log.write("  Ctrl+Shift+C, Ctrl+Y    - Copy selected chat text or latest agent reply")
-        log.write("  Ctrl+C                  - Copy the selection, or quit when nothing is selected")
-        log.write("  [dim]Mouse drag over the chat log selects text; every copy is also saved to output/clipboard/ "
-                 "so it can be recovered even if the terminal drops OSC 52.[/dim]")
-        log.write("  /safety <turbo|balanced|cautious|strict> - Set tool confirmation level")
-        log.write("  /mode <coding|research|science|security|auto> - Set operational mode")
-        log.write("  /thinking <auto|low|medium|high|xhigh|max> - Set model reasoning effort (deep = high)")
-        log.write("  /steps <classifier|fixed|unbounded|N> - Set tool-step limit policy")
-        log.write("  /prompts [show NAME]   - List model prompts or print one; edit via prompts.json overrides")
-        log.write("  /classifier <semif|sklearn|backend> [model/path] - Switch decision engine")
-        log.write("  /workspace [path]      - Show or change working directory")
-        log.write("  /sessions              - Browse saved sessions (F5); /sessions list prints IDs")
-        log.write("  /session new [title] | load <id> | save")
-        log.write("  /skills                - List installed skills")
-        log.write("  /skill list            - Browse 22 built-in and custom skills")
-        log.write("  /skill <name|off>      - Force a skill or restore automatic routing")
-        log.write("  /output                - Open a selectable full-text view of the latest agent response")
-        log.write("  /tool-output           - Open a selectable view of the latest tool result")
-        log.write("  /usage                 - Show all session token types and reported cost")
-        log.write("  /new | /reset          - Start a new session or reset current one (settings carry over)")
-        log.write("  /reset defaults        - Also restore mode/thinking/safety/swarm to launch defaults")
-        log.write("  /theme [name]          - Preview and save terminal theme (F2)")
-        log.write("  /history               - Show recent prompts; Up/Down recalls prompts")
-        log.write("  /export [markdown|json] - Save the session to output/sessions/")
-        log.write("  F3                    - Review isolated changes")
-        log.write("  F6                    - Show or hide telemetry")
-        log.write("  /clear                 - Clear chat history")
-        log.write("  /exit                  - Exit application")
+        log.write(Text("Available Commands", style="bold yellow"))
+        width = max((len(command) for command in COMMANDS), default=10)
+        for command in COMMANDS:
+            description = COMMAND_DESCRIPTIONS.get(command, "")
+            log.write(Text(f"  {command.ljust(width)}  {description}"))
+        log.write(Text(""))
+        log.write(Text("Key bindings", style="bold yellow"))
+        for binding in self._key_binding_help():
+            log.write(Text(f"  {binding}"))
+        log.write(Text(""))
+        log.write(Text(
+            "Drag across the chat log to select text. Every copy is also saved to "
+            "output/clipboard/ so it survives a terminal that drops OSC 52.",
+            style="dim"))
+        log.write(Text(
+            "While the agent is working, Enter queues your note for the start of the "
+            "next step; prefix it with ! to stop the run after the current step.",
+            style="dim"))
+
+    @staticmethod
+    def _key_binding_help() -> list[str]:
+        """The keys the footer advertises, described in words rather than glyphs."""
+        return [
+            "Ctrl+C        copy the selection, or quit when nothing is selected",
+            "Ctrl+Y        copy the selection or the latest agent reply",
+            "Ctrl+N        new session",
+            "Ctrl+L        clear the chat history",
+            "F2            preview and save the terminal theme",
+            "F3            review isolated changes",
+            "F4            choose a model",
+            "F5            browse saved sessions",
+            "F6            show or hide telemetry",
+            "F7            open the settings screen",
+            "Esc           close a dialog, or cancel a question",
+        ]
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "prompt-input":
@@ -1407,7 +1600,10 @@ class AdaptiveHarnessApp(App):
 
         input_widget = self.query_one("#prompt-input", HistoryInput)
         if self._busy and not text.startswith("/"):
-            self.query_one("#chat-log", RichLog).write(Text("Agent is still working. Wait for this task to finish.", style="yellow"))
+            # Steering a run already in flight, rather than making the user wait
+            # for a long task to end before they can correct it. A leading "!"
+            # asks to stop after this step and start from the note instead.
+            self._queue_operator_message(text, input_widget)
             return
         input_widget.value = ""
         input_widget.reset_navigation()
@@ -1436,6 +1632,37 @@ class AdaptiveHarnessApp(App):
         self._refresh_status()
         self._bell_rung = False
         self.execute_agent_task(text)
+
+    def _queue_operator_message(self, text: str, input_widget: HistoryInput) -> None:
+        """Accept a message typed into a run already in flight.
+
+        Plain text is added to the next step's context; a leading ``!`` asks to
+        stop after the current step and be replaced by this text. Either way the
+        run keeps going and the log says which, because an instruction typed by
+        a human is never silently swallowed.
+        """
+        log = self.query_one("#chat-log", RichLog)
+        kind = "steer"
+        if text.startswith("!"):
+            kind = "interrupt"
+            text = text[1:].strip()
+            if not text:
+                text = "Stop here and report exactly what you have verified so far."
+        depth = self.agent.queue_operator_message(text, kind=kind)
+        log.write(Text(f"\nDeveloper (operator) > {text}", style="bold cyan"))
+        log.write(Text(("⏳ queued, delivered at the start of the next step" if kind == "steer"
+                        else "⏳ queued, the run stops after this step and this becomes the next task")
+                       + (f" · {depth} pending" if depth > 1 else ""), style="dim cyan"))
+        input_widget.value = ""
+        input_widget.reset_navigation()
+        try:
+            if self.history_store.record(text):
+                input_widget.history = list(self.history_store.entries)
+        except OSError as exc:
+            log.write(Text(f"Prompt history could not be saved: {exc}", style="yellow"))
+        # Deliberately no _save_session() here: it reads self.agent.messages from
+        # this thread while the worker thread is appending to it.
+        self._refresh_status()
 
     def _handle_slash_command(self, cmd_text: str) -> None:
         log = self.query_one("#chat-log", RichLog)
@@ -1757,6 +1984,23 @@ class AdaptiveHarnessApp(App):
                 log.write(Text("No tool result yet.", style="yellow"))
         elif cmd == "/usage":
             self._show_usage()
+        elif cmd == "/context":
+            self._show_context()
+        elif cmd == "/memory":
+            self._show_memory(arg)
+        elif cmd == "/tasks":
+            from adaptive_harness.agents import AgentRegistry
+
+            log = self.query_one("#chat-log", RichLog)
+            log.write(Text(self.subagents.describe(), style="dim"))
+            registry = AgentRegistry(self.workspace_root)
+            registry.discover()
+            log.write(Text(""))
+            log.write(Text(registry.describe(), style="dim"))
+            for warning in registry.warnings:
+                log.write(Text(f"  {warning}", style="dim yellow"))
+        elif cmd == "/doctor":
+            self._show_doctor()
         elif cmd == "/copy":
             self.action_copy_output()
         else:
@@ -1819,6 +2063,69 @@ class AdaptiveHarnessApp(App):
 
     def _show_usage(self) -> None:
         self.query_one("#chat-log", RichLog).write(Text("Session usage · " + self._usage_summary(), style="bold cyan"))
+
+    def _show_context(self) -> None:
+        """The context budget waterfall.
+
+        This is the view that answers "where did my context go", which is the
+        only question an operator has about context and the one the plane
+        exists to make answerable.
+        """
+        log = self.query_one("#chat-log", RichLog)
+        described = self.agent.context_plane.describe()
+        log.write(Text("Context plane", style="bold cyan"))
+        log.write(Text(f"  window {described['capacity']:,} · "
+                       f"reserved {described['reserved']:,} for the final answer · "
+                       f"{described['available']:,} to fill", style="dim"))
+        held = described.get("held") or {}
+        if not held:
+            log.write(Text("  nothing held: only the conversation so far", style="dim"))
+        for source, info in held.items():
+            log.write(Text(f"  {source} · ~{info['tokens']:,} tokens · priority "
+                           f"{info['priority']} · trigger {info['trigger']}"
+                           + (" · pinned" if info["pinned"] else ""), style="dim"))
+        last = described.get("last")
+        if last:
+            log.write(Text(f"  last turn: {last['used']:,}/{last['available']:,} used · "
+                           f"{len(last['admitted'])} admitted · "
+                           f"{len(last['rejected'])} deferred", style="dim"))
+            for item in last.get("rejected", []):
+                log.write(Text(f"    not admitted · {item['source']}: {item['reason']}",
+                               style="dim yellow"))
+
+    def _show_memory(self, argument: str) -> None:
+        """Durable memory: what the harness remembers, and what it is asking about."""
+        from adaptive_harness.agent.memory import MemoryStore
+
+        log = self.query_one("#chat-log", RichLog)
+        store = MemoryStore(Path(self.config_dir) if getattr(self, "config_dir", None) else None)
+        action, _, value = (argument or "").partition(" ")
+        value = value.strip()
+        try:
+            if action == "accept" and value:
+                memory = store.accept(value)
+                log.write(Text(f"Remembered: {memory.text}" if memory
+                               else f"No pending memory with id {value!r}.", style="green"))
+            elif action == "forget" and value:
+                log.write(Text("Forgotten." if store.forget(value)
+                               else f"No memory with id {value!r}.",
+                               style="green" if store.proposals or store.memories else "yellow"))
+            elif action == "clear":
+                log.write(Text(f"Cleared {store.clear()} memory(ies).", style="green"))
+            else:
+                log.write(Text(store.describe(), style="dim"))
+        except ValueError as exc:
+            log.write(Text(str(exc), style="yellow"))
+        log.write(Text("/memory accept <id> · /memory forget <id> · /memory clear", style="dim"))
+
+    def _show_doctor(self) -> None:
+        """Is this installation actually able to do what it claims?"""
+        log = self.query_one("#chat-log", RichLog)
+        log.write(Text("Environment", style="bold cyan"))
+        log.write(Text(f"  harness {__version__} · python {sys.version.split()[0]}", style="dim"))
+        for label, ok, detail in _doctor_checks(self):
+            mark = "[green]ok[/green]" if ok else "[yellow]--[/yellow]"
+            log.write(Text(f"  {mark} {label}: {detail}", style="dim"))
 
     def _should_isolate(self, task: str) -> bool:
         if self.isolation_mode == "off":
@@ -1892,21 +2199,64 @@ class AdaptiveHarnessApp(App):
             pass
 
     def _render_subagent_event(self, event) -> None:
+        """Render a subagent lifecycle event.
+
+        The old shape was a one-line text dump per tool call, so a run with three
+        subagents interleaved into a wall of `⇢` with no way to tell whose work
+        you were reading. Now the agent id is on every line and the activity is
+        nested under the agent that produced it.
+        """
+        p = event.payload or {}
+        et = event.event_type
+        if et == "agent_spawned":
+            indent = "  " * (int(p.get("depth", 0)) + 1)
+            self.query_one("#chat-log", RichLog).write(Text(
+                f"{indent}⏺ {BULLET} {p.get('agent_id', '?')} · {p.get('role', '?')} · "
+                f"{p.get('description', '')[:100]}", style="dim cyan"))
+        elif et == "agent_tool_unavailable":
+            names = ", ".join(p.get("tools", []))
+            self.query_one("#chat-log", RichLog).write(Text(
+                f"  ⚠ {p.get('agent', '?')} asked for tools this build does not "
+                f"provide: {names}. It ran without them.", style="dim yellow"))
+        elif et == "agent_completed":
+            indent = "  " * (int(p.get("depth", 0)) + 1)
+            status = p.get("status", "?")
+            tools = len(p.get("tools") or [])
+            style = "dim green" if status == "completed" else "dim red"
+            if p.get("error"):
+                self.query_one("#chat-log", RichLog).write(Text(
+                    f"{indent}✗ {p.get('agent_id', '?')} {status} after "
+                    f"{tools} tool(s) in {(p.get('elapsed_ms') or 0) / 1000:.1f}s"
+                    f" — {str(p.get('error'))[:120]}", style="dim red"))
+            else:
+                self.query_one("#chat-log", RichLog).write(Text(
+                    f"{indent}● {p.get('agent_id', '?')} {status} · {tools} tool(s) · "
+                    f"{(p.get('elapsed_ms') or 0) / 1000:.1f}s", style=style))
+        elif et in {"tool_call", "tool_result", "prompt_injection", "response"}:
+            self._render_subagent_detail(et, p)
+
+    def _render_subagent_detail(self, et: str, p: dict) -> None:
+        """One line of subagent activity, attributed and indented."""
         log = self.query_one("#chat-log", RichLog)
-        et, p = event.event_type, event.payload
+        agent_id = p.get("agent_id", "")
+        indent = "  " * (int(p.get("depth", 0)) + 2)
         if et == "tool_call":
-            log.write(Text(f"⇢ subagent tool call: {p.get('name')} {json.dumps(p.get('arguments', {}), ensure_ascii=False)[:160]}",
-                           style="dim cyan"))
+            target = p.get("arguments", {}) or {}
+            detail = ""
+            for key in ("path", "file_path", "command", "query", "url"):
+                value = target.get(key)
+                if isinstance(value, str) and value.strip():
+                    detail = " " + " ".join(value.split())[:56]
+                    break
+            log.write(Text(f"{indent}⏺ {p.get('name', '?')}{detail}"
+                           + (f"  [{agent_id}]" if agent_id else ""), style="dim"))
         elif et == "tool_result":
-            log.write(Text(f"⇢ subagent result: {p.get('name')} "
-                           f"{'ok' if p.get('success') else 'failed: ' + str(p.get('error') or '')[:160]}",
-                           style="dim cyan"))
+            status = "ok" if p.get("success") else "failed"
+            log.write(Text(f"{indent}  → {status}", style="dim red" if not p.get("success") else "dim green"))
         elif et == "prompt_injection":
-            log.write(Text(f"⇢ subagent prompt injected ({p.get('source')}): {str(p.get('content'))[:200]}",
-                           style="dim yellow"))
+            log.write(Text(f"{indent}⇢ prompt ({p.get('source', '?')})", style="dim yellow"))
         elif et == "response":
-            log.write(Text(f"⇢ subagent finished ({p.get('stop_reason') or 'completed'})",
-                           style="dim cyan"))
+            log.write(Text(f"{indent}  ({p.get('stop_reason') or 'done'})", style="dim"))
 
     def _prepare_swarm_telemetry(self, task_text: str) -> None:
         self._activity = "Preparing swarm"
@@ -1993,7 +2343,7 @@ class AdaptiveHarnessApp(App):
                 coordinator = SwarmCoordinator(DeveloperAgentWorker(llm_client_factory=self._swarm_client,
                     max_steps=self.agent.max_steps, step_policy=self.agent.step_policy,
                     repository=self.agent.repository, safety_profile=self.agent.safety_profile,
-                    on_event=self._subagent_event),
+                    on_event=self._subagent_event, registry=self.subagents),
                     on_status=lambda status: self.call_from_thread(self._swarm_status_changed, dict(status)))
                 report = coordinator.run(task_text, isolated.workspace if isolated else self.workspace_root,
                                          isolated=bool(isolated))
@@ -2001,7 +2351,7 @@ class AdaptiveHarnessApp(App):
                 success = report.success
             else:
                 success = False
-                for event in self.agent.run_stream(task_text):
+                for event in self.agent.run_stream_with_followup(task_text):
                     if event.event_type == "response":
                         success = bool(event.payload.get("success"))
                     self.call_from_thread(self._render_event, event)
@@ -2115,6 +2465,64 @@ class AdaptiveHarnessApp(App):
                 suffix = f" · {p['state'].replace('_', ' ').title()}" if p.get("state") else ""
                 log.write(Text(f"⚠ Prompt injected ({label}{suffix}):", style="bold yellow"))
                 log.write(Text(p["content"], style="yellow"))
+        elif et == "operator_queued":
+                depth = p.get("pending", 1)
+                when = ("stop after this step" if p.get("kind") == "interrupt"
+                        else "lands at the start of the next step")
+                log.write(Text(f"⏳ operator ({when}" + (f" · {depth} queued" if depth > 1 else "")
+                               + ")", style="dim cyan"))
+        elif et == "operator_message":
+                # Cyan means the model actually received it and it changed the
+                # run. Yellow means it was recorded but steered nothing -- a late
+                # note must never be rendered as though it was obeyed.
+                raw = p.get("raw") or ""
+                if p.get("kind") == "interrupt":
+                    log.write(Text(f"⚡ operator: {raw}", style="bold cyan"))
+                    log.write(Text("run stops after this step · this becomes the next task", style="dim cyan"))
+                    self._activity = "Handing over to the operator"
+                elif p.get("state") == "carried_over":
+                    log.write(Text(f"⚡ operator: {raw}", style="bold yellow"))
+                    log.write(Text("the previous run was already over · running this as the next task", style="dim yellow"))
+                elif p.get("late"):
+                    log.write(Text(f"⚡ operator: {raw}", style="bold yellow"))
+                    log.write(Text("the run had already finished · kept as context, it did not steer anything",
+                                   style="dim yellow"))
+                else:
+                    log.write(Text(f"⚡ operator: {raw}", style="bold cyan"))
+                    log.write(Text(f"injected as the first instruction of step {p.get('step')} "
+                                   f"· waited {p.get('wait_ms', 0)} ms", style="dim cyan"))
+                self._refresh_status()
+        elif et == "requirements":
+                items = p.get("requirements", [])
+                if items:
+                    log.write(Text(f"\n◈ {len(items)} obligation(s) extracted from your request:",
+                                   style="dim"))
+                    for item in items:
+                        log.write(Text(f"  {item.get('id')} {item.get('text')}", style="dim"))
+        elif et == "context_budget":
+                admitted, rejected = p.get("admitted", []), p.get("rejected", [])
+                bits = [f"{p.get('used', 0):,}/{p.get('available', 0):,} tokens used"]
+                if admitted:
+                    bits.append(f"{len(admitted)} fragment(s) admitted")
+                if rejected:
+                    bits.append(f"{len(rejected)} deferred")
+                log.write(Text("◈ Context budget · " + " · ".join(bits), style="dim"))
+                for item in rejected:
+                    log.write(Text(f"  not admitted · {item.get('source')}: "
+                                   f"{item.get('reason')}", style="dim yellow"))
+        elif et == "quality_gate":
+                # The finding is shown whether or not the gate is load-bearing,
+                # because a user who cannot see it cannot act on it.
+                verdict = p.get("verdict", "?")
+                colour = {"accept": "green", "revise": "yellow", "reject": "red"}.get(verdict, "yellow")
+                log.write(Text(f"\n◈ Quality gate: {verdict.upper()} — {p.get('reason', '')}",
+                               style=f"bold {colour}"))
+                for item in p.get("adjudications", []):
+                    if item.get("status") != "satisfied":
+                        log.write(Text(f"  {item.get('id')} {item.get('status')}: "
+                                       f"{item.get('reason')}", style="dim yellow"))
+                for line in p.get("contradictions", []):
+                    log.write(Text(f"  contradiction: {line}", style="red"))
         elif et == "provider_failover":
                 log.write(Text(f"Provider failover: {p['from']} → {p['to']} ({p['model']})", style="bold yellow"))
                 telemetry.update_telemetry(model=p["model"], selection="failover")
@@ -2245,14 +2653,23 @@ class AdaptiveHarnessApp(App):
                     "verification_failed": "Task needs another verification pass",
                     "skill_verification_failed": "Task did not meet skill verification checks",
                     "provider_error": "Provider request failed",
+                    "operator_interrupt": "Stopped at your instruction",
+                    "cancelled": "Cancelled — a tool call already in flight finished first",
                 }.get(p.get("stop_reason"), "Task stopped before completion")
                 cost_display = f"${self._reported_cost_usd:.6f}" if self._cost_reported else "not reported by provider"
                 log.write(Text(f"Session tokens: {self.prompt_tokens + self.completion_tokens:,} total · "
                     f"input {self.prompt_tokens:,} · output {self.completion_tokens:,} · reasoning {self._reasoning_tokens:,} · "
                     f"cache read {self._cached_tokens:,} · cache write {self._cache_write_tokens:,} · cost {cost_display}",
                     style="dim cyan"))
-                log.write(Text(f"\n{status} in {p['total_time_ms']} ms ({p['steps']} steps)\n",
-                               style="bold green" if p["success"] else "bold yellow"))
+                # "86.37 ms" and "1 steps" are developer instrumentation. Round to
+                # a number a person would say, and fix the plural.
+                elapsed = _human_duration(p['total_time_ms'])
+                steps = p['steps']
+                step_word = "step" if steps == 1 else "steps"
+                handover = p.get("stop_reason") == "operator_interrupt"
+                log.write(Text(f"\n{status} in {elapsed} ({steps} {step_word})\n",
+                               style="dim cyan" if handover else
+                               "bold green" if p["success"] else "bold yellow"))
                 if p.get("total_time_ms", 0) >= 5000 and not self._has_focus and not self._bell_rung:
                     self.bell()
                     self._bell_rung = True
