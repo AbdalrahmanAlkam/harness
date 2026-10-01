@@ -2213,6 +2213,11 @@ class AdaptiveHarnessApp(App):
             self.query_one("#chat-log", RichLog).write(Text(
                 f"{indent}⏺ {BULLET} {p.get('agent_id', '?')} · {p.get('role', '?')} · "
                 f"{p.get('description', '')[:100]}", style="dim cyan"))
+        elif et == "agent_tool_unavailable":
+            names = ", ".join(p.get("tools", []))
+            self.query_one("#chat-log", RichLog).write(Text(
+                f"  ⚠ {p.get('agent', '?')} asked for tools this build does not "
+                f"provide: {names}. It ran without them.", style="dim yellow"))
         elif et == "agent_completed":
             indent = "  " * (int(p.get("depth", 0)) + 1)
             status = p.get("status", "?")

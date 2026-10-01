@@ -309,6 +309,9 @@ class DeveloperAgentWorker:
         # agent that reports what it cost.
         self.registry = registry
         self.parent_id = parent_id
+        #: Tool names a definition asked for that this build does not have.
+        #: Dropped rather than fatal, but never silent.
+        self.unknown_tools: list[str] = []
         # Per-assignment token ceiling. The research swarm passes one so a run
         # has a bound on what it can spend; None means unbounded, which is only
         # appropriate for a single interactive task.
@@ -356,12 +359,22 @@ class DeveloperAgentWorker:
             # A definition naming a tool this build does not have is a mistake
             # in the file, and the person who wrote it should find out at once.
             # Silently running the agent with fewer tools than it declared would
-            # be a promise the definition did not keep.
+            # A tool this build does not have is dropped, loudly. An agent
+            # definition is a file a person writes, and one stale tool name --
+            # a rename, a typo, a tool from a newer build -- should not cost
+            # the whole run. It is never silent: the names land in
+            # `unknown_tools` for the caller to surface, and a definition that
+            # ends up with no tools at all is still refused, because an agent
+            # that cannot do anything is not worth starting.
             unknown = [name for name in self.tool_names if name not in available]
             if unknown:
-                raise ValueError(
-                    f"Unsupported worker tools requested: {unknown}. "
-                    f"Available: {', '.join(sorted(available))}")
+                self.unknown_tools = list(unknown)
+                usable = tuple(name for name in self.tool_names if name in available)
+                if not usable:
+                    raise ValueError(
+                        f"None of the requested tools exist: {unknown}. "
+                        f"Available: {', '.join(sorted(available))}")
+                self.tool_names = usable
             return [available[name]() for name in self.tool_names]
 
         tools = [ReadFileTool(workspace_root=root), ListDirectoryTool(workspace_root=root),

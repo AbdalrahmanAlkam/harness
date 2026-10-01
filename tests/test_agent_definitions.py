@@ -317,3 +317,43 @@ def test_an_agent_declaration_reaches_the_worker(tmp_path: Path):
     assert seen, "the agent never called the model"
     assert any("You review database migrations." in text for text in seen), (
         "the declared system prompt was not used")
+
+
+def test_a_dropped_tool_reaches_the_caller_rather_than_being_silent(tmp_path: Path):
+    """One unavailable tool costs that tool, not the run -- but the user has to
+    be told, or the agent quietly is not what its file declared."""
+    from adaptive_harness.llm.client import LLMResponse
+    from adaptive_harness.tools.delegation import DelegateSubagentTool
+
+    seen: list[dict] = []
+
+    class Client:
+        default_model = "mock"
+        provider = "openrouter"
+
+        def __init__(self):
+            self.done = False
+
+        def complete(self, messages, **kwargs):
+            if not self.done:
+                self.done = True
+                return LLMResponse(model="mock", content="",
+                                   tool_calls=[__import__(
+                                       "adaptive_harness.llm.mock_client",
+                                       fromlist=["ToolCall"]).ToolCall(
+                                       id="w1", name="write_file",
+                                       arguments={"path": "out.md",
+                                                  "content": "done"})])
+            return LLMResponse(model="mock", content="done")
+
+    # A write-capable agent, so the run is judged on the file it produces
+    # rather than on the tool it could not have.
+    _write(tmp_path / ".harness" / "agents", "mixed", "---\nname: mixed\n"
+           "description: d\ntools: read_file, write_file, teleport\n---\nBody\n")
+    tool = DelegateSubagentTool(tmp_path, llm_client_factory=Client,
+                                on_event=lambda e: seen.append(e.payload))
+    result = tool.execute(role="mixed", task="do the thing")
+    assert result.success, result.error
+    assert result.metadata["unavailable_tools"] == ["teleport"]
+    assert any(event.get("tools") == ["teleport"] for event in seen), (
+        "the dropped tool was never announced")

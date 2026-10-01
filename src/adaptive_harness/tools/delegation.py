@@ -138,9 +138,22 @@ class DelegateSubagentTool(Tool):
             if record is not None:
                 payload["agent_id"] = record.id
                 payload["ledger"] = record.ledger()
+            # A tool the definition asked for and this build does not have. The
+            # run continues without it, so the fact has to reach the user: an
+            # agent quietly missing the tool it was declared with is a promise the
+            # file did not keep.
+            dropped = list(getattr(worker, "unknown_tools", ()) or ())
+            if dropped:
+                payload["unavailable_tools"] = dropped
+                if self.on_event is not None:
+                    from adaptive_harness.agent.agent import AgentEvent
+
+                    self.on_event(AgentEvent("agent_tool_unavailable",
+                                            {"agent": definition.name, "tools": dropped}))
             return ToolResult(success=result.success, output=json.dumps(payload, ensure_ascii=False),
                               error=result.error,
                               metadata={"role": role, "verified": result.verified,
-                                        "agent_id": record.id if record else None})
+                                        "agent_id": record.id if record else None,
+                                        "unavailable_tools": dropped})
         except (OSError, ValueError) as exc:
             return ToolResult(success=False, output="", error=f"Delegation failed: {exc}")
