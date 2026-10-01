@@ -509,7 +509,8 @@ class PluginHost:
             return
         if "hooks" not in plugin.permissions:
             raise ValueError(f"{plugin.name} declares hooks without the 'hooks' permission")
-        resolved = {"pre_tool": None, "post_tool": None, "on_final": None, "on_event": None}
+        resolved = {"pre_tool": None, "post_tool": None, "on_final": None,
+                    "on_event": None, "subagent_start": None, "subagent_stop": None}
         for spec in specs:
             when = str(spec.get("when", "")).lower()
             if when not in resolved:
@@ -620,6 +621,45 @@ class PluginHost:
                     argument_schema=dict(spec.get("argument_schema", {})),
                 )
         return specs
+
+    def subagent_start_hooks(self) -> List[Callable[..., Any]]:
+        return [plugin.hooks.subagent_start for plugin in self.plugins
+                if plugin.ok and plugin.hooks.subagent_start is not None]
+
+    def subagent_stop_hooks(self) -> List[Callable[..., Any]]:
+        return [plugin.hooks.subagent_stop for plugin in self.plugins
+                if plugin.ok and plugin.hooks.subagent_stop is not None]
+
+    def run_subagent_start(self, record) -> None:
+        """Announce a subagent. A hook that raises is reported, never fatal."""
+        for hook in self.subagent_start_hooks():
+            try:
+                hook(record)
+            except Exception as exc:  # noqa: BLE001 - a hook must not break the run
+                self.load_errors.append(
+                    f"subagent_start hook for {record.id} raised: "
+                    f"{type(exc).__name__}: {exc}")
+
+    def run_subagent_stop(self, record) -> str:
+        """Let every stop hook review a finished subagent.
+
+        Returns the first non-empty string any hook produced, which the caller
+        feeds back to the subagent as a correction. This is what makes a stop
+        hook useful rather than merely decorative: "you did not run the tests"
+        reaches the model that has to act on it.
+        """
+        feedback = ""
+        for hook in self.subagent_stop_hooks():
+            try:
+                outcome = hook(record)
+            except Exception as exc:  # noqa: BLE001
+                self.load_errors.append(
+                    f"subagent_stop hook for {record.id} raised: "
+                    f"{type(exc).__name__}: {exc}")
+                continue
+            if isinstance(outcome, str) and outcome.strip() and not feedback:
+                feedback = outcome.strip()
+        return feedback
 
     def pre_tool_hooks(self) -> List[Callable[..., Any]]:
         """PRE_TOOL hooks from every plugin that has one."""

@@ -221,6 +221,79 @@ def on_agent_event(event):
 Hooks run on every step, so they must be fast. One that raises is removed and
 reported; it cannot break the run.
 
+## Subagents
+
+A subagent is a markdown file with a frontmatter block, under
+`.harness/agents/` in a project or `~/.config/adaptive-harness/agents/` for your
+own. The frontmatter keys match the ones Claude Code documents, so a definition
+written for either works in both.
+
+```markdown
+---
+name: db-reviewer
+description: Reviews a migration for safety and reversibility.
+tools: read_file, search_files, run_bash
+permissionMode: plan
+maxTurns: 12
+isolation: worktree
+background: false
+---
+
+You review database migrations. ...
+```
+
+Acted on here: `tools`, `disallowedTools`, `model`, `permissionMode`, `maxTurns`,
+`effort`, `isolation`, `background`. Everything else is carried, and anything
+carried is listed by `harness agent list` so a key this build ignores is
+visible rather than silently dropped.
+
+The definition is honoured, not merely read: its tool list becomes the agent's
+surface, its system prompt is what the subagent is given, and
+`permissionMode: plan` means the agent cannot write at all.
+
+```bash
+harness agent init db-reviewer --description "Reviews a migration."
+harness agent list
+harness agent show db-reviewer
+```
+
+`/tasks` shows both what is running and what you can spawn. The four built-in
+roles are definitions too, and a project file may shadow one deliberately.
+
+A tool this build does not provide is dropped and reported — in the result, in
+the tool metadata, and on screen. A definition where *no* requested tool exists
+is refused outright, because an agent that cannot do anything is not worth
+starting.
+
+### Background agents
+
+`background: true`, or `wait: false` on `delegate_subagent`, returns an agent id
+immediately and runs the subagent without holding your turn. Collect it later:
+
+```python
+tool.background_result(agent_id)
+```
+
+A background agent still registers normally, so `/tasks` sees it start *and*
+finish. Asking for an id that is not running says so rather than hanging.
+
+### Subagent hooks
+
+`subagent_start` and `subagent_stop` are named after Claude Code's documented
+`SubagentStart` / `SubagentStop`. A stop hook may return a string, which is fed
+back to the subagent — that is what makes it a control rather than an observer:
+
+```python
+def check_it_finished_the_work(record):
+    if record.status != "completed":
+        return f"{record.id} ended as {record.status}. Say what went wrong."
+    if not record.tools:
+        return f"{record.id} did nothing. Do the task, or say why you cannot."
+    return ""
+```
+
+A hook that raises is dropped and reported; it never fails the run it observes.
+
 ## Safety and limits
 
 The plugin surface is a convenience, not a security boundary. It exists so that

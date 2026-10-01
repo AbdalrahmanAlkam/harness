@@ -16,6 +16,10 @@ class DelegateSubagentTool(Tool):
         "role": {"type": "string", "enum": ["architect", "coder", "reviewer", "security"]},
         "task": {"type": "string"},
         "target_dir": {"type": "string", "description": "Optional directory inside the workspace"},
+        "wait": {"type": "boolean",
+                 "description": "Wait for the subagent to finish (default). Pass false to "
+                                "run it in the background and get an id back immediately; "
+                                "collect it later with background_result."},
     }, "required": ["role", "task"]}
 
     def __init__(self, workspace_root: str | Path, *, llm_client_factory: Callable[[], Any] | None = None,
@@ -23,7 +27,7 @@ class DelegateSubagentTool(Tool):
                  step_policy: str = "classifier", max_steps: int | None = None,
                  on_event: Callable[[Any], None] | None = None,
                  registry: Any = None, parent_id: str = "main",
-                 agents: Any = None):
+                 agents: Any = None, plugins: Any = None):
         self.workspace_root = Path(workspace_root).resolve()
         self.llm_client_factory = llm_client_factory
         self.repository = repository
@@ -36,9 +40,40 @@ class DelegateSubagentTool(Tool):
         # monitoring view.
         self.registry = registry
         self.agents = agents
+        self.plugins = plugins
+        # `background: true` runs the subagent without blocking the caller's
+        # turn. The id comes back immediately and the run is picked up from
+        # `background_result` when asked, which is the whole point: the parent
+        # can keep working instead of sitting idle.
+        self._background: dict[str, Any] = {}
         self.parent_id = parent_id
 
-    def execute(self, role: str, task: str, target_dir: str | None = None, **kwargs: Any) -> ToolResult:
+    def background_result(self, agent_id: str) -> ToolResult:
+        """Collect a backgrounded subagent, or say it is still going.
+
+        A background agent that cannot be collected is worse than one that
+        blocks: the caller holds an id and no way to turn it into an answer.
+        """
+        entry = self._background.get(agent_id)
+        if entry is None:
+            known = ", ".join(sorted(self._background)) or "none"
+            return ToolResult(success=False, output="",
+                              error=f"No background subagent with id {agent_id!r}. "
+                                    f"Running: {known}")
+        if not entry.get("done"):
+            return ToolResult(success=True, output=json.dumps({
+                "agent_id": agent_id, "status": "still running"}),
+                metadata={"agent_id": agent_id, "done": False})
+        if entry.get("error"):
+            return ToolResult(success=False, output="", error=entry["error"],
+                              metadata={"agent_id": agent_id, "done": True})
+        result = entry["result"]
+        return ToolResult(success=result.success,
+                          output=json.dumps(result.to_dict(), ensure_ascii=False),
+                          error=result.error, metadata={"agent_id": agent_id, "done": True})
+
+    def execute(self, role: str, task: str, target_dir: str | None = None,
+                wait: bool = True, **kwargs: Any) -> ToolResult:
         from adaptive_harness.agent.swarm import (DeveloperAgentWorker, SwarmAssignment,
                                                    SwarmPhase, SwarmRole, run_assignment)
 
@@ -100,6 +135,8 @@ class DelegateSubagentTool(Tool):
                 record = self.registry.spawn(parent_id=self.parent_id, role=role,
                                              description=task.strip()[:120])
                 reporter = SubagentReporter(self.registry)
+                if self.plugins is not None:
+                    self.plugins.run_subagent_start(record)
                 if self.on_event is not None:
                     self.on_event(AgentEvent("agent_spawned", spawn_event(record)))
 
@@ -122,7 +159,70 @@ class DelegateSubagentTool(Tool):
                 tool_names=tools,
                 system_prompt=definition.system_prompt or None,
                 on_event=forward)
-            result = run_assignment(worker, assignment)
+            # A definition marked `background: true` runs without holding the
+            # caller's turn. The id comes back immediately and the result is
+            # collected later, which is the point: the parent keeps working
+            # instead of sitting idle while a reviewer reads a diff.
+            run_it = lambda: run_assignment(worker, assignment)  # noqa: E731
+            if definition.background and not wait:
+                if record is None:
+                    # A background agent is addressed by id, so it cannot exist
+                    # without one. Failing here is better than returning an id
+                    # that will never resolve.
+                    return ToolResult(success=False, output="",
+                                      error=f"{definition.name} is a background agent, "
+                                            f"which needs a subagent registry to be "
+                                            f"addressable. Run through the TUI or the "
+                                            f"swarm, which supply one.")
+                import threading
+
+                def background_run() -> None:
+                    # The registry has to learn the agent finished, exactly as
+                    # it does for a blocking run. Otherwise `/tasks` shows an
+                    # agent still running for work that ended minutes ago --
+                    # the precise state a monitoring view exists to prevent.
+                    try:
+                        result = run_it()
+                        self._background[record.id] = {"result": result, "done": True}
+                    except Exception as exc:  # noqa: BLE001 - reported, not lost
+                        result = None
+                        self._background[record.id] = {
+                            "result": None, "done": True,
+                            "error": f"{type(exc).__name__}: {exc}"}
+                    finally:
+                        if record is not None and self.registry is not None:
+                            self.registry.complete(
+                                record.id,
+                                result=(result.summary if result is not None else ""),
+                                error=(result.error or "") if result is not None else "",
+                                stop_reason=((result.artifacts or {}).get("stop_reason") or ""))
+
+                thread = threading.Thread(target=background_run, daemon=True,
+                                         name=f"subagent-{record.id}")
+                thread.start()
+                return ToolResult(success=True, output=json.dumps({
+                    "agent_id": record.id, "status": "running in the background",
+                    "how_to_collect": "call background_result with this id",
+                }), metadata={"agent_id": record.id, "background": True})
+            result = run_it()
+            # A stop hook may send a correction back to the subagent. This is
+            # what makes the hook useful rather than decorative: "you did not
+            # run the tests" has to reach the model that can act on it.
+            correction = ""
+            if record is not None and self.plugins is not None:
+                # Guarded at the call site as well as inside the host. A hook is
+                # third-party code on the critical path of finishing a subagent,
+                # and it must not be able to fail the run it was only observing.
+                try:
+                    correction = self.plugins.run_subagent_stop(record) or ""
+                except Exception:  # noqa: BLE001 - a hook must not break the run
+                    correction = ""
+                if correction and self.on_event is not None:
+                    from adaptive_harness.agent.agent import AgentEvent
+
+                    self.on_event(AgentEvent("agent_correction",
+                                            {"agent_id": record.id,
+                                             "feedback": correction}))
             if record is not None and self.registry is not None:
                 self.registry.complete(record.id, result=result.summary,
                                        error=result.error,

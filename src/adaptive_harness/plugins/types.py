@@ -223,14 +223,24 @@ class CommandSpec:
 
 @dataclass
 class HookSet:
-    """The two-phase hook functions a plugin exposes.
+    """The hooks a plugin exposes.
 
-    Each is optional. A plugin that only wants to observe supplies
-    ``on_agent_event``, which is the original fire-and-forget listener and
-    cannot affect the run.
+    Each is optional. ``on_event`` is the fire-and-forget listener that cannot
+    affect the run; the rest can.
+
+    ``subagent_start`` and ``subagent_stop`` are named after Claude Code's
+    documented ``SubagentStart`` / ``SubagentStop`` so a hook written for one
+    works in both. Unlike the tool hooks, a stop hook here may return a string
+    to feed back to the subagent -- that is how a "you did not run the tests"
+    style guard is expressed.
     """
 
     pre_tool: Optional[Callable[..., Any]] = None
     post_tool: Optional[Callable[..., Any]] = None
     on_final: Optional[Callable[..., Any]] = None
     on_event: Optional[Callable[[Any], None]] = None
+    #: ``(agent_record) -> None``. Called as a subagent begins.
+    subagent_start: Optional[Callable[..., Any]] = None
+    #: ``(agent_record) -> str | None``. Called as one finishes; a returned
+    #: string is fed back to the subagent as a correction.
+    subagent_stop: Optional[Callable[..., Any]] = None

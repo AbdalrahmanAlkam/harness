@@ -139,6 +139,12 @@ assert something that had not happened. Those are the substantive changes:
   changes. A reset that leaves the prompt overridden — because a second file
   also overrides it — says so instead of reporting a success that did not
   happen.
+- **Subagent hooks and background agents.** `SubagentStart` / `SubagentStop`
+  equivalents let a plugin review a finished subagent and send a correction
+  back, so a hook is a control rather than an observer. `background: true` (or
+  `wait: false`) returns an agent id immediately instead of holding your turn,
+  and the result is collected later; the agent still registers, so `/tasks` sees
+  it start and finish.
 - **Subagents you define yourself.** A subagent is now a markdown file with a
   frontmatter block under `.harness/agents/`, so you can add a database
   reviewer or a performance auditor without editing the harness, and share it
