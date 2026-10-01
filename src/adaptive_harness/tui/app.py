@@ -167,7 +167,7 @@ COMMAND_DESCRIPTIONS = {
     "/session": "Load or save a session",
     "/usage": "Show token usage and cost",
     "/context": "Show the context budget: what is held, what was admitted, what was not",
-    "/tasks": "Show every subagent: id, status, tool calls, tokens, elapsed",
+    "/tasks": "Show running subagents (id, status, tools, tokens, elapsed) and the ones you can spawn",
     "/memory": "Durable memory: list, accept <id>, forget <id>, clear",
     "/doctor": "Check that this installation can do what it claims",
     "/skills": "Browse installed skills",
@@ -1989,8 +1989,16 @@ class AdaptiveHarnessApp(App):
         elif cmd == "/memory":
             self._show_memory(arg)
         elif cmd == "/tasks":
-            self.query_one("#chat-log", RichLog).write(
-                Text(self.subagents.describe(), style="dim"))
+            from adaptive_harness.agents import AgentRegistry
+
+            log = self.query_one("#chat-log", RichLog)
+            log.write(Text(self.subagents.describe(), style="dim"))
+            registry = AgentRegistry(self.workspace_root)
+            registry.discover()
+            log.write(Text(""))
+            log.write(Text(registry.describe(), style="dim"))
+            for warning in registry.warnings:
+                log.write(Text(f"  {warning}", style="dim yellow"))
         elif cmd == "/doctor":
             self._show_doctor()
         elif cmd == "/copy":

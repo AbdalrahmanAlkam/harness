@@ -139,6 +139,16 @@ assert something that had not happened. Those are the substantive changes:
   changes. A reset that leaves the prompt overridden — because a second file
   also overrides it — says so instead of reporting a success that did not
   happen.
+- **Subagents you define yourself.** A subagent is now a markdown file with a
+  frontmatter block under `.harness/agents/`, so you can add a database
+  reviewer or a performance auditor without editing the harness, and share it
+  with whoever works on the same repository. The frontmatter keys match the ones
+  Claude Code documents, so a definition written for either works in both.
+  `tools`, `model`, `permissionMode`, `maxTurns`, `effort`, `isolation` and
+  `background` are acted on; anything else is carried rather than dropped. The
+  four built-in roles still work, and a definition may shadow one of them.
+  `harness agent init <name>` scaffolds one, and `/tasks` lists what you can
+  spawn alongside what is running.
 - **Named, watchable subagents.** Every subagent now has a short readable id
   (`agent_7f3a`) carried on every one of its events, so a run with several in
   flight can be read, referred to, and accounted for. `/tasks` reports status,

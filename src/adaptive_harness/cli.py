@@ -795,6 +795,81 @@ def plugin_info(name: str = typer.Argument(..., help="Plugin name")):
         console.print("  [bold]hooks:[/bold] " + ", ".join(sorted(active)))
 
 
+@app.command("agent")
+def agent_cmd(
+    action: str = typer.Argument("list", help="list, show NAME, or init NAME"),
+    name: str = typer.Argument("", help="Agent name"),
+    description: str = typer.Option("", "--description", help="What the agent does, for `init`"),
+    scope: str = typer.Option("project", "--scope", help="`project` writes to .harness/agents/, `user` to your config"),
+):
+    """The subagents you can spawn.
+
+    A subagent is a markdown file with a small frontmatter block, so you can
+    add one -- a database reviewer, a performance auditor -- without touching
+    the harness, and share it with whoever works on the same repository.
+
+        harness agent init db-reviewer --description "Reviews a migration."
+
+    The frontmatter keys match the ones Claude Code documents, so a definition
+    written for one works here. Only `tools`, `model`, `permissionMode`,
+    `maxTurns`, `effort`, `isolation` and `background` change behaviour here;
+    anything else is carried rather than dropped.
+    """
+    from adaptive_harness.agents import (
+        AgentDefinitionError, AgentRegistry, load_definition, scaffold,
+    )
+    from adaptive_harness.data.config import DEFAULT_CONFIG_DIR
+
+    if action == "init":
+        if not name:
+            raise typer.BadParameter("init requires a name", param_hint="NAME")
+        target = (Path(DEFAULT_CONFIG_DIR) / "agents" if scope == "user"
+                  else Path.cwd() / ".harness" / "agents")
+        try:
+            path = scaffold(target, name, description)
+        except AgentDefinitionError as exc:
+            console.print(f"[red]{escape(str(exc))}[/red]")
+            raise typer.Exit(1) from exc
+        console.print(f"[green]Created[/green] {path}")
+        console.print("[dim]Edit the system prompt, then it is available to "
+                      "`delegate_subagent` and listed by /tasks.[/dim]")
+        return
+    if action == "show":
+        if not name:
+            raise typer.BadParameter("show requires a name", param_hint="NAME")
+        registry = AgentRegistry(Path.cwd())
+        registry.discover()
+        definition = registry.get(name)
+        if definition is None:
+            for path in list(registry.roots()):
+                candidate = path / f"{name}.md"
+                if candidate.is_file():
+                    try:
+                        definition = load_definition(candidate)
+                    except AgentDefinitionError as exc:
+                        console.print(f"[red]{escape(str(exc))}[/red]")
+                        raise typer.Exit(1) from exc
+                    break
+        if definition is None:
+            console.print(f"[yellow]No subagent named {name!r}.[/yellow]")
+            raise typer.Exit(1)
+        console.print(f"[bold]{definition.name}[/bold] — {definition.description}")
+        for key, value in definition.to_dict().items():
+            if key not in {"name", "description"} and value:
+                console.print(f"  {key}: {escape(str(value))}")
+        if definition.system_prompt:
+            console.print()
+            console.print(Text(definition.system_prompt))
+        return
+
+    registry = AgentRegistry(Path.cwd())
+    registry.discover()
+    console.print(registry.describe())
+    for warning in registry.warnings:
+        console.print(f"  [yellow]{escape(warning)}[/yellow]")
+    console.print("[dim]Scaffold one with: adaptive-harness agent init <name>[/dim]")
+
+
 @app.command("memory")
 def memory_cmd(
     action: str = typer.Argument("list", help="list, accept ID, forget ID, or clear"),

@@ -1,0 +1,319 @@
+"""User-defined subagents.
+
+A subagent used to be one of four names hardcoded into a tool's JSON schema, so
+the agent surface was a property of the binary: adding a "database reviewer"
+meant editing the source, and there was nowhere to say that a given subagent
+wanted a different model, fewer permissions, or a worktree of its own.
+
+These tests pin that a subagent is a file, that the file is honoured rather
+than merely read, and that a broken one cannot stop the harness starting.
+
+The frontmatter keys deliberately match Claude Code's documented ones, so a
+definition written for either works in both -- which is the whole reason for the
+naming.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from adaptive_harness.agents import (
+    AgentDefinitionError,
+    AgentRegistry,
+    builtin_definitions,
+    load_definition,
+    parse_frontmatter,
+    resolve,
+    scaffold,
+)
+
+GOOD = """---
+name: db-reviewer
+description: Reviews a migration for safety and reversibility.
+tools: read_file, search_files, run_bash
+disallowedTools: write_file
+model: fast
+permissionMode: plan
+maxTurns: 12
+effort: high
+isolation: worktree
+background: true
+color: blue
+memory: project
+---
+
+You review database migrations.
+"""
+
+
+def _write(root: Path, name: str, text: str) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{name}.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+# --- parsing ----------------------------------------------------------------
+
+
+def test_a_definition_parses_into_frontmatter_and_a_body():
+    fields, body = parse_frontmatter(GOOD, "db-reviewer.md")
+    assert fields["name"] == "db-reviewer"
+    assert fields["tools"] == ["read_file", "search_files", "run_bash"]
+    assert fields["maxTurns"] == 12
+    assert fields["background"] is True
+    assert body == "You review database migrations."
+
+
+def test_a_list_may_be_written_across_lines():
+    text = ("---\nname: x\ndescription: d\ntools:\n  - read_file\n  - run_bash\n---\nBody\n")
+    fields, _ = parse_frontmatter(text, "x.md")
+    assert fields["tools"] == ["read_file", "run_bash"]
+
+
+def test_a_bracketed_list_is_accepted():
+    text = "---\nname: x\ndescription: d\ntools: [read_file, run_bash]\n---\n"
+    fields, _ = parse_frontmatter(text, "x.md")
+    assert fields["tools"] == ["read_file", "run_bash"]
+
+
+def test_a_file_with_no_frontmatter_is_refused_with_a_reason():
+    with pytest.raises(AgentDefinitionError) as excinfo:
+        parse_frontmatter("just prose\n", "x.md")
+    assert "---" in str(excinfo.value), "the error should show the expected shape"
+
+
+def test_a_description_is_required_because_the_model_reads_it():
+    """It is how the model decides when to spawn this agent, so an empty one is
+    never chosen and should not be accepted."""
+    with pytest.raises(AgentDefinitionError) as excinfo:
+        load_definition(_write(Path("/tmp"), "nodesc", "---\nname: nodesc\n---\nBody\n"))
+    assert "description" in str(excinfo.value)
+
+
+def test_an_unreadable_isolation_is_refused():
+    bad = "---\nname: x\ndescription: d\nisolation: container\n---\n"
+    with pytest.raises(AgentDefinitionError) as excinfo:
+        load_definition(_write(Path("/tmp"), "badiso", bad))
+    assert "worktree" in str(excinfo.value)
+
+
+def test_a_non_numeric_max_turns_is_refused():
+    bad = "---\nname: x\ndescription: d\nmaxTurns: lots\n---\n"
+    with pytest.raises(AgentDefinitionError):
+        load_definition(_write(Path("/tmp"), "badturns", bad))
+
+
+def test_an_unknown_key_is_carried_rather_than_dropped():
+    """A file written for a newer tool should still run here."""
+    definition = load_definition(_write(Path("/tmp"), "future",
+                                       "---\nname: future\ndescription: d\ncacheTtl: 1h\n---\nB\n"))
+    assert "cacheTtl" in definition.extra
+    assert definition.name == "future"
+
+
+# --- what the definition controls --------------------------------------------
+
+
+def test_the_tool_list_becomes_the_agents_tool_surface(tmp_path: Path):
+    definition = load_definition(_write(tmp_path, "db-reviewer", GOOD))
+    assert definition.tools == ("read_file", "search_files", "run_bash")
+    assert definition.disallowed_tools == ("write_file",)
+
+
+def test_a_plan_agent_is_not_write_capable():
+    """`permissionMode: plan` must mean it, not merely suggest it."""
+    definition = load_definition(_write(Path("/tmp"), "planner",
+                                       "---\nname: p\ndescription: d\n"
+                                       "permissionMode: plan\ntools: read_file, write_file\n---\n"))
+    assert not definition.is_write_capable
+
+
+def test_a_write_capable_agent_is_detected():
+    definition = load_definition(_write(Path("/tmp"), "builder",
+                                       "---\nname: b\ndescription: d\n"
+                                       "tools: read_file, write_file\n---\n"))
+    assert definition.is_write_capable
+
+
+def test_model_turns_and_isolation_survive_the_round_trip(tmp_path: Path):
+    definition = load_definition(_write(tmp_path, "db-reviewer", GOOD))
+    assert definition.model == "fast"
+    assert definition.max_turns == 12
+    assert definition.effort == "high"
+    assert definition.isolation == "worktree"
+    assert definition.background is True
+    assert definition.color == "blue"
+
+
+# --- discovery --------------------------------------------------------------
+
+
+def test_a_project_definition_is_discovered(tmp_path: Path):
+    _write(tmp_path / ".harness" / "agents", "db-reviewer", GOOD)
+    registry = AgentRegistry(tmp_path)
+    assert "db-reviewer" in registry.discover()
+    assert registry.get("db-reviewer").description.startswith("Reviews a migration")
+
+
+def test_a_broken_definition_does_not_hide_the_working_ones(tmp_path: Path):
+    root = tmp_path / ".harness" / "agents"
+    _write(root, "db-reviewer", GOOD)
+    _write(root, "broken", "no frontmatter at all\n")
+    registry = AgentRegistry(tmp_path)
+    found = registry.discover()
+    assert "db-reviewer" in found
+    assert "broken" not in found
+    assert registry.warnings, "a broken definition must be reported, not silently dropped"
+
+
+def test_a_project_definition_overrides_a_user_one(tmp_path: Path):
+    """The project's is the more specific and the more deliberate."""
+    _write(tmp_path / ".harness" / "agents", "db-reviewer",
+           "---\nname: db-reviewer\ndescription: The project's version.\n---\n")
+    registry = AgentRegistry(tmp_path)
+    registry.discover()
+    assert registry.get("db-reviewer").description == "The project's version."
+
+
+def test_the_built_in_roles_still_resolve_with_no_files_on_disk(tmp_path: Path):
+    """Nothing that worked before may stop working."""
+    registry = AgentRegistry(tmp_path)
+    registry.discover()
+    for name in ("architect", "coder", "reviewer", "security"):
+        assert resolve(name, registry) is not None
+        assert registry.get(name) is None, "a built-in is not a discovered file"
+
+
+def test_a_user_definition_wins_over_a_built_in_of_the_same_name(tmp_path: Path):
+    _write(tmp_path / ".harness" / "agents", "coder",
+           "---\nname: coder\ndescription: The team's coder, with their rules.\n---\n")
+    registry = AgentRegistry(tmp_path)
+    registry.discover()
+    assert "team's" in resolve("coder", registry).description
+
+
+# --- the listing ------------------------------------------------------------
+
+
+def test_the_listing_shows_what_matters_per_agent(tmp_path: Path):
+    _write(tmp_path / ".harness" / "agents", "db-reviewer", GOOD)
+    registry = AgentRegistry(tmp_path)
+    registry.discover()
+    described = registry.describe()
+    assert "db-reviewer" in described
+    for flag in ("background", "worktree", "fast", "plan"):
+        assert flag in described, f"{flag} is declared but not shown"
+
+
+def test_an_empty_listing_says_how_to_make_one(tmp_path: Path):
+    described = AgentRegistry(tmp_path).describe()
+    assert "No subagents" in described
+    assert "init" in described, "the empty view should say how to get one"
+
+
+def test_a_carried_key_is_flagged_as_not_acted_on(tmp_path: Path):
+    _write(tmp_path / ".harness" / "agents", "future",
+           "---\nname: future\ndescription: d\ncacheTtl: 1h\n---\n")
+    registry = AgentRegistry(tmp_path)
+    registry.discover()
+    assert "not acted on" in registry.describe()
+
+
+# --- scaffolding ------------------------------------------------------------
+
+
+def test_a_scaffolded_agent_is_usable_as_written(tmp_path: Path):
+    """The first thing a user does must not need fixing first."""
+    path = scaffold(tmp_path / ".harness" / "agents", "db-reviewer", "Reviews a migration.")
+    definition = load_definition(path)
+    assert definition.name == "db-reviewer"
+    assert definition.description == "Reviews a migration."
+    assert definition.tools, "a scaffold with no tools cannot do anything"
+    assert definition.system_prompt
+
+
+def test_scaffolding_over_an_existing_agent_is_refused(tmp_path: Path):
+    scaffold(tmp_path / ".harness" / "agents", "x")
+    with pytest.raises(AgentDefinitionError):
+        scaffold(tmp_path / ".harness" / "agents", "x")
+
+
+def test_a_scaffolded_agent_appears_in_discovery(tmp_path: Path):
+    scaffold(tmp_path / ".harness" / "agents", "perf", "Audits hot paths.")
+    registry = AgentRegistry(tmp_path)
+    assert "perf" in registry.discover()
+
+
+# --- the delegation tool honours the definition -----------------------------
+
+
+def test_delegation_runs_a_named_definition_and_keeps_the_builtins():
+    import tempfile
+
+    from adaptive_harness.llm.client import LLMResponse
+    from adaptive_harness.tools.delegation import DelegateSubagentTool
+
+    class Client:
+        default_model = "mock"
+        provider = "openrouter"
+
+        def complete(self, messages, **kwargs):
+            return LLMResponse(model="mock", content="Safe: additive and reversible.")
+
+    root = Path(tempfile.mkdtemp())
+    _write(root / ".harness" / "agents", "db-reviewer", GOOD)
+    (root / "m.sql").write_text("ALTER TABLE t ADD COLUMN c int;")
+
+    tool = DelegateSubagentTool(root, llm_client_factory=Client)
+    result = tool.execute(role="db-reviewer", task="review m.sql")
+    assert result.success, result.error
+    assert "Safe" in result.output
+
+    # And a built-in role still runs, unchanged.
+    builtin = tool.execute(role="reviewer", task="check the migration")
+    assert builtin.success, builtin.error
+
+
+def test_an_unknown_agent_name_is_actionable(tmp_path: Path):
+    from adaptive_harness.tools.delegation import DelegateSubagentTool
+
+    class Client:
+        default_model = "mock"
+        provider = "openrouter"
+
+        def complete(self, messages, **kwargs):
+            raise AssertionError("should not be called for an unknown name")
+
+    tool = DelegateSubagentTool(tmp_path, llm_client_factory=Client)
+    result = tool.execute(role="not-real", task="x")
+    assert not result.success
+    assert ".harness/agents/" in result.error, (
+        "the error should say where to define one")
+    assert "reviewer" in result.error, "and what already exists"
+
+
+def test_an_agent_declaration_reaches_the_worker(tmp_path: Path):
+    """The file is honoured, not merely read: its system prompt is what the
+    subagent is actually given."""
+    from adaptive_harness.llm.client import LLMResponse
+    from adaptive_harness.tools.delegation import DelegateSubagentTool
+
+    seen: list[str] = []
+
+    class Client:
+        default_model = "mock"
+        provider = "openrouter"
+
+        def complete(self, messages, **kwargs):
+            seen.append(str(messages[0].get("content", "")))
+            return LLMResponse(model="mock", content="ok")
+
+    _write(tmp_path / ".harness" / "agents", "db-reviewer", GOOD)
+    tool = DelegateSubagentTool(tmp_path, llm_client_factory=Client)
+    tool.execute(role="db-reviewer", task="review m.sql")
+    assert seen, "the agent never called the model"
+    assert any("You review database migrations." in text for text in seen), (
+        "the declared system prompt was not used")

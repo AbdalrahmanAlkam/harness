@@ -22,7 +22,8 @@ class DelegateSubagentTool(Tool):
                  repository: Any = None, safety_profile: str = "turbo",
                  step_policy: str = "classifier", max_steps: int | None = None,
                  on_event: Callable[[Any], None] | None = None,
-                 registry: Any = None, parent_id: str = "main"):
+                 registry: Any = None, parent_id: str = "main",
+                 agents: Any = None):
         self.workspace_root = Path(workspace_root).resolve()
         self.llm_client_factory = llm_client_factory
         self.repository = repository
@@ -34,6 +35,7 @@ class DelegateSubagentTool(Tool):
         # registry gives each one an id, a lifecycle, and a place in the
         # monitoring view.
         self.registry = registry
+        self.agents = agents
         self.parent_id = parent_id
 
     def execute(self, role: str, task: str, target_dir: str | None = None, **kwargs: Any) -> ToolResult:
@@ -44,9 +46,38 @@ class DelegateSubagentTool(Tool):
                  "coder": (SwarmRole.CODER, SwarmPhase.IMPLEMENT),
                  "reviewer": (SwarmRole.QA, SwarmPhase.VERIFY),
                  "security": (SwarmRole.SECURITY, SwarmPhase.VERIFY)}
-        if role not in roles or not isinstance(task, str) or not task.strip():
+
+        # A subagent is now a *file*, not one of four hardcoded roles. A name
+        # that matches a definition runs that definition; a name that matches a
+        # built-in role still runs the role, so nothing that worked before
+        # stops working.
+        from adaptive_harness.agents import AgentRegistry, builtin_definitions, resolve
+
+        # `registry` tracks *running* agents; `agents` holds the *definitions*.
+        # They are different things, and conflating them sends a lookup here to a
+        # method only the former has.
+        if self.agents is None:
+            self.agents = AgentRegistry(self.workspace_root)
+            self.agents.discover()
+        definition = resolve(role, self.agents)
+        if definition is None:
+            known = sorted(set(self.agents.names()) | set(builtin_definitions()))
             return ToolResult(success=False, output="",
-                              error="Choose architect, coder, reviewer, or security and provide a task")
+                              error=f"No subagent named {role!r}. Define one at "
+                                    f".harness/agents/{role}.md, or use one of: "
+                                    f"{', '.join(known)}")
+        if role not in roles:
+            # A user-defined agent has no built-in phase. It is planned unless
+            # it asked to write, which is the honest default for something
+            # whose whole job is to produce an answer.
+            roles[role] = ((SwarmRole.CODER if definition.is_write_capable
+                            else SwarmRole.ARCHITECT),
+                           SwarmPhase.IMPLEMENT if definition.is_write_capable
+                           else SwarmPhase.PLAN)
+
+        if not isinstance(task, str) or not task.strip():
+            return ToolResult(success=False, output="",
+                              error=f"Give the {role} agent something to do.")
         try:
             root = workspace_path(self.workspace_root, target_dir or ".")
             selected_role, phase = roles[role]
@@ -78,9 +109,19 @@ class DelegateSubagentTool(Tool):
                 if self.on_event is not None:
                     self.on_event(event)
 
+            # The definition decides the tool surface, not just the name. An
+            # agent handed write_file when its file said `permissionMode: plan`
+            # would be a promise the file did not keep.
+            tools = list(definition.tools) or None
+            if tools is not None and definition.disallowed_tools:
+                tools = [name for name in tools if name not in definition.disallowed_tools]
             worker = DeveloperAgentWorker(llm_client_factory=self.llm_client_factory,
                 repository=self.repository, safety_profile=self.safety_profile,
-                step_policy=self.step_policy, max_steps=self.max_steps, on_event=forward)
+                step_policy=self.step_policy,
+                max_steps=definition.max_turns or self.max_steps,
+                tool_names=tools,
+                system_prompt=definition.system_prompt or None,
+                on_event=forward)
             result = run_assignment(worker, assignment)
             if record is not None and self.registry is not None:
                 self.registry.complete(record.id, result=result.summary,

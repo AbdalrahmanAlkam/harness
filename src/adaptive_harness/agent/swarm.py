@@ -353,9 +353,15 @@ class DeveloperAgentWorker:
                 "web_search": lambda: WebSearchTool(allow_public_metadata=True),
                 "compile_typst": lambda: CompileTypstTool(workspace_root=root),
             }
+            # A definition naming a tool this build does not have is a mistake
+            # in the file, and the person who wrote it should find out at once.
+            # Silently running the agent with fewer tools than it declared would
+            # be a promise the definition did not keep.
             unknown = [name for name in self.tool_names if name not in available]
             if unknown:
-                raise ValueError(f"Unsupported worker tools requested: {unknown}")
+                raise ValueError(
+                    f"Unsupported worker tools requested: {unknown}. "
+                    f"Available: {', '.join(sorted(available))}")
             return [available[name]() for name in self.tool_names]
 
         tools = [ReadFileTool(workspace_root=root), ListDirectoryTool(workspace_root=root),
