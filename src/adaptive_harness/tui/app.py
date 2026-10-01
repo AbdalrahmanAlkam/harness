@@ -311,8 +311,13 @@ class AdaptiveHarnessApp(App):
         """
         if self._busy:
             self.agent.request_cancel("operator pressed Esc")
+            # Mark the subagents too. Without this the monitoring view keeps
+            # showing them as running for a run that is already over, which is
+            # the state a user checks `/agents` in precisely to avoid trusting.
+            stopped = self.subagents.stop_all("the run was cancelled")
+            note = (f" and {len(stopped)} subagent(s)" if stopped else "")
             self.query_one("#chat-log", RichLog).write(
-                Text("Cancelling after the current step…", style="yellow"))
+                Text(f"Cancelling after the current step{note}…", style="yellow"))
             return
         # Not busy: let a modal or the settings screen handle Escape itself.
 

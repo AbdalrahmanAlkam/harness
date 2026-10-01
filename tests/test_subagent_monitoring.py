@@ -383,3 +383,34 @@ def test_reset_clears_everything():
     registry.spawn(parent_id="main", role="x", description="1")
     registry.reset()
     assert registry.all() == [] and registry.totals()["agents"] == 0
+
+
+# --- a capability that exists but nothing calls is not a capability ----------
+
+
+def test_cancelling_a_run_marks_its_subagents_stopped():
+    """The bug this pins: the monitoring view said agents were still running for
+    a run that had already been cancelled, which is exactly the state a user
+    checks `/agents` in order to avoid trusting."""
+    registry = SubagentRegistry()
+    record = registry.spawn(parent_id="main", role="coder", description="x")
+    assert record.running
+
+    stopped = registry.stop_all("the run was cancelled")
+
+    assert stopped, "cancelling reported nothing, so a running agent stays 'running' forever"
+    assert not registry.running()
+    assert registry.get(record.id).status == STATUS_STOPPED
+    assert "cancelled" in registry.get(record.id).error
+
+
+def test_the_tui_cancels_subagents_too():
+    """Wiring, checked against the source: a method that exists but is never
+    called is the failure mode this whole module is about."""
+    import inspect
+
+    from adaptive_harness.tui.app import AdaptiveHarnessApp
+
+    source = inspect.getsource(AdaptiveHarnessApp.action_cancel_task)
+    assert "stop_all" in source, (
+        "Esc cancels the agent but not its subagents, so /agents keeps spinning")
